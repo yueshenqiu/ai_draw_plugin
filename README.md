@@ -2,7 +2,6 @@
 
 MaiBot 的 AI 绘图插件。通过 LLM 将自然语言描述转换为结构化提示词，再调用图像生成服务出图。支持多模型热切换、画师/风格预设、参考图模式、自拍模式、自动撤回等功能。
 
-- **作者**：三花
 - **命令前缀**：`/ad`
 - **SDK**：maibot-sdk 2.x
 
@@ -183,6 +182,10 @@ ai_draw_plugin/
 2. 实现 `generate()` 方法和 `capabilities` 属性
 3. 在 `providers/__init__.py` 的注册表中添加映射
 4. 在 `config.toml` 新增模型段，`format` 填对应 provider 标识
+
+
+- 三花想说的话：
+https://github.com/Rabbit-Jia-Er他的插件爆改而来，融百家之长的自用插件，有需要的用前请备份！！！后面还要加n多东西，早用早享受，晚用享bug
 
 ## 许可证
 
