@@ -8,8 +8,9 @@ venv/
 # 运行时生成的临时图片
 temp_images/
 
-# 个人自拍参考图（按需自行放入）
-selfie_refs/
+# 个人自拍参考图（保留空目录，里面的图片不提交）
+selfie_refs/*
+!selfie_refs/.gitkeep
 
 # 本地敏感配置（如自行复制一份带密钥的配置，请勿提交）
 config.local.toml
