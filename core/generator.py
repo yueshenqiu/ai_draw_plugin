@@ -27,20 +27,40 @@ _cached_bot_nickname: str = ""
 def _get_temp_image_path(suffix: str = ".jpg", prefix: str = "ai_fwd_") -> Path:
     """在插件目录 temp_images/ 下生成临时文件路径，并确保最多保留 _MAX_TEMP_FILES 个文件。"""
     _TEMP_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-    _cleanup_temp_images()
+    # 写前预留一个名额：清理到 _MAX_TEMP_FILES - 1，写入新文件后总数恰好不超过 _MAX_TEMP_FILES。
+    _cleanup_temp_images(keep=max(0, _MAX_TEMP_FILES - 1))
     filename = f"{prefix}{int(time.time() * 1000)}{suffix}"
     return _TEMP_IMAGES_DIR / filename
 
 
-def _cleanup_temp_images() -> None:
-    """保留最新的 _MAX_TEMP_FILES 个文件，删除多余的旧文件。"""
+def _cleanup_temp_images(keep: int = _MAX_TEMP_FILES) -> None:
+    """保留最新的 keep 个文件，删除多余的旧文件。
+
+    逐文件容错：并发生图任务之间可能删到同一个文件（FileNotFoundError），
+    或文件被 NapCat 占用导致删除失败（Windows PermissionError）。这些都只能
+    跳过当前文件，绝不能中断整轮清理——否则旧的临时图会一直堆积。
+    """
     try:
-        files = sorted(_TEMP_IMAGES_DIR.iterdir(), key=lambda p: p.stat().st_mtime)
-        while len(files) > _MAX_TEMP_FILES:
-            oldest = files.pop(0)
-            oldest.unlink(missing_ok=True)
-    except Exception:
-        pass
+        candidates = [p for p in _TEMP_IMAGES_DIR.iterdir() if p.is_file()]
+    except (FileNotFoundError, OSError):
+        return
+
+    def _mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0  # 取不到时间的当作最旧，优先清理
+
+    candidates.sort(key=_mtime)
+    overflow = len(candidates) - max(0, keep)
+    if overflow <= 0:
+        return
+    for old in candidates[:overflow]:
+        try:
+            old.unlink(missing_ok=True)
+        except OSError:
+            # 文件被占用或已被其他任务删除，跳过不影响其余文件清理
+            continue
 
 
 # ================================================================
