@@ -7,7 +7,7 @@
     "name": "三花",
     "url": "https://github.com/yueshenqiu"
   },
-  "license": "GPL-v3.0-or-later",
+  "license": "GPL-3.0-or-later",
   "urls": {
     "repository": "https://github.com/yueshenqiu/ai_draw_plugin",
     "homepage": "https://github.com/yueshenqiu/ai_draw_plugin"
@@ -36,8 +36,7 @@
   ],
   "i18n": {
     "default_locale": "zh-CN",
-    "locales_path": "_locales",
     "supported_locales": ["zh-CN"]
   },
-  "id": "rabbit.ai-draw-plugin"
+  "id": "github.yueshenqiu.ai-draw-plugin"
 }
