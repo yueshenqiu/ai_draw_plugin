@@ -184,8 +184,8 @@ ai_draw_plugin/
 4. 在 `config.toml` 新增模型段，`format` 填对应 provider 标识
 
 
-- 三花想说的话：
-https://github.com/Rabbit-Jia-Er他的插件爆改而来，融百家之长的自用插件，有需要的用前请备份！！！后面还要加n多东西，早用早享受，晚用享bug
+- **三花**想说的话：
+- “https://github.com/Rabbit-Jia-Er ” 他的插件爆改而来，融百家之长的自用插件，有需要的用前请备份！！！后面还要加n多东西，早用早享受，晚用享bug
 
 ## 许可证
 
