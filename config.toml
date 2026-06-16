@@ -1,0 +1,136 @@
+# ai_draw_plugin 配置文件
+# AI 绘图插件，命令前缀 /ad
+
+[plugin]
+enabled = true
+config_version = "2.0.0"
+napcat_http_url = "http://127.0.0.1:5780"   # NapCat HTTP API 地址（直连，绕过 IPC）
+napcat_http_token = ""
+send_mode = "direct"                          # direct=普通直发（快） / forward=合并转发（隐蔽但慢）
+force_forward_when_nsfw_off = true            # NSFW 过滤关闭时强制合并转发
+
+
+[admin]
+admin_users = []   # 管理员 QQ 号列表，例如 ["10001"]
+default_admin_mode = false     # 启用后仅管理员可使用生图命令
+
+
+[prompt_generator]
+model_name = "deepseek-v4-pro"
+api_base = "https://api.deepseek.com"
+api_key = ""
+output_format = "json"              # json / text
+selfie_appearance_policy = "auto"   # 自拍外貌标签策略：auto / never / keep
+enforce_tag_order = false
+scene_llm_enabled = true            # 自拍场景 LLM 增强
+temperature = 0.2
+max_tokens = 4000
+prompt_template = ""
+inherit_ttl = 3600                  # 上一轮提示词继承有效时间（秒）
+
+
+[auto_recall]
+enabled = true
+delay_seconds = 50            # 撤回延迟（秒）
+allowed_groups = []           # 撤回白名单（platform:chat_id），空=全部允许
+
+
+[nsfw_filter]
+enabled = true
+filter_tags = "{{{{{nsfw}}}}}"
+
+
+[prompt_show]
+enabled = false
+hide_selfie_prompt_add = false
+selfie_prompt_add = ""
+negative_prompt_add = "1::artist collaboration,multiple views,thick outline::,lowres, bad anatomy, bad hands, bad composition, worst quality, jpeg artifacts, signature, watermark, username, blurry, deformed, disfigured, extra limbs, extra fingers, fewer limbs, fewer fingers, missing limbs, missing fingers, malformed limbs, malformed fingers, text, error, ugly, tiling, cropped, poorly drawn face, poorly drawn hands, abstract, chibi, doll, stuffed toy,male,"
+selfie_ref_image = ""   # 自拍参考图（selfie_refs/ 目录），留空则用文字提示词
+
+
+# 全局画师预设（所有模型共享，模型里用 artist_preset = "名称" 引用）
+[artist_presets]
+"无" = ""
+
+
+# 风格预设（/ad y 命令使用）
+[styles]
+"线描" = "line art style, single weight lines, no shading, white background, clean contours, vector-like precision"
+
+
+# 随机场景（留空则自动使用 prompt_generator 的模型）
+[random_scene]
+temperature = 1.0
+max_tokens = 200
+
+
+# 角色参考模式（/ad r、/ad rh）的 VLM 分析配置
+[tagger]
+enabled = true
+api_base = "https://api.deepseek.com"
+api_key = ""
+model_name = "deepseek-v4-pro"
+temperature = 0.4
+max_tokens = 1200
+
+
+[custom_prompt]
+system_prompt = ""
+
+
+# ======================================================================
+# 多模型配置
+# ======================================================================
+[models]
+default_model = "model1"
+
+[models.model1]
+name = "BestNAI V4.5 - 梦幻柔美"
+format = "bestnai"
+base_url = ""
+api_key = ""
+model = "nai-diffusion-4-5-full"
+endpoint = "/v1/chat/completions"
+max_tokens = 100000
+sampler = "k_euler_ancestral"
+steps = 28
+scale = 6.5
+cfg = 0.1
+noise_schedule = "karras"
+default_size = "832x1216"
+size_preset = "竖图"
+artist_preset = "梦幻柔美"
+
+[models.model2]
+name = "BestNAI V4.5 - 纯净模式"
+format = "bestnai"
+base_url = ""
+api_key = ""
+model = "nai-diffusion-4-5-full"
+endpoint = "/v1/chat/completions"
+max_tokens = 100000
+sampler = "k_euler_ancestral"
+steps = 28
+scale = 6.0
+cfg = 0.1
+noise_schedule = "karras"
+default_size = "832x1216"
+size_preset = "竖图"
+artist_preset = "无"
+
+[models.model3]
+name = "BestNAI V4 - 默认"
+format = "bestnai"
+base_url = ""
+api_key = ""
+model = "nai-diffusion-4-full"
+endpoint = "/v1/chat/completions"
+max_tokens = 100000
+sampler = "k_euler_ancestral"
+steps = 23
+scale = 5.0
+cfg = 0.0
+noise_schedule = "karras"
+default_size = "832x1216"
+size_preset = "竖图"
+artist_preset = "风格组合1"

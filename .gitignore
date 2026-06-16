@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时生成的临时图片
+temp_images/
+
+# 个人自拍参考图（按需自行放入）
+selfie_refs/
+
+# 本地敏感配置（如自行复制一份带密钥的配置，请勿提交）
+config.local.toml
+*.local.toml
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
