@@ -1,0 +1,2 @@
+# 把自拍参考图（.png/.jpg）放在此目录，文件名填到 config.toml 的 selfie_ref_image
+# 此目录内的图片不会被提交到仓库
