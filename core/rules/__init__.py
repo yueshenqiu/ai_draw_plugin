@@ -1,0 +1,16 @@
+# -*- coding: utf-8 -*-
+"""提示词规则模板（保留大型模板文件，避免内联到 prompt_engine.py 导致不可维护）。"""
+
+from .prompt_rules import (
+    PROMPT_GENERATOR_TEMPLATE,
+    PROMPT_GENERATOR_JSON_TEMPLATE,
+    SFW_PROMPT_GENERATOR_TEMPLATE,
+    SFW_PROMPT_GENERATOR_JSON_TEMPLATE,
+)
+
+__all__ = [
+    "PROMPT_GENERATOR_TEMPLATE",
+    "PROMPT_GENERATOR_JSON_TEMPLATE",
+    "SFW_PROMPT_GENERATOR_TEMPLATE",
+    "SFW_PROMPT_GENERATOR_JSON_TEMPLATE",
+]
