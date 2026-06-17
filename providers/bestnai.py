@@ -344,7 +344,10 @@ class BestNAIProvider(BaseImageProvider):
 
         # 图生图 / 参考模式
         if ref_image and ref_mode:
-            image_uri = ref_image if ref_image.startswith("data:") else self._to_data_uri(ref_image)
+            if ref_image.startswith(("data:", "http://", "https://")):
+                image_uri = ref_image
+            else:
+                image_uri = self._to_data_uri(ref_image)
             if ref_mode == "i2i":
                 if params.get("size"):
                     ref_image = self._resize_to_match(ref_image, params["size"])

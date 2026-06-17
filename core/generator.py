@@ -683,9 +683,9 @@ async def fetch_ref_image(kwargs: dict, stream_id: str = "") -> Optional[str]:
         except Exception as e:
             plugin.ctx.logger.debug(f"[参考图] NapCat get_msg 失败: {e}")
 
-        # 2b-ii. 通过 SDK message.get_by_id 获取
+        # 2b-ii. 通过 SDK message.get_by_id 获取（include_binary_data 拿回原始图片）
         try:
-            sdk_result = await plugin.ctx.message.get_by_id(message_id=target_id)
+            sdk_result = await plugin.ctx.message.get_by_id(message_id=target_id, include_binary_data=True)
             if isinstance(sdk_result, dict):
                 inner = sdk_result.get("result", sdk_result)
                 if isinstance(inner, dict):
@@ -709,6 +709,7 @@ async def fetch_ref_image(kwargs: dict, stream_id: str = "") -> Optional[str]:
         for msg in reversed(messages or []):
             if not isinstance(msg, dict):
                 continue
+            # NapCat 格式（raw_message/message 字段）
             segs = msg.get("message", msg.get("raw_message", []))
             for seg in (segs or []):
                 if isinstance(seg, dict) and seg.get("type") == "image":
@@ -722,8 +723,25 @@ async def fetch_ref_image(kwargs: dict, stream_id: str = "") -> Optional[str]:
                             resolved = await _resolve_napcat_file_image(file_data, plugin)
                             if resolved:
                                 return resolved
+                        url = str(data.get("url") or "")
+                        if url:
+                            downloaded = await _download_image_as_base64(url, plugin)
+                            if downloaded:
+                                return downloaded
                     if isinstance(data, str) and data:
+                        continue  # SnowLuma 将图片替换为文字描述且不缓存二进制，跳过
                         return data
+            # SDK 格式（SnowLuma 等非 NapCat 适配器），跳过文字描述
+            img = _extract_image_from_sdk_message(msg)
+            if img and not img.startswith("[图"):
+                if img.startswith(("http://", "https://")):
+                    downloaded = await _download_image_as_base64(img, plugin)
+                    if downloaded:
+                        plugin.ctx.logger.info("[参考图] SDK 历史 URL 下载")
+                        return downloaded
+                else:
+                    plugin.ctx.logger.info("[参考图] SDK 历史图片")
+                    return img
     except Exception as e:
         plugin.ctx.logger.warning(f"[参考图] NapCat 历史获取失败: {e}")
 
@@ -793,13 +811,17 @@ def _extract_image_from_sdk_message(msg: dict) -> Optional[str]:
     raw = msg.get("raw_message", msg.get("message", []))
     if isinstance(raw, list):
         for s in raw:
-            if isinstance(s, dict) and s.get("type") == "image":
+            if isinstance(s, dict) and s.get("type") in ("image", "emoji"):
+                # SnowLuma adapter 存储的原始二进制（include_binary_data=True 时返回）
+                b64 = str(s.get("binary_data_base64") or "")
+                if b64:
+                    return b64
                 data = s.get("data", "")
                 if isinstance(data, dict):
                     url = data.get("url") or data.get("file") or data.get("base64") or ""
                     if url:
                         return str(url)
-                elif isinstance(data, str) and data:
+                elif isinstance(data, str) and data and not data.startswith("[图"):
                     return data
     return None
 

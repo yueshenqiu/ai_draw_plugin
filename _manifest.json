@@ -27,6 +27,7 @@
     "send.forward",
     "send.custom",
     "message.get_recent",
+    "message.get_by_id",
     "llm.generate",
     "db.query",
     "db.save",
