@@ -131,18 +131,13 @@ async def generate_and_send(
 
         info = plugin._extract_session_info(kwargs or {})
 
-        # 预热 bot 身份缓存：首次发图时从历史消息拉取 bot 的真实 QQ 号和昵称
-        if not _cached_bot_self_id or not _cached_bot_nickname:
-            await fetch_recent_messages(
-                stream_id=stream_id, limit=3,
+        # 预热 bot 身份缓存，让会话内第一次合并转发不必现查身份
+        if not _cached_bot_self_id:
+            await _ensure_bot_identity(
+                stream_id=stream_id,
                 group_id=info["chat_id"] if info.get("chat_type") == "group" else "",
                 user_id=info["user_id"] if info.get("chat_type") == "private" else "",
             )
-            if _cached_bot_self_id:
-                plugin.ctx.logger.info(
-                    f"[身份缓存] bot_uin={_cached_bot_self_id} "
-                    f"nickname={_cached_bot_nickname or '(未获取到)'}"
-                )
         send_ok, sent_msg_id = await send_image_result(
             result, prompt_text or prompt, stream_id,
             group_id=info["chat_id"] if info.get("chat_type") == "group" else "",
@@ -295,7 +290,14 @@ async def send_image_forward(
     if not plugin:
         return None
 
-    bot_uin = _cached_bot_self_id or "0"
+    # 合并转发 node 必须带真实 bot QQ 号；uin=0 会被服务端拒绝 (retcode=1200)
+    if not _cached_bot_self_id:
+        await _ensure_bot_identity(stream_id=stream_id, group_id=group_id, user_id=user_id)
+    if not _cached_bot_self_id:
+        plugin.ctx.logger.warning("[发送] 未获取到 bot QQ 号，合并转发改为普通直发")
+        return await send_image_direct(image_base64, stream_id, group_id, user_id)
+
+    bot_uin = _cached_bot_self_id
     bot_name = _cached_bot_nickname or bot_uin
     file_uri = _prepare_image_file(image_base64)
 
@@ -556,6 +558,67 @@ def _capture_bot_identity(messages: list) -> None:
         # 都拿到了就退出
         if _cached_bot_self_id and _cached_bot_nickname:
             return
+
+
+async def _ensure_bot_identity(
+    stream_id: str = "",
+    group_id: str = "",
+    user_id: str = "",
+) -> bool:
+    """确保已缓存 bot 的真实 QQ 号（合并转发 node 必需）。
+
+    两条路覆盖不同适配器：
+    - 主：get_login_info 直接拿 bot 身份，不依赖历史消息的 self_id 字段
+      （SnowLuma 会在历史消息返回时剥掉 self_id，只能走这条）。
+    - 回退：扫最近历史消息提取 self_id（NapCat 保留该字段，老路径仍可用），
+      在 get_login_info 不可用时兜底。
+
+    uin 退化为 "0" 会被服务端拒绝（retcode=1200）。返回 True 表示已有可用 QQ 号。
+    """
+    global _cached_bot_self_id, _cached_bot_nickname
+    if _cached_bot_self_id:
+        return True
+
+    plugin = get_plugin_instance()
+
+    # 主路径：get_login_info
+    try:
+        resp = await _napcat_http_call("get_login_info", {})
+        if resp and resp.get("status") == "ok":
+            data = resp.get("data") or {}
+            uid = str(data.get("user_id", "") or "")
+            nick = str(data.get("nickname", "") or "")
+            if uid and uid != "0":
+                _cached_bot_self_id = uid
+                if nick and not _cached_bot_nickname:
+                    _cached_bot_nickname = nick
+                if plugin:
+                    plugin.ctx.logger.info(
+                        f"[身份缓存] get_login_info bot_uin={_cached_bot_self_id} "
+                        f"nickname={_cached_bot_nickname or '(未获取到)'}"
+                    )
+                return True
+    except Exception as e:
+        if plugin:
+            plugin.ctx.logger.warning(f"[身份缓存] get_login_info 失败，回退历史消息: {e}")
+
+    # 回退路径：扫历史消息提取 self_id（NapCat 等保留该字段的适配器）
+    if not _cached_bot_self_id and (group_id or user_id or stream_id):
+        try:
+            await fetch_recent_messages(
+                stream_id=stream_id, limit=3,
+                group_id=group_id, user_id=user_id,
+            )
+            if _cached_bot_self_id and plugin:
+                plugin.ctx.logger.info(
+                    f"[身份缓存] 历史消息 bot_uin={_cached_bot_self_id} "
+                    f"nickname={_cached_bot_nickname or '(未获取到)'}"
+                )
+        except Exception as e:
+            if plugin:
+                plugin.ctx.logger.warning(f"[身份缓存] 历史消息回退失败: {e}")
+
+    return bool(_cached_bot_self_id)
 
 
 async def fetch_recent_messages(
