@@ -16,51 +16,9 @@ from ..instance import get_plugin_instance
 from ..providers import get_provider_class
 from .image_utils import process_api_response
 
-_TEMP_IMAGES_DIR = Path(__file__).resolve().parent.parent / "temp_images"
-_MAX_TEMP_FILES = 10
-
 # 缓存 bot 真实 QQ 号和昵称（用于合并转发，避免伪造身份触发风控）
 _cached_bot_self_id: str = ""
 _cached_bot_nickname: str = ""
-
-
-def _get_temp_image_path(suffix: str = ".jpg", prefix: str = "ai_fwd_") -> Path:
-    """在插件目录 temp_images/ 下生成临时文件路径，并确保最多保留 _MAX_TEMP_FILES 个文件。"""
-    _TEMP_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-    # 写前预留一个名额：清理到 _MAX_TEMP_FILES - 1，写入新文件后总数恰好不超过 _MAX_TEMP_FILES。
-    _cleanup_temp_images(keep=max(0, _MAX_TEMP_FILES - 1))
-    filename = f"{prefix}{int(time.time() * 1000)}{suffix}"
-    return _TEMP_IMAGES_DIR / filename
-
-
-def _cleanup_temp_images(keep: int = _MAX_TEMP_FILES) -> None:
-    """保留最新的 keep 个文件，删除多余的旧文件。
-
-    逐文件容错：并发生图任务之间可能删到同一个文件（FileNotFoundError），
-    或文件被 NapCat 占用导致删除失败（Windows PermissionError）。这些都只能
-    跳过当前文件，绝不能中断整轮清理——否则旧的临时图会一直堆积。
-    """
-    try:
-        candidates = [p for p in _TEMP_IMAGES_DIR.iterdir() if p.is_file()]
-    except (FileNotFoundError, OSError):
-        return
-
-    def _mtime(p: Path) -> float:
-        try:
-            return p.stat().st_mtime
-        except OSError:
-            return 0.0  # 取不到时间的当作最旧，优先清理
-
-    candidates.sort(key=_mtime)
-    overflow = len(candidates) - max(0, keep)
-    if overflow <= 0:
-        return
-    for old in candidates[:overflow]:
-        try:
-            old.unlink(missing_ok=True)
-        except OSError:
-            # 文件被占用或已被其他任务删除，跳过不影响其余文件清理
-            continue
 
 
 # ================================================================
@@ -262,19 +220,6 @@ def _resolve_send_function(kwargs: dict, group_id: str, user_id: str):
     return send_image_forward if send_mode == "forward" else send_image_direct
 
 
-def _prepare_image_file(image_base64: str) -> str:
-    """解码图片、按原始格式写入临时文件，返回 file:/// URI。
-
-    不做任何压缩/转码，保持 NAI 原始 PNG 画质。
-    """
-    img_bytes = base64.b64decode(image_base64)
-    is_png = img_bytes[:8] == b'\x89PNG\r\n\x1a\n'
-    suffix = ".png" if is_png else ".jpg"
-    tmp_path = _get_temp_image_path(suffix=suffix, prefix="ai_fwd_")
-    tmp_path.write_bytes(img_bytes)
-    return str(tmp_path).replace("\\", "/")
-
-
 async def send_image_forward(
     image_base64: str,
     stream_id: str,
@@ -283,8 +228,7 @@ async def send_image_forward(
 ) -> Optional[str]:
     """通过合并转发发送图片，返回 message_id 用于撤回。
 
-    直接调用 NapCat HTTP API（绕过 SDK IPC 链路），避免多层超时导致假失败。
-    合并转发更隐蔽但慢（QQ 服务端构建 multimsg 耗时）。
+    走 SDK passthrough 发送。合并转发更隐蔽但慢（QQ 服务端构建 multimsg 耗时）。
     """
     plugin = get_plugin_instance()
     if not plugin:
@@ -299,9 +243,9 @@ async def send_image_forward(
 
     bot_uin = _cached_bot_self_id
     bot_name = _cached_bot_nickname or bot_uin
-    file_uri = _prepare_image_file(image_base64)
 
-    node_content = [{"type": "image", "data": {"file": f"file:///{file_uri}"}}]
+    # 通过 base64 内联图片，避免依赖适配器与插件同机的本地文件路径
+    node_content = [{"type": "image", "data": {"file": f"base64://{image_base64}"}}]
     messages = [{"type": "node", "data": {"uin": bot_uin, "name": bot_name, "content": node_content}}]
 
     if group_id:
@@ -314,20 +258,14 @@ async def send_image_forward(
         plugin.ctx.logger.error("[发送] 无 group_id 或 user_id")
         return None
 
-    try:
-        resp_data = await _napcat_http_call(action, params)
-        if resp_data and resp_data.get("status") == "ok":
-            data = resp_data.get("data") or {}
-            msg_id = str(data.get("message_id") or data.get("msg_id") or "")
-            if msg_id:
-                plugin.ctx.logger.info(f"[发送] 合并转发成功, message_id={msg_id}")
-                return msg_id
-        retcode = resp_data.get("retcode", -1) if resp_data else -1
-        plugin.ctx.logger.warning(f"[发送] 合并转发返回异常: retcode={retcode}")
-        return None
-    except Exception as e:
-        plugin.ctx.logger.error(f"[发送] 合并转发失败: {e}")
-        return None
+    resp_data = await _napcat_action(action, params)
+    if resp_data and resp_data.get("message_id"):
+        msg_id = resp_data["message_id"]
+        plugin.ctx.logger.info(f"[发送] 合并转发成功, message_id={msg_id}")
+        return msg_id
+    retcode = resp_data.get("retcode", -1) if resp_data else -1
+    plugin.ctx.logger.warning(f"[发送] 合并转发返回异常: retcode={retcode}")
+    return None
 
 
 async def send_image_direct(
@@ -338,15 +276,14 @@ async def send_image_direct(
 ) -> Optional[str]:
     """普通图片消息直发，返回 message_id 用于撤回。
 
-    直接调用 NapCat HTTP API。普通图片消息比合并转发快很多
+    通过 SDK passthrough 调用适配器发送。普通图片消息比合并转发快很多
     （无需 QQ 服务端构建 multimsg），但隐蔽性略低。
     """
     plugin = get_plugin_instance()
     if not plugin:
         return None
 
-    file_uri = _prepare_image_file(image_base64)
-    message = [{"type": "image", "data": {"file": f"file:///{file_uri}"}}]
+    message = [{"type": "image", "data": {"file": f"base64://{image_base64}"}}]
 
     if group_id:
         action = "send_group_msg"
@@ -358,44 +295,54 @@ async def send_image_direct(
         plugin.ctx.logger.error("[发送] 无 group_id 或 user_id")
         return None
 
-    try:
-        resp_data = await _napcat_http_call(action, params)
-        if resp_data and resp_data.get("status") == "ok":
-            data = resp_data.get("data") or {}
-            msg_id = str(data.get("message_id") or data.get("msg_id") or "")
-            if msg_id:
-                plugin.ctx.logger.info(f"[发送] 普通直发成功, message_id={msg_id}")
-                return msg_id
-        retcode = resp_data.get("retcode", -1) if resp_data else -1
-        plugin.ctx.logger.warning(f"[发送] 普通直发返回异常: retcode={retcode}")
-        return None
-    except Exception as e:
-        plugin.ctx.logger.error(f"[发送] 普通直发失败: {e}")
-        return None
+    resp_data = await _napcat_action(action, params)
+    if resp_data and resp_data.get("message_id"):
+        msg_id = resp_data["message_id"]
+        plugin.ctx.logger.info(f"[发送] 普通直发成功, message_id={msg_id}")
+        return msg_id
+    retcode = resp_data.get("retcode", -1) if resp_data else -1
+    plugin.ctx.logger.warning(f"[发送] 普通直发返回异常: retcode={retcode}")
+    return None
 
 
-async def _napcat_http_call(action: str, params: dict, timeout: int = 60) -> Optional[dict]:
-    """直接调用 NapCat 本地 HTTP API，绕过 SDK IPC 层。"""
-    import aiohttp
+async def _napcat_action(action: str, params: dict) -> Optional[dict]:
+    """通过 SDK passthrough 调用适配器的 NapCat 动作，返回归一化响应。
+
+    走 ctx.api.call("adapter.napcat.*")，在 SDK 边界内执行，不直连 HTTP。
+    napcat-adapter 与 SnowLuma 适配器在同一命名空间下暴露这些动作，
+    返回结构一致（原始 OneBot 响应）。失败返回 None。
+    """
     plugin = get_plugin_instance()
-    base_url = "http://127.0.0.1:5700"
-    token = ""
-    if plugin:
-        base_url = getattr(plugin.config.plugin, "napcat_http_url", base_url) or base_url
-        token = getattr(plugin.config.plugin, "napcat_http_token", "") or ""
-    url = f"{base_url.rstrip('/')}/{action}"
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=params, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-                return await resp.json()
-    except Exception as e:
-        if plugin:
-            plugin.ctx.logger.error(f"[NapCat HTTP] 请求失败: {action} -> {e}")
+    if not plugin:
         return None
-
+    if action == "get_login_info":
+        api_name = "adapter.napcat.system.get_login_info"
+    else:
+        api_name = f"adapter.napcat.message.{action}"
+    try:
+        result = await plugin.ctx.api.call(api_name, params=params)
+    except Exception as e:
+        plugin.ctx.logger.error(f"[passthrough] 调用 {api_name} 失败: {e}")
+        return None
+    if not isinstance(result, dict):
+        plugin.ctx.logger.warning(f"[passthrough] {api_name} 返回非字典: {result!r}")
+        return None
+    status = str(result.get("status") or "").lower()
+    retcode = result.get("retcode")
+    if (status and status != "ok") or (isinstance(retcode, int) and retcode not in (0, 1)):
+        plugin.ctx.logger.warning(f"[passthrough] {api_name} 返回异常: status={status} retcode={retcode}")
+        return None
+    # message_id 兼容顶层或 data 内
+    data = result.get("data")
+    msg_id = str(result.get("message_id") or "")
+    if not msg_id and isinstance(data, dict):
+        msg_id = str(data.get("message_id") or data.get("msg_id") or "")
+    return {
+        "status": result.get("status", "ok"),
+        "retcode": retcode if retcode is not None else 0,
+        "message_id": msg_id,
+        "data": data,
+    }
 
 
 def _extract_message_id_from_response(resp) -> Optional[str]:
@@ -583,8 +530,8 @@ async def _ensure_bot_identity(
 
     # 主路径：get_login_info
     try:
-        resp = await _napcat_http_call("get_login_info", {})
-        if resp and resp.get("status") == "ok":
+        resp = await _napcat_action("get_login_info", {})
+        if resp and resp.get("data"):
             data = resp.get("data") or {}
             uid = str(data.get("user_id", "") or "")
             nick = str(data.get("nickname", "") or "")
@@ -627,12 +574,12 @@ async def fetch_recent_messages(
     group_id: str = "",
     user_id: str = "",
 ) -> list:
-    """获取最近消息（优先 NapCat 直连，回退 MaiBot DB）。"""
+    """获取最近消息（优先适配器 passthrough，回退 MaiBot DB）。"""
     plugin = get_plugin_instance()
     if not plugin:
         return []
 
-    # 群聊：NapCat 直连
+    # 群聊：passthrough 取历史
     if group_id:
         try:
             result = await plugin.ctx.api.call(
@@ -647,7 +594,7 @@ async def fetch_recent_messages(
         except Exception as e:
             plugin.ctx.logger.warning(f"[撤回] get_group_msg_history 失败: {e}")
 
-    # 私聊：NapCat 直连
+    # 私聊：passthrough 取历史
     if user_id:
         try:
             result = await plugin.ctx.api.call(
@@ -895,15 +842,16 @@ async def _download_image_as_base64(url: str, plugin) -> Optional[str]:
         return None
     try:
         import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                if resp.status != 200:
-                    plugin.ctx.logger.warning(f"[参考图] 下载图片失败 HTTP {resp.status}")
-                    return None
-                data = await resp.read()
-                if not data:
-                    return None
-                return base64.b64encode(data).decode("utf-8")
+        from .http_client import get_session
+        session = await get_session(30)
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status != 200:
+                plugin.ctx.logger.warning(f"[参考图] 下载图片失败 HTTP {resp.status}")
+                return None
+            data = await resp.read()
+            if not data:
+                return None
+            return base64.b64encode(data).decode("utf-8")
     except Exception as e:
         plugin.ctx.logger.warning(f"[参考图] 下载图片异常: {e}")
         return None
@@ -1041,8 +989,8 @@ async def auto_recall_task(stream_id: str = "", group_id: str = "", user_id: str
         # 优先路径：直接用 message_id 撤回
         if message_id:
             try:
-                resp = await _napcat_http_call("delete_msg", {"message_id": int(message_id)}, timeout=15)
-                if resp and resp.get("status") == "ok":
+                resp = await _napcat_action("delete_msg", {"message_id": int(message_id)})
+                if resp and resp.get("retcode") in (0, 1, None) and resp.get("status") != "failed":
                     plugin.ctx.logger.info(
                         f"[自动撤回] 精确撤回成功: message_id={message_id}"
                     )
@@ -1088,8 +1036,8 @@ async def auto_recall_task(stream_id: str = "", group_id: str = "", user_id: str
         target_time, target_id = candidates[0]
 
         try:
-            resp = await _napcat_http_call("delete_msg", {"message_id": int(target_id)}, timeout=15)
-            if resp and resp.get("status") == "ok":
+            resp = await _napcat_action("delete_msg", {"message_id": int(target_id)})
+            if resp and resp.get("retcode") in (0, 1, None) and resp.get("status") != "failed":
                 plugin.ctx.logger.info(
                     f"[自动撤回] 回退撤回成功: {target_id} (after_ts={after_ts}, msg_time={target_time})"
                 )

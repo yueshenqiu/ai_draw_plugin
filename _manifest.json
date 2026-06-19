@@ -25,15 +25,11 @@
     "send.text",
     "send.image",
     "send.forward",
-    "send.custom",
     "message.get_recent",
     "message.get_by_id",
     "llm.generate",
-    "db.query",
-    "db.save",
     "config.get",
-    "api.call",
-    "emoji.get_random"
+    "api.call"
   ],
   "i18n": {
     "default_locale": "zh-CN",

@@ -26,8 +26,6 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_label__ = "插件基本配置"
     enabled: bool = Field(default=True, description="是否启用插件")
     config_version: str = Field(default="2.0.0", description="配置版本号")
-    napcat_http_url: str = Field(default="http://127.0.0.1:5780", description="NapCat HTTP API 地址（直连，绕过 IPC）")
-    napcat_http_token: str = Field(default="", description="NapCat HTTP API Token")
     send_mode: str = Field(default="direct", description="图片发送方式：direct（普通直发，快）/ forward（合并转发，隐蔽但慢）")
     force_forward_when_nsfw_off: bool = Field(default=True, description="NSFW 过滤关闭时强制用合并转发（更隐蔽）")
 
