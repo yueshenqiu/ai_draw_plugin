@@ -4,14 +4,12 @@
 [plugin]
 enabled = true
 config_version = "2.0.0"
-napcat_http_url = "http://127.0.0.1:5780"   # NapCat HTTP API 地址（直连，绕过 IPC）
-napcat_http_token = ""
 send_mode = "direct"                          # direct=普通直发（快） / forward=合并转发（隐蔽但慢）
 force_forward_when_nsfw_off = true            # NSFW 过滤关闭时强制合并转发
 
 
 [admin]
-admin_users = []   # 管理员 QQ 号列表，例如 ["10001"]
+admin_users = [""]   # 管理员 QQ 号列表
 default_admin_mode = false     # 启用后仅管理员可使用生图命令
 
 
@@ -85,7 +83,7 @@ system_prompt = ""
 default_model = "model1"
 
 [models.model1]
-name = "BestNAI V4.5 - 梦幻柔美"
+name = "BestNAI V4.5"
 format = "bestnai"
 base_url = ""
 api_key = ""
@@ -99,12 +97,12 @@ cfg = 0.1
 noise_schedule = "karras"
 default_size = "832x1216"
 size_preset = "竖图"
-artist_preset = "梦幻柔美"
+artist_preset = "无"
 
 [models.model2]
 name = "BestNAI V4.5 - 纯净模式"
 format = "bestnai"
-base_url = ""
+base_url = "https://api.tuercha.com"
 api_key = ""
 model = "nai-diffusion-4-5-full"
 endpoint = "/v1/chat/completions"
@@ -121,7 +119,7 @@ artist_preset = "无"
 [models.model3]
 name = "BestNAI V4 - 默认"
 format = "bestnai"
-base_url = ""
+base_url = "https://api.tuercha.com"
 api_key = ""
 model = "nai-diffusion-4-full"
 endpoint = "/v1/chat/completions"
@@ -133,4 +131,4 @@ cfg = 0.0
 noise_schedule = "karras"
 default_size = "832x1216"
 size_preset = "竖图"
-artist_preset = "风格组合1"
+artist_preset = "无"
