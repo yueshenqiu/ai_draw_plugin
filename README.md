@@ -47,6 +47,13 @@ Pillow>=10.0.0
 certifi>=2024.2.2
 ```
 
+### 可选的跨插件依赖
+
+自拍场景增强（`[prompt_generator] scene_llm_enabled = true`）会尝试通过 `api.call`
+读取日程插件 `xuqian13.autonomous-planning-plugin-v4` 的 `get_current_activity`，
+用当前日程活动丰富自拍场景。**此依赖为可选**：未安装该插件时会静默降级，
+不影响生图与其他功能。
+
 ### 安装方式
 
 **方式一**：将 `ai_draw_plugin` 文件夹复制到 MaiBot 的 `plugins/` 目录下。
