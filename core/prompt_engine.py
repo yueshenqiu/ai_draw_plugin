@@ -75,6 +75,8 @@ async def call_custom_llm_api(
         return False, "API 配置不完整", "", ""
 
     base_url = api_base.rstrip("/")
+    if base_url.startswith("http://"):
+        _logger.warning("[LLM] api_base 为明文 HTTP，API Key 将以明文传输，建议改用 HTTPS")
     url = f"{base_url}/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
@@ -591,6 +593,8 @@ async def analyze_ref_image_character(
         return None
 
     base_url = api_base.rstrip("/")
+    if base_url.startswith("http://"):
+        _logger.warning("[VLM] api_base 为明文 HTTP，API Key 将以明文传输，建议改用 HTTPS")
     url = f"{base_url}/v1/chat/completions"
 
     image_format = "png"

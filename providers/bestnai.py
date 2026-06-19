@@ -10,10 +10,12 @@ import base64
 import io
 import json
 import re
+import ssl
 from typing import Dict, Any, Tuple, Optional, List
 
 import requests
 import urllib3
+import certifi
 from requests.adapters import HTTPAdapter
 from requests.exceptions import ProxyError
 from urllib3.util.ssl_ import create_urllib3_context
@@ -30,11 +32,16 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class SSLAdapter(HTTPAdapter):
-    """自定义 SSL 适配器，处理 SSL 连接问题"""
+    """自定义 SSL 适配器：保留证书验证，同时兼容部分老服务器握手。
+
+    证书验证基于 certifi CA 包开启（解决嵌入式 Python 缺 CA 的问题），
+    OP_LEGACY_SERVER_CONNECT 用于兼容不支持 RFC 5746 重协商的旧服务端。
+    """
     def init_poolmanager(self, *args, **kwargs):
         context = create_urllib3_context()
-        context.check_hostname = False
-        context.verify_mode = 0
+        context.load_verify_locations(cafile=certifi.where())
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
         context.options |= 0x4  # OP_LEGACY_SERVER_CONNECT
         kwargs['ssl_context'] = context
         return super().init_poolmanager(*args, **kwargs)
@@ -76,6 +83,8 @@ class BestNAIProvider(BaseImageProvider):
                 return False, "模型配置不完整（缺少 base_url 或 model）"
 
             base_url = (model_config.get("base_url") or "").rstrip('/')
+            if base_url.startswith("http://"):
+                self._logger.warning(f"{self.log_prefix} (BestNAI) base_url 为明文 HTTP，API Key 将以明文传输，建议改用 HTTPS")
             endpoint = model_config.get("endpoint") or model_config.get("nai_endpoint") or "/v1/chat/completions"
             if not endpoint.startswith('/'):
                 endpoint = f"/{endpoint}"
@@ -262,7 +271,7 @@ class BestNAIProvider(BaseImageProvider):
         session = self._get_session(trust_env=trust_env)
         return session.post(
             url=url, headers=headers, json=payload,
-            timeout=120, verify=False, allow_redirects=False,
+            timeout=120, allow_redirects=False,
         )
 
     @staticmethod

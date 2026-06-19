@@ -892,6 +892,20 @@ async def ad_workflow(
 
     plugin.ctx.logger.info("[LLM生图] 最终提示词: %s", generated_prompt)
 
+    # NSFW 过滤：LLM 产出的是英文 prompt，须在送生图前扫描违规标签。
+    # 直接标签路径在入口已过滤，但 LLM 路径输入是中文、产出才是英文 tag，
+    # 因此过滤点必须放在这里（最终 prompt 生成后、发送生图前）。
+    if nsfw_enabled:
+        found = _filter_nsfw_tags_from_prompt(generated_prompt)
+        if found:
+            plugin.ctx.logger.info("[LLM生图] NSFW过滤拦截: %s", ", ".join(found))
+            await plugin.ctx.send.text(
+                f"NSFW 过滤已开启，生成的提示词包含违规标签被拦截：{', '.join(found)}\n"
+                f"如需生成请使用 /ad nsfw off 关闭过滤。",
+                stream_id,
+            )
+            return
+
     # 提示词显示
     if _is_prompt_show_enabled_from_kwargs(kwargs):
         show_prompt = generated_prompt
@@ -931,8 +945,9 @@ def _check_chat_permission(platform: str, chat_id: str) -> tuple:
     return False, "当前会话不在允许列表中"
 
 
-# NSFW 标签黑名单（用于 /ad0 直接标签模式，NSFW 过滤开启时生效）
+# NSFW 标签黑名单（用于 /ad0 直接标签模式与 LLM 生图最终提示词，NSFW 过滤开启时生效）
 _NSFW_BLACKLIST = [
+    # 显式露骨
     "nsfw", "nude", "naked", "sex", "penis", "pussy", "vagina",
     "nipples", "anus", "penetration", "cum", "ejaculation",
     "fellatio", "cunnilingus", "paizuri", "footjob", "handjob",
@@ -940,6 +955,16 @@ _NSFW_BLACKLIST = [
     "exposed", "spread pussy", "spread legs", "pussy juice",
     "fingering", "dildo", "vibrator", "bondage", "tentacle",
     " rape", "rape ", "guro", "gore", "loli", "shota",
+    # 性暗示 / 软色情
+    "suggestive", "seductive", "erotic", "lewd", "ecchi",
+    "partially dressed", "partially undressed", "undressed",
+    "clothes half-removed", "half-dressed", "half undressed",
+    "bra visible", "bra strap", "panties", "underwear", "lingerie",
+    "cleavage", "downblouse", "upskirt", "visible midriff",
+    "skirt lifted", "skirt pull", "shirt lift", "clothes lift",
+    "thighhighs", "garter belt", "see-through", "wet clothes",
+    "presenting", "spread", "legs spread", "knees up", "m legs",
+    "after sex", "ahegao", "drooling", "saliva", "covered nipples",
 ]
 
 
