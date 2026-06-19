@@ -172,6 +172,7 @@ class BestNAIProvider(BaseImageProvider):
             if token:
                 headers["Authorization"] = f"Bearer {token}"
 
+            # api_key 仅放入 Authorization 头，不写入日志/异常；下方仅记录 url（不含 key）
             self._logger.info(f"{self.log_prefix} (BestNAI) 请求URL: {url}")
 
             # 异步执行 HTTP 请求
