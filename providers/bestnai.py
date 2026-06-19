@@ -14,7 +14,6 @@ import ssl
 from typing import Dict, Any, Tuple, Optional, List
 
 import requests
-import urllib3
 import certifi
 from requests.adapters import HTTPAdapter
 from requests.exceptions import ProxyError
@@ -27,8 +26,6 @@ try:
     _HAS_PIL = True
 except ImportError:
     _HAS_PIL = False
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class SSLAdapter(HTTPAdapter):
