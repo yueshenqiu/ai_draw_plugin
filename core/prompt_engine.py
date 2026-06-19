@@ -78,6 +78,7 @@ async def call_custom_llm_api(
     if base_url.startswith("http://"):
         _logger.warning("[LLM] api_base 为明文 HTTP，API Key 将以明文传输，建议改用 HTTPS")
     url = f"{base_url}/v1/chat/completions"
+    # api_key 仅放入 Authorization 头，不写入任何日志/异常；下方日志只记录 url（不含 key）
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -605,6 +606,7 @@ async def analyze_ref_image_character(
     elif image_base64.startswith("UklGR"):
         image_format = "webp"
 
+    # api_key 仅放入 Authorization 头，不写入任何日志/异常
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
