@@ -327,6 +327,10 @@ async def _napcat_action(action: str, params: dict) -> Optional[dict]:
     if not isinstance(result, dict):
         plugin.ctx.logger.warning(f"[passthrough] {api_name} 返回非字典: {result!r}")
         return None
+    # SDK 失败包装：handler 抛异常时返回 {"success": False, "error": ...}
+    if result.get("success") is False:
+        plugin.ctx.logger.warning(f"[passthrough] {api_name} 调用失败: {result.get('error')}")
+        return None
     status = str(result.get("status") or "").lower()
     retcode = result.get("retcode")
     if (status and status != "ok") or (isinstance(retcode, int) and retcode not in (0, 1)):

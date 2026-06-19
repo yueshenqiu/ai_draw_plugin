@@ -892,19 +892,8 @@ async def ad_workflow(
 
     plugin.ctx.logger.info("[LLM生图] 最终提示词: %s", generated_prompt)
 
-    # NSFW 过滤：LLM 产出的是英文 prompt，须在送生图前扫描违规标签。
-    # 直接标签路径在入口已过滤，但 LLM 路径输入是中文、产出才是英文 tag，
-    # 因此过滤点必须放在这里（最终 prompt 生成后、发送生图前）。
-    if nsfw_enabled:
-        found = _filter_nsfw_tags_from_prompt(generated_prompt)
-        if found:
-            plugin.ctx.logger.info("[LLM生图] NSFW过滤拦截: %s", ", ".join(found))
-            await plugin.ctx.send.text(
-                f"NSFW 过滤已开启，生成的提示词包含违规标签被拦截：{', '.join(found)}\n"
-                f"如需生成请使用 /ad nsfw off 关闭过滤。",
-                stream_id,
-            )
-            return
+    # NSFW 开启时由 SFW 提示词模板（SFW_PROMPT_GENERATOR_*）从源头约束 LLM 产出，
+    # 此处不再做产出后的黑名单二次拦截：避免 LLM 已规避、却因个别软色情词被拦下不发图。
 
     # 提示词显示
     if _is_prompt_show_enabled_from_kwargs(kwargs):

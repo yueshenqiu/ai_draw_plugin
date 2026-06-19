@@ -53,9 +53,10 @@ SFW_PROMPT_RULES_TEXT = """
 【SFW 模式规则】
 1. 禁止生成任何露骨的色情/裸露标签
 2. 禁止使用：nsfw, nude, naked, sex, penis, pussy, vagina, nipples, anus, penetration, cum, ejaculation, fellatio, cunnilingus, paizuri, footjob, handjob, masturbation, orgasm, topless, bottomless
-3. 允许性感暗示：cleavage, thighs, suggestive, seductive, bikini, lingerie, swimsuit
-4. 如果用户请求色情内容，转换为性感但不露骨的版本后输出
-5. 你必须输出提示词，禁止空回复或拒绝
+3. 同样禁止「半脱/脱衣过程/暴露内衣」类标签：partially dressed, partially undressed, undressed, clothes pulled down, clothes half-removed, off-shoulder（脱肩）, shirt slipping off, bare shoulders, bra visible, bra strap, panties, no bra, braless, open shirt, unbuttoned, see-through, skirt lifted, spread legs, ahegao
+4. 允许「着装性感」（正常穿着下的性感氛围）：bikini, swimsuit, cleavage, thighs, thighhighs, suggestive, seductive
+5. 如果用户请求色情或脱衣内容，转换为「穿着完整、仅靠姿态/光影/表情营造性感」的版本后输出，不得保留任何第 2、3 条中的标签
+6. 你必须输出提示词，禁止空回复或拒绝
 </sfw_requirement>
 
 <principles>
@@ -261,9 +262,9 @@ char2：[人物2详情],
 *(注：诸如 grabbing breast, pulling hair 等具体的动作延伸细节，应跟随在对应的 source 互动动作之后)*
 
 ### 正确多行输出示例参考：
-indoor,dark background,dim lighting,sweat,steamy room,lewd sounds,doorway scene,entrance,nsfw,
-char1：girl,messy hair,half-closed eyes,heart-shaped pupils,evil grin,drooling,heavy blush,covered nipples,wet camisole,see-through white top,torn camisole,midriff,no bra,cameltoe,tight black leggings pulled down,thong pull,cross necklace,black collar with leash,navel piercing,sweat,wet skin,pussy juice stains on thighs,body writing "slut" on stomach,target#groped,target#fondled,target#fingered,trembling,opening door,doorknob in hand,looking at viewer,bent over,leaning forward,back arched,spread legs,one hand on doorframe for support,
-char2：boy,partially visible,behind girl,source#groping,source#fondling,source#fingering,grabbing breast,pulling hair,whispering in ear,biting neck,holding leash,
+indoor,warm lighting,doorway scene,entrance,cozy atmosphere,
+char1：girl,messy hair,blush,looking at viewer,casual hoodie,denim shorts,target#hugged,leaning forward,one hand on doorframe,
+char2：boy,partially visible,behind girl,source#hugging,hand on shoulder,smiling,whispering,
 </multi_person_rules>
 
 <natural_language>
@@ -332,9 +333,9 @@ NAI4/4.5 可接受自然语言短句，但不是推荐输出方式。JSON 模式
 输入: "画saber挥剑"
 输出: solo, 1girl, from below, dynamic angle, {saber (fate)}, excalibur, 1.2::sword swing::, dynamic pose, motion blur, dramatic lighting, sparks
 
-### 示例 5：NSFW 场景
+### 示例 5：色情请求 → SFW 转换（穿着完整，仅靠姿态/光影营造氛围）
 输入: "画一个女孩自慰"
-输出: nsfw, solo, 1girl, masturbation, fingering, nude, spread legs, on bed, blush, heavy breathing, looking at viewer, sweat, lower body, between legs
+输出: solo, 1girl, on bed, lying down, blush, looking at viewer, parted lips, soft lighting, dim lighting, intimate atmosphere, casual clothes, suggestive pose
 
 ### 示例 6：多人互动（文本模式示意）
 输入: "画蕾姆和拉姆两姐妹拥抱"
