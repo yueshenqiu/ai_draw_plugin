@@ -6,6 +6,7 @@
 
 import asyncio
 import base64
+import os
 import random
 import re
 import time
@@ -16,9 +17,48 @@ from ..instance import get_plugin_instance
 from ..providers import get_provider_class
 from .image_utils import process_api_response
 
+_TEMP_IMAGES_DIR = Path(__file__).resolve().parent.parent / "temp_images"
+_MAX_TEMP_FILES = 10
+
 # 缓存 bot 真实 QQ 号和昵称（用于合并转发，避免伪造身份触发风控）
 _cached_bot_self_id: str = ""
 _cached_bot_nickname: str = ""
+
+
+def _cleanup_temp_images() -> None:
+    """保留最新的 _MAX_TEMP_FILES 个文件，删除多余的旧文件。"""
+    try:
+        files = sorted(_TEMP_IMAGES_DIR.iterdir(), key=lambda p: p.stat().st_mtime)
+        while len(files) > _MAX_TEMP_FILES:
+            oldest = files.pop(0)
+            oldest.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _get_temp_image_path(suffix: str = ".jpg", prefix: str = "ai_fwd_") -> Path:
+    """在插件目录 temp_images/ 下生成临时文件路径，并确保最多保留 _MAX_TEMP_FILES 个文件。"""
+    _TEMP_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    _cleanup_temp_images()
+    # pid + 毫秒 + 随机段：并发生图任务可能在同一毫秒落点，仅靠时间戳会撞名
+    unique = f"{os.getpid()}_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+    filename = f"{prefix}{unique}{suffix}"
+    return _TEMP_IMAGES_DIR / filename
+
+
+def _prepare_image_file(image_base64: str) -> str:
+    """解码图片、按原始格式写入临时文件，返回 file:/// URI。
+
+    本地文件路径让同机适配器直接读盘、零传输开销（远快于 base64 内联）；
+    不做任何压缩/转码，保持 NAI 原始 PNG 画质。
+    """
+    img_bytes = base64.b64decode(image_base64)
+    is_png = img_bytes[:8] == b'\x89PNG\r\n\x1a\n'
+    suffix = ".png" if is_png else ".jpg"
+    tmp_path = _get_temp_image_path(suffix=suffix, prefix="ai_fwd_")
+    tmp_path.write_bytes(img_bytes)
+    return str(tmp_path).replace("\\", "/")
+
 
 
 # ================================================================
@@ -244,8 +284,9 @@ async def send_image_forward(
     bot_uin = _cached_bot_self_id
     bot_name = _cached_bot_nickname or bot_uin
 
-    # 通过 base64 内联图片，避免依赖适配器与插件同机的本地文件路径
-    node_content = [{"type": "image", "data": {"file": f"base64://{image_base64}"}}]
+    # 写入本地临时文件，传 file:/// 路径供同机适配器直接读盘（零传输开销，远快于 base64 内联）
+    file_uri = _prepare_image_file(image_base64)
+    node_content = [{"type": "image", "data": {"file": f"file:///{file_uri}"}}]
     messages = [{"type": "node", "data": {"uin": bot_uin, "name": bot_name, "content": node_content}}]
 
     if group_id:
@@ -283,7 +324,9 @@ async def send_image_direct(
     if not plugin:
         return None
 
-    message = [{"type": "image", "data": {"file": f"base64://{image_base64}"}}]
+    # 写入本地临时文件，传 file:/// 路径供同机适配器直接读盘（零传输开销，远快于 base64 内联）
+    file_uri = _prepare_image_file(image_base64)
+    message = [{"type": "image", "data": {"file": f"file:///{file_uri}"}}]
 
     if group_id:
         action = "send_group_msg"
@@ -305,16 +348,82 @@ async def send_image_direct(
     return None
 
 
-async def _napcat_action(action: str, params: dict) -> Optional[dict]:
-    """通过 SDK passthrough 调用适配器的 NapCat 动作，返回归一化响应。
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 
-    走 ctx.api.call("adapter.napcat.*")，在 SDK 边界内执行，不直连 HTTP。
-    napcat-adapter 与 SnowLuma 适配器在同一命名空间下暴露这些动作，
-    返回结构一致（原始 OneBot 响应）。失败返回 None。
+
+def _normalize_action_response(payload: Optional[dict]) -> Optional[dict]:
+    """把适配器/HTTP 的原始 OneBot 响应归一化为 {status,retcode,message_id,data}。"""
+    if not isinstance(payload, dict):
+        return None
+    status = str(payload.get("status") or "").lower()
+    retcode = payload.get("retcode")
+    if (status and status != "ok") or (isinstance(retcode, int) and retcode not in (0, 1)):
+        return None
+    data = payload.get("data")
+    msg_id = str(payload.get("message_id") or "")
+    if not msg_id and isinstance(data, dict):
+        msg_id = str(data.get("message_id") or data.get("msg_id") or "")
+    return {
+        "status": payload.get("status", "ok"),
+        "retcode": retcode if retcode is not None else 0,
+        "message_id": msg_id,
+        "data": data,
+    }
+
+
+async def _napcat_http_call(action: str, params: dict, timeout: int = 60) -> Optional[dict]:
+    """直连本机 NapCat/SnowLuma HTTP API（仅 use_http_direct=true 时启用）。
+
+    地址强制限定本机回环，防 SSRF；token 仅放入 Authorization 头、不写入日志。
+    慢环境下 HTTP 直连超时预算更长（默认 60s），避免回执超时丢失 message_id。
+    """
+    import aiohttp
+    from urllib.parse import urlparse
+
+    plugin = get_plugin_instance()
+    if not plugin:
+        return None
+    base_url = str(getattr(plugin.config.plugin, "napcat_http_url", "") or "").strip()
+    token = str(getattr(plugin.config.plugin, "napcat_http_token", "") or "").strip()
+    host = (urlparse(base_url).hostname or "").lower()
+    if host not in _LOCAL_HOSTS:
+        plugin.ctx.logger.error(f"[HTTP直连] 拒绝非本机地址（仅允许本机回环）: host={host or '?'}")
+        return None
+
+    url = f"{base_url.rstrip('/')}/{action}"
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, json=params, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                if resp.status != 200:
+                    plugin.ctx.logger.warning(f"[HTTP直连] {action} HTTP {resp.status}")
+                    return None
+                return await resp.json()
+    except Exception as e:
+        plugin.ctx.logger.warning(f"[HTTP直连] {action} 失败: {e}")
+        return None
+
+
+async def _napcat_action(action: str, params: dict) -> Optional[dict]:
+    """调用 NapCat 动作，返回归一化响应 {status,retcode,message_id,data}。
+
+    默认走 SDK passthrough（ctx.api.call，合规、在 SDK 边界内）；
+    当 use_http_direct=true 时改走本机 HTTP 直连（慢环境提速、超时预算更长）。
+    两个适配器（napcat-adapter / SnowLuma）返回结构一致。失败返回 None。
     """
     plugin = get_plugin_instance()
     if not plugin:
         return None
+
+    # 分流：HTTP 直连（可选） vs SDK passthrough（默认）
+    if getattr(plugin.config.plugin, "use_http_direct", False):
+        return _normalize_action_response(await _napcat_http_call(action, params))
+
     if action == "get_login_info":
         api_name = "adapter.napcat.system.get_login_info"
     else:
@@ -331,22 +440,7 @@ async def _napcat_action(action: str, params: dict) -> Optional[dict]:
     if result.get("success") is False:
         plugin.ctx.logger.warning(f"[passthrough] {api_name} 调用失败: {result.get('error')}")
         return None
-    status = str(result.get("status") or "").lower()
-    retcode = result.get("retcode")
-    if (status and status != "ok") or (isinstance(retcode, int) and retcode not in (0, 1)):
-        plugin.ctx.logger.warning(f"[passthrough] {api_name} 返回异常: status={status} retcode={retcode}")
-        return None
-    # message_id 兼容顶层或 data 内
-    data = result.get("data")
-    msg_id = str(result.get("message_id") or "")
-    if not msg_id and isinstance(data, dict):
-        msg_id = str(data.get("message_id") or data.get("msg_id") or "")
-    return {
-        "status": result.get("status", "ok"),
-        "retcode": retcode if retcode is not None else 0,
-        "message_id": msg_id,
-        "data": data,
-    }
+    return _normalize_action_response(result)
 
 
 def _extract_message_id_from_response(resp) -> Optional[str]:
@@ -402,9 +496,12 @@ def is_nai_bot_message(msg: dict, display_text: str = "") -> bool:
     sender = msg.get("sender", {}) or {}
     sender_id = str(sender.get("user_id", ""))
     self_id = str(msg.get("self_id", ""))
+    # SnowLuma 等适配器会从历史消息剥掉 self_id，改用已缓存的 bot QQ 号兜底判定，
+    # 否则慢环境下丢失精确 message_id 后、回退匹配也认不出 bot 自己发的图。
     is_self = (
         msg.get("self") is True
         or (bool(self_id) and bool(sender_id) and self_id == sender_id)
+        or (bool(_cached_bot_self_id) and bool(sender_id) and sender_id == _cached_bot_self_id)
     )
 
     # 检查消息段类型
@@ -682,7 +779,7 @@ async def fetch_ref_image(kwargs: dict, stream_id: str = "") -> Optional[str]:
 
         plugin.ctx.logger.info(f"[参考图] 从 reply segment 追溯目标消息: {target_id}")
 
-        # 2b-i. 通过 NapCat get_msg 获取被引用消息
+        # 2b-i. 通过 NapCat get_msg 获取被引用消息（实时取回，URL 含有效 rkey）
         try:
             napcat_result = await plugin.ctx.api.call(
                 "adapter.napcat.message.get_msg",
@@ -707,8 +804,15 @@ async def fetch_ref_image(kwargs: dict, stream_id: str = "") -> Optional[str]:
                     if isinstance(target_msg_data, dict):
                         img = _extract_image_from_sdk_message(target_msg_data)
                         if img:
-                            plugin.ctx.logger.info("[参考图] 从 SDK get_by_id 获取引用图片")
-                            return img
+                            # 可能是 base64（binary_data_base64）或 URL；URL 需下载转 base64
+                            if img.startswith(("http://", "https://")):
+                                downloaded = await _download_image_as_base64(img, plugin)
+                                if downloaded:
+                                    plugin.ctx.logger.info("[参考图] 从 SDK get_by_id 获取引用图片(URL 下载)")
+                                    return downloaded
+                            else:
+                                plugin.ctx.logger.info("[参考图] 从 SDK get_by_id 获取引用图片")
+                                return img
         except Exception as e:
             plugin.ctx.logger.debug(f"[参考图] SDK get_by_id 失败: {e}")
 
@@ -793,13 +897,14 @@ async def _resolve_image_from_napcat_msg(msg: dict, plugin) -> Optional[str]:
                 resolved = await _resolve_napcat_file_image(file_data, plugin)
                 if resolved:
                     return resolved
-            # 回退：URL 下载转 base64（QQ 私链可能无法被外部 API 访问）
+            # 回退：URL 下载转 base64（QQ 私链需鉴权，外部 API 无法直接访问）
             url = data.get("url") or ""
             if url:
                 downloaded = await _download_image_as_base64(str(url), plugin)
                 if downloaded:
                     return downloaded
-                return str(url)
+                # 下载失败时不回传裸 URL——外部生图 API 无法读取鉴权私链
+                return None
         elif isinstance(data, str) and data:
             return data
     return None
@@ -850,7 +955,7 @@ async def _download_image_as_base64(url: str, plugin) -> Optional[str]:
         session = await get_session(30)
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
             if resp.status != 200:
-                plugin.ctx.logger.warning(f"[参考图] 下载图片失败 HTTP {resp.status}")
+                plugin.ctx.logger.warning(f"[参考图] 下载图片失败 HTTP {resp.status} url={url[:200]}")
                 return None
             data = await resp.read()
             if not data:
@@ -889,8 +994,14 @@ async def _resolve_napcat_file_image(file_data: str, plugin) -> Optional[str]:
                 plugin.ctx.logger.info(f"[参考图] 本地文件: {file_or_url}")
                 return base64.b64encode(img_path.read_bytes()).decode("utf-8")
         if file_or_url.startswith(("http://", "https://")):
-            plugin.ctx.logger.info(f"[参考图] URL: {file_or_url[:100]}")
-            return file_or_url
+            # get_image 返回的 URL 由本体刷新过 rkey，下载转 base64 供生图 API 使用；
+            # 直接回传 URL 会让外部生图 API 拿到不可读图片（鉴权私链）。
+            downloaded = await _download_image_as_base64(file_or_url, plugin)
+            if downloaded:
+                plugin.ctx.logger.info(f"[参考图] get_image URL 下载成功: {file_or_url[:60]}")
+                return downloaded
+            plugin.ctx.logger.warning(f"[参考图] get_image URL 下载失败: {file_or_url[:100]}")
+            return None
     except Exception as e:
         plugin.ctx.logger.warning(f"[参考图] get_image 失败: {e}")
     return None

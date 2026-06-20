@@ -28,6 +28,9 @@ class PluginSectionConfig(PluginConfigBase):
     config_version: str = Field(default="2.0.0", description="配置版本号")
     send_mode: str = Field(default="direct", description="图片发送方式：direct（普通直发，快）/ forward（合并转发，隐蔽但慢）")
     force_forward_when_nsfw_off: bool = Field(default=True, description="NSFW 过滤关闭时强制用合并转发（更隐蔽）")
+    use_http_direct: bool = Field(default=False, description="是否直连 NapCat/SnowLuma 本机 HTTP API（默认 false 走 SDK passthrough）。慢环境下回执易超时丢失 message_id，可开启此项用 HTTP 直连提速；仅本机地址，配置见 README")
+    napcat_http_url: str = Field(default="http://127.0.0.1:5780", description="HTTP 直连地址（仅 use_http_direct=true 时生效，仅允许本机 127.0.0.1/localhost）")
+    napcat_http_token: str = Field(default="", description="HTTP 直连访问令牌（与 NapCat/SnowLuma 的 HTTP 服务器 token 一致）")
 
 
 class ModelsSectionConfig(PluginConfigBase):
