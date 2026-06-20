@@ -779,22 +779,7 @@ async def fetch_ref_image(kwargs: dict, stream_id: str = "") -> Optional[str]:
 
         plugin.ctx.logger.info(f"[参考图] 从 reply segment 追溯目标消息: {target_id}")
 
-        # 2b-i. 通过 NapCat get_msg 获取被引用消息（实时取回，URL 含有效 rkey）
-        try:
-            napcat_result = await plugin.ctx.api.call(
-                "adapter.napcat.message.get_msg",
-                message_id=int(target_id),
-            )
-            target_msg = _extract_napcat_msg(napcat_result)
-            if target_msg:
-                img = await _resolve_image_from_napcat_msg(target_msg, plugin)
-                if img:
-                    plugin.ctx.logger.info(f"[参考图] 从 NapCat get_msg 获取引用图片, type={img[:30]}...")
-                    return img
-        except Exception as e:
-            plugin.ctx.logger.debug(f"[参考图] NapCat get_msg 失败: {e}")
-
-        # 2b-ii. 通过 SDK message.get_by_id 获取（include_binary_data 拿回原始图片）
+        # 2b-i. 优先 SDK message.get_by_id 查本地库（命中则瞬时返回、零服务器请求）
         try:
             sdk_result = await plugin.ctx.message.get_by_id(message_id=target_id, include_binary_data=True)
             if isinstance(sdk_result, dict):
@@ -815,6 +800,21 @@ async def fetch_ref_image(kwargs: dict, stream_id: str = "") -> Optional[str]:
                                 return img
         except Exception as e:
             plugin.ctx.logger.debug(f"[参考图] SDK get_by_id 失败: {e}")
+
+        # 2b-ii. 本地库未命中，再用 get_msg 上服务器实时取回（URL 含有效 rkey，不依赖本地库）
+        try:
+            napcat_result = await plugin.ctx.api.call(
+                "adapter.napcat.message.get_msg",
+                message_id=int(target_id),
+            )
+            target_msg = _extract_napcat_msg(napcat_result)
+            if target_msg:
+                img = await _resolve_image_from_napcat_msg(target_msg, plugin)
+                if img:
+                    plugin.ctx.logger.info(f"[参考图] 从 NapCat get_msg 获取引用图片, type={img[:30]}...")
+                    return img
+        except Exception as e:
+            plugin.ctx.logger.debug(f"[参考图] NapCat get_msg 失败: {e}")
 
     # 3. NapCat 最近消息回退
     try:
