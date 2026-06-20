@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "2.1.5",
+  "version": "2.1.6",
   "name": "AI Draw 图片生成插件",
   "description": "AI 绘图插件。命令前缀 /ad。支持多模型热切换、LLM 提示词生成、画师/风格预设、自拍模式、图生图/参考模式、双发送模式、自动撤回。Provider 架构预留扩展其他服务商。",
   "author": {
