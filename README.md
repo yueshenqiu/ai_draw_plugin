@@ -256,7 +256,7 @@ ai_draw_plugin/
 
 
 - **三花**想说的话：
-- “https://github.com/Rabbit-Jia-Er ” 他的插件爆改而来，融百家之长的自用插件，有需要的用前请备份！！！后面还要加n多东西，早用早享受，晚用享bug
+- “https://github.com/saberlights/nai_draw_plugin ” 他的插件爆改而来，融百家之长的自用插件，有需要的用前请备份！！！后面还要加n多东西，早用早享受，晚用享bug
 
 ## 许可证
 
