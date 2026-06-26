@@ -409,12 +409,64 @@ async def _napcat_http_call(action: str, params: dict, timeout: int = 60) -> Opt
         return None
 
 
+# 两适配器命名空间差异：send_group_msg 在 napcat=group.* / SnowLuma=message.*；
+# send_private_forward_msg 仅 SnowLuma 有，napcat 回退 send_forward_msg。其余沿用 message.*。
+# 按优先级逐个尝试候选，命中"未找到 API"才换下一个。
+_ACTION_API_CANDIDATES: Dict[str, Tuple[str, ...]] = {
+    "get_login_info": ("adapter.napcat.system.get_login_info",),
+    "send_group_msg": (
+        "adapter.napcat.message.send_group_msg",  # SnowLuma
+        "adapter.napcat.group.send_group_msg",    # napcat-adapter
+    ),
+    "send_private_forward_msg": (
+        "adapter.napcat.message.send_private_forward_msg",  # SnowLuma
+        "adapter.napcat.message.send_forward_msg",          # napcat-adapter 回退
+    ),
+}
+
+# 缓存命中的完整 API 名，避免重复试错（适配器热切换时自愈）
+_resolved_action_api: Dict[str, str] = {}
+
+# 两适配器参数签名差异（SnowLuma 用 **kwargs 全兼容，napcat 各方法互斥）：
+#   params=ctx.api.call(api, params=dict) / spread=call(api, **dict) / noargs=call(api)
+# 未列出默认 params（发送类全走这条）。
+_ACTION_CALL_STYLE: Dict[str, str] = {
+    "get_login_info": "noargs",
+    "delete_msg": "spread",
+}
+
+
+async def _call_action_api(plugin, api_name: str, action: str, params: dict):
+    """按动作的参数约定调用 passthrough API（兼容两适配器互斥的方法签名）。"""
+    style = _ACTION_CALL_STYLE.get(action, "params")
+    if style == "noargs":
+        return await plugin.ctx.api.call(api_name)
+    if style == "spread":
+        return await plugin.ctx.api.call(api_name, **params)
+    return await plugin.ctx.api.call(api_name, params=params)
+
+
+def _candidate_api_names(action: str) -> List[str]:
+    """返回动作的候选完整 API 名（按优先级；上次命中的排最前）。"""
+    candidates = list(_ACTION_API_CANDIDATES.get(action, (f"adapter.napcat.message.{action}",)))
+    cached = _resolved_action_api.get(action)
+    if cached:
+        if cached in candidates:
+            candidates.remove(cached)
+        candidates.insert(0, cached)
+    return candidates
+
+
+def _is_api_missing_error(message: str) -> bool:
+    """passthrough 错误是否为"该 API 名不存在"（可换命名空间重试）。"""
+    return "未找到 API" in message
+
+
 async def _napcat_action(action: str, params: dict) -> Optional[dict]:
     """调用 NapCat 动作，返回归一化响应 {status,retcode,message_id,data}。
 
-    默认走 SDK passthrough（ctx.api.call，合规、在 SDK 边界内）；
-    当 use_http_direct=true 时改走本机 HTTP 直连（慢环境提速、超时预算更长）。
-    两个适配器（napcat-adapter / SnowLuma）返回结构一致。失败返回 None。
+    默认走 SDK passthrough；use_http_direct=true 时走本机 HTTP 直连。
+    两适配器个别动作命名空间/签名不同，按候选逐个尝试并缓存命中。失败返回 None。
     """
     plugin = get_plugin_instance()
     if not plugin:
@@ -424,23 +476,38 @@ async def _napcat_action(action: str, params: dict) -> Optional[dict]:
     if getattr(plugin.config.plugin, "use_http_direct", False):
         return _normalize_action_response(await _napcat_http_call(action, params))
 
-    if action == "get_login_info":
-        api_name = "adapter.napcat.system.get_login_info"
-    else:
-        api_name = f"adapter.napcat.message.{action}"
-    try:
-        result = await plugin.ctx.api.call(api_name, params=params)
-    except Exception as e:
-        plugin.ctx.logger.error(f"[passthrough] 调用 {api_name} 失败: {e}")
-        return None
-    if not isinstance(result, dict):
-        plugin.ctx.logger.warning(f"[passthrough] {api_name} 返回非字典: {result!r}")
-        return None
-    # SDK 失败包装：handler 抛异常时返回 {"success": False, "error": ...}
-    if result.get("success") is False:
-        plugin.ctx.logger.warning(f"[passthrough] {api_name} 调用失败: {result.get('error')}")
-        return None
-    return _normalize_action_response(result)
+    candidates = _candidate_api_names(action)
+    last_error = ""
+    for index, api_name in enumerate(candidates):
+        try:
+            result = await _call_action_api(plugin, api_name, action, params)
+        except Exception as e:
+            last_error = str(e)
+            # 完整 API 名不存在且还有候选 → 换命名空间重试（兼容另一适配器）
+            if _is_api_missing_error(last_error) and index < len(candidates) - 1:
+                continue
+            plugin.ctx.logger.error(f"[passthrough] 调用 {api_name} 失败: {last_error}")
+            return None
+        if not isinstance(result, dict):
+            plugin.ctx.logger.warning(f"[passthrough] {api_name} 返回非字典: {result!r}")
+            return None
+        # SDK 失败包装：handler 抛异常时返回 {"success": False, "error": ...}
+        if result.get("success") is False:
+            error_text = str(result.get("error") or "")
+            if _is_api_missing_error(error_text) and index < len(candidates) - 1:
+                last_error = error_text
+                continue
+            plugin.ctx.logger.warning(f"[passthrough] {api_name} 调用失败: {error_text}")
+            return None
+        # 命中：缓存该完整 API 名，后续直接命中、不再试错
+        if _resolved_action_api.get(action) != api_name:
+            _resolved_action_api[action] = api_name
+            if index > 0:
+                plugin.ctx.logger.info(f"[passthrough] {action} 解析到 {api_name}（已缓存）")
+        return _normalize_action_response(result)
+
+    plugin.ctx.logger.error(f"[passthrough] 调用 {action} 失败，所有候选 API 均不可用: {last_error}")
+    return None
 
 
 def _extract_message_id_from_response(resp) -> Optional[str]:

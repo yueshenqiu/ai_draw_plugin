@@ -16,6 +16,11 @@ selfie_refs/*
 config.local.toml
 *.local.toml
 
+# WebUI 保存配置时生成的带密钥备份（含真实 key/token，严禁提交）
+config_back/
+*.backup.*
+*.bak
+
 # 编辑器/系统
 .vscode/
 .idea/
