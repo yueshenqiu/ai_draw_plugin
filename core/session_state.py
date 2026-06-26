@@ -72,14 +72,16 @@ class SessionStateManager:
         if not self.is_admin_mode_enabled(platform, chat_id, get_config):
             return True
         admin_users = get_config("admin.admin_users", [])
+        # 空=禁止（fail-closed）：管理员模式开启但未配置管理员时，无人可用生图命令。
         if not admin_users:
-            return True
+            return False
         return str(user_id) in admin_users
 
     def is_admin_user(self, user_id: str, get_config: Callable) -> bool:
         admin_users = get_config("admin.admin_users", [])
+        # 空=禁止（fail-closed）：未配置管理员时无人有权限，需改 config.toml 恢复。
         if not admin_users:
-            return True
+            return False
         return str(user_id) in admin_users
 
     # ==================== 插件总开关（/ad on|off）====================

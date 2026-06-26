@@ -7,10 +7,11 @@
 """
 
 import asyncio
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Literal, Optional
 
 from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
+from pydantic import ConfigDict, field_validator
 
 from .constants.constants import MODEL_MAPPINGS, SIZE_MAPPINGS, BESTNAI_MODEL_IDS
 from .instance import set_plugin_instance, clear_plugin_instance
@@ -22,93 +23,322 @@ from .core.session_state import session_state
 # Config Models（适配新 [models.modelX] 结构）
 # ================================================================
 
+def _ui(label: str, *, hint: str = "", order: int = 0, **extra: Any) -> Dict[str, Any]:
+    """构造 WebUI 配置项元数据。
+
+    插件配置页按 field.ui_type 渲染控件，ui_type 由 json_schema_extra 的
+    "x-widget" 决定（无则按字段类型推断）。manifest 仅声明 zh-CN，故不写 i18n。
+    """
+    meta: Dict[str, Any] = {"label": label, "order": order}
+    if hint:
+        meta["hint"] = hint
+    meta.update(extra)
+    return meta
+
+
+def _normalize_str_id_list(value: Any) -> List[str]:
+    """把任意输入归一化为去重后的字符串 ID 列表（WebUI 列表编辑器用）。"""
+    if value is None:
+        return []
+    raw = value if isinstance(value, list) else [value]
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        s = str(item if item is not None else "").strip()
+        if s and s not in seen:
+            out.append(s)
+            seen.add(s)
+    return out
+
+
 class PluginSectionConfig(PluginConfigBase):
-    __ui_label__ = "插件基本配置"
-    enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="2.0.0", description="配置版本号")
-    send_mode: str = Field(default="direct", description="图片发送方式：direct（普通直发，快）/ forward（合并转发，隐蔽但慢）")
-    force_forward_when_nsfw_off: bool = Field(default=True, description="NSFW 过滤关闭时强制用合并转发（更隐蔽）")
-    use_http_direct: bool = Field(default=False, description="是否直连 NapCat/SnowLuma 本机 HTTP API（默认 false 走 SDK passthrough）。慢环境下回执易超时丢失 message_id，可开启此项用 HTTP 直连提速；仅本机地址，配置见 README")
-    napcat_http_url: str = Field(default="http://127.0.0.1:5780", description="HTTP 直连地址（仅 use_http_direct=true 时生效，仅允许本机 127.0.0.1/localhost）")
-    napcat_http_token: str = Field(default="", description="HTTP 直连访问令牌（与 NapCat/SnowLuma 的 HTTP 服务器 token 一致）")
+    __ui_label__: ClassVar[str] = "插件基本配置"
+    __ui_order__: ClassVar[int] = 0
+
+    enabled: bool = Field(
+        default=True, description="是否启用插件",
+        json_schema_extra=_ui("启用插件", hint="关闭后插件不响应任何 /ad 指令", order=0),
+    )
+    send_mode: Literal["direct", "forward"] = Field(
+        default="direct", description="图片发送方式：direct（普通直发，快）/ forward（合并转发，隐蔽但慢）",
+        json_schema_extra=_ui(
+            "图片发送方式", order=1,
+            hint="direct=普通直发（快）；forward=合并转发（隐蔽但慢，QQ 服务端构建耗时）",
+        ),
+    )
+    force_forward_when_nsfw_off: bool = Field(
+        default=True, description="NSFW 过滤关闭时强制用合并转发（更隐蔽）",
+        json_schema_extra=_ui("NSFW 关闭时强制合并转发", order=2, hint="当前会话关闭 NSFW 过滤时，强制走合并转发以提升隐蔽性"),
+    )
+    use_http_direct: bool = Field(
+        default=False, description="是否直连 NapCat/SnowLuma 本机 HTTP API（默认 false 走 SDK passthrough）。慢环境下回执易超时丢失 message_id，可开启此项用 HTTP 直连提速；仅本机地址，配置见 README",
+        json_schema_extra=_ui(
+            "HTTP 直连本机适配器", order=3,
+            hint="默认关闭走 SDK passthrough。慢环境下回执易超时丢 message_id，可开启用本机 HTTP 直连提速；仅允许本机回环地址",
+        ),
+    )
+    napcat_http_url: str = Field(
+        default="http://127.0.0.1:5780", description="HTTP 直连地址（仅 use_http_direct=true 时生效，仅允许本机 127.0.0.1/localhost）",
+        json_schema_extra=_ui(
+            "HTTP 直连地址", order=4, placeholder="http://127.0.0.1:5780",
+            hint="仅 HTTP 直连开启时生效，且只允许本机 127.0.0.1 / localhost",
+        ),
+    )
+    napcat_http_token: str = Field(
+        default="", description="HTTP 直连访问令牌（与 NapCat/SnowLuma 的 HTTP 服务器 token 一致）",
+        json_schema_extra=_ui(
+            "HTTP 直连令牌", order=5, placeholder="无则留空",
+            hint="与 NapCat/SnowLuma 的 HTTP 服务器 token 一致，无则留空",
+            **{"x-widget": "password"},
+        ),
+    )
+    config_version: str = Field(
+        default="2.0.0", description="配置版本号",
+        json_schema_extra=_ui("配置版本", order=99, hidden=True, disabled=True),
+    )
+
+    @field_validator("send_mode", mode="before")
+    @classmethod
+    def _normalize_send_mode(cls, value: Any) -> str:
+        s = str(value or "direct").strip().lower()
+        return s if s in {"direct", "forward"} else "direct"
 
 
 class ModelsSectionConfig(PluginConfigBase):
-    __ui_label__ = "多模型配置"
-    default_model: str = Field(default="model1", description="默认使用的模型 ID")
+    # extra="allow"：保留动态 [models.modelX] 段（SDK schema 无法声明这些键），
+    # 否则归一化丢弃 model1/2/3，WebUI 表单保存时会把模型详情写丢。
+    model_config = ConfigDict(validate_assignment=True, extra="allow")
+    __ui_label__: ClassVar[str] = "多模型配置"
+    __ui_order__: ClassVar[int] = 1
+    default_model: str = Field(
+        default="model1", description="默认使用的模型 ID",
+        json_schema_extra=_ui(
+            "默认模型 ID", order=0, placeholder="model1",
+            hint="对应 config.toml 中 [models.modelX] 的 X（如 model1）。各模型详细参数请直接编辑 config.toml",
+        ),
+    )
 
 
 class AutoRecallSection(PluginConfigBase):
-    __ui_label__ = "自动撤回配置"
-    enabled: bool = Field(default=True, description="是否默认启用自动撤回")
-    delay_seconds: int = Field(default=30, description="撤回延迟时间（秒）")
-    allowed_groups: list = Field(default_factory=list, description="允许自动撤回的会话白名单")
+    __ui_label__: ClassVar[str] = "自动撤回配置"
+    __ui_order__: ClassVar[int] = 3
+    enabled: bool = Field(
+        default=True, description="是否默认启用自动撤回",
+        json_schema_extra=_ui("启用自动撤回", order=0, hint="发图后延时自动撤回，可用 /ad 指令按会话热切换"),
+    )
+    delay_seconds: int = Field(
+        default=30, description="撤回延迟时间（秒）",
+        json_schema_extra=_ui("撤回延迟（秒）", order=1, hint="发送成功后等待多少秒再撤回"),
+    )
+    allowed_groups: List[str] = Field(
+        default_factory=list, description="允许自动撤回的会话白名单",
+        json_schema_extra=_ui(
+            "撤回白名单", order=2, placeholder="platform:chat_id",
+            hint="格式 platform:chat_id；留空=全部会话允许自动撤回",
+        ),
+    )
+
+    @field_validator("allowed_groups", mode="before")
+    @classmethod
+    def _normalize_allowed_groups(cls, value: Any) -> List[str]:
+        return _normalize_str_id_list(value)
 
 
 class AdminSection(PluginConfigBase):
-    __ui_label__ = "管理员权限配置"
-    admin_users: list = Field(default_factory=list, description="管理员用户ID列表")
-    default_admin_mode: bool = Field(default=False, description="是否默认启用管理员模式")
+    __ui_label__: ClassVar[str] = "管理员权限配置"
+    __ui_order__: ClassVar[int] = 2
+    admin_users: List[str] = Field(
+        default_factory=list, description="管理员用户ID列表",
+        json_schema_extra=_ui(
+            "管理员 QQ 号", order=0, placeholder="请输入 QQ 号",
+            hint="管理员 QQ 号列表；管理员模式开启时仅这些用户可用生图指令",
+        ),
+    )
+    default_admin_mode: bool = Field(
+        default=False, description="是否默认启用管理员模式",
+        json_schema_extra=_ui("默认启用管理员模式", order=1, hint="开启后仅管理员可使用生图指令"),
+    )
+
+    @field_validator("admin_users", mode="before")
+    @classmethod
+    def _normalize_admin_users(cls, value: Any) -> List[str]:
+        return _normalize_str_id_list(value)
 
 
 class PromptShowSection(PluginConfigBase):
-    __ui_label__ = "提示词显示配置"
-    enabled: bool = Field(default=False, description="是否默认启用提示词显示")
-    hide_selfie_prompt_add: bool = Field(default=False, description="显示时是否隐藏自拍补充提示词")
+    __ui_label__: ClassVar[str] = "提示词显示配置"
+    __ui_order__: ClassVar[int] = 4
+    enabled: bool = Field(
+        default=False, description="是否默认启用提示词显示",
+        json_schema_extra=_ui("启用提示词显示", order=0, hint="开启后发图时一并展示最终提示词，可用 /ad 指令热切换"),
+    )
+    hide_selfie_prompt_add: bool = Field(
+        default=False, description="显示时是否隐藏自拍补充提示词",
+        json_schema_extra=_ui("隐藏自拍补充提示词", order=1, hint="展示提示词时，隐藏下方的自拍角色特征部分"),
+    )
     selfie_prompt_add: str = Field(
         default="girl,long brown hair with a star-shaped hair accessory, warm brown eyes, blue and white princess dress with a cutout at the midriff, gold trim, purple gem accents, white thigh-high stockings, blue heels",
         description="自拍模式角色特征提示词（所有模型共享）",
+        json_schema_extra=_ui(
+            "自拍角色特征提示词", order=2, rows=4,
+            hint="自拍模式下追加的角色外貌标签，所有模型共享",
+            **{"x-widget": "textarea"},
+        ),
     )
     negative_prompt_add: str = Field(
         default="1::artist collaboration,multiple views,thick outline::,lowres, bad anatomy, bad hands, bad composition, worst quality, jpeg artifacts, signature, watermark, username, blurry, deformed, disfigured, extra limbs, extra fingers, fewer limbs, fewer fingers, missing limbs, missing fingers, malformed limbs, malformed fingers, text, error, ugly, tiling, cropped, poorly drawn face, poorly drawn hands, abstract, chibi, doll, stuffed toy,male,",
         description="负面提示词（所有模型共享）",
+        json_schema_extra=_ui(
+            "全局负面提示词", order=3, rows=5,
+            hint="所有模型共享的负面提示词",
+            **{"x-widget": "textarea"},
+        ),
     )
     selfie_ref_image: str = Field(
-        default="",
-        description="自拍参考图文件名（存放在 selfie_refs/ 目录下），留空则使用文字提示词模式",
+        default="", description="自拍参考图文件名（存放在 selfie_refs/ 目录下），留空则使用文字提示词模式",
+        json_schema_extra=_ui(
+            "自拍参考图文件名", order=4, placeholder="留空则用文字提示词",
+            hint="存放在 selfie_refs/ 目录下的文件名；留空则使用上方文字提示词模式",
+        ),
     )
 
 
 class NsfwFilterSection(PluginConfigBase):
-    __ui_label__ = "NSFW 内容过滤配置"
-    enabled: bool = Field(default=True, description="是否默认启用NSFW内容过滤")
-    filter_tags: str = Field(default="{{{{{nsfw}}}}}", description="NSFW过滤标签")
+    __ui_label__: ClassVar[str] = "NSFW 内容过滤配置"
+    __ui_order__: ClassVar[int] = 5
+    enabled: bool = Field(
+        default=True, description="是否默认启用NSFW内容过滤",
+        json_schema_extra=_ui("启用 NSFW 过滤", order=0, hint="开启后向提示词注入过滤标签，可用 /ad 指令按会话热切换"),
+    )
+    filter_tags: str = Field(
+        default="{{{{{nsfw}}}}}", description="NSFW过滤标签",
+        json_schema_extra=_ui("NSFW 过滤标签", order=1, hint="注入到负面提示词的 NSFW 过滤标签"),
+    )
+
 
 
 class PromptGeneratorSection(PluginConfigBase):
-    __ui_label__ = "提示词生成配置"
-    model_name: str = Field(default="deepseek-v4-pro", description="LLM模型代号")
-    api_base: str = Field(default="https://api.deepseek.com", description="自定义 LLM API 地址")
-    api_key: str = Field(default="", description="自定义 LLM API 密钥")
-    output_format: str = Field(default="json", description="输出格式：json/text")
-    selfie_appearance_policy: str = Field(default="auto", description="自拍外貌标签策略：auto/never/keep")
-    enforce_tag_order: bool = Field(default=False, description="是否对提示词做轻量排序")
-    scene_llm_enabled: bool = Field(default=True, description="是否启用自拍场景LLM增强（使用本配置的模型）")
-    temperature: float = Field(default=0.2, description="LLM温度")
-    max_tokens: int = Field(default=4000, description="LLM最大输出token")
-    prompt_template: str = Field(default="", description="自定义提示词模板")
-    inherit_ttl: int = Field(default=3600, description="提示词继承有效时间（秒）")
+    __ui_label__: ClassVar[str] = "提示词生成配置"
+    __ui_order__: ClassVar[int] = 6
+    model_name: str = Field(
+        default="deepseek-v4-pro", description="LLM模型代号",
+        json_schema_extra=_ui("LLM 模型代号", order=0, placeholder="deepseek-v4-pro"),
+    )
+    api_base: str = Field(
+        default="https://api.deepseek.com", description="自定义 LLM API 地址",
+        json_schema_extra=_ui("LLM API 地址", order=1, placeholder="https://api.deepseek.com"),
+    )
+    api_key: str = Field(
+        default="", description="自定义 LLM API 密钥",
+        json_schema_extra=_ui("LLM API 密钥", order=2, placeholder="sk-...", **{"x-widget": "password"}),
+    )
+    output_format: Literal["json", "text"] = Field(
+        default="json", description="输出格式：json/text",
+        json_schema_extra=_ui("输出格式", order=3, hint="LLM 提示词输出格式：json（结构化）/ text（纯文本）"),
+    )
+    selfie_appearance_policy: Literal["auto", "never", "keep"] = Field(
+        default="auto", description="自拍外貌标签策略：auto/never/keep",
+        json_schema_extra=_ui(
+            "自拍外貌标签策略", order=4,
+            hint="auto=自动判断；never=从不加外貌标签；keep=保留",
+        ),
+    )
+    enforce_tag_order: bool = Field(
+        default=False, description="是否对提示词做轻量排序",
+        json_schema_extra=_ui("轻量排序提示词", order=5, hint="对生成的提示词标签做轻量重排"),
+    )
+    scene_llm_enabled: bool = Field(
+        default=True, description="是否启用自拍场景LLM增强（使用本配置的模型）",
+        json_schema_extra=_ui("自拍场景 LLM 增强", order=6, hint="启用后用本配置的模型增强自拍场景描述"),
+    )
+    temperature: float = Field(
+        default=0.2, description="LLM温度",
+        json_schema_extra=_ui("LLM 温度", order=7, step=0.1, hint="越低越稳定，越高越发散"),
+    )
+    max_tokens: int = Field(
+        default=4000, description="LLM最大输出token",
+        json_schema_extra=_ui("最大输出 token", order=8),
+    )
+    prompt_template: str = Field(
+        default="", description="自定义提示词模板",
+        json_schema_extra=_ui(
+            "自定义提示词模板", order=9, rows=4, placeholder="留空使用内置模板",
+            hint="覆盖内置的提示词生成模板，留空则用默认",
+            **{"x-widget": "textarea"},
+        ),
+    )
+    inherit_ttl: int = Field(
+        default=3600, description="提示词继承有效时间（秒）",
+        json_schema_extra=_ui("提示词继承有效期（秒）", order=10, hint="上一轮提示词可被继承的有效时间"),
+    )
+
+    @field_validator("output_format", mode="before")
+    @classmethod
+    def _normalize_output_format(cls, value: Any) -> str:
+        s = str(value or "json").strip().lower()
+        return s if s in {"json", "text"} else "json"
+
+    @field_validator("selfie_appearance_policy", mode="before")
+    @classmethod
+    def _normalize_appearance_policy(cls, value: Any) -> str:
+        s = str(value or "auto").strip().lower()
+        return s if s in {"auto", "never", "keep"} else "auto"
 
 
 class RandomSceneSection(PluginConfigBase):
-    __ui_label__ = "随机场景生成配置"
-    temperature: float = Field(default=1.0, description="LLM温度")
-    max_tokens: int = Field(default=200, description="LLM最大输出token")
+    __ui_label__: ClassVar[str] = "随机场景生成配置"
+    __ui_order__: ClassVar[int] = 7
+    temperature: float = Field(
+        default=1.0, description="LLM温度",
+        json_schema_extra=_ui("LLM 温度", order=0, step=0.1, hint="随机场景生成温度，越高越多样"),
+    )
+    max_tokens: int = Field(
+        default=200, description="LLM最大输出token",
+        json_schema_extra=_ui("最大输出 token", order=1),
+    )
 
 
 class TaggerSection(PluginConfigBase):
-    __ui_label__ = "图片打标配置"
-    enabled: bool = Field(default=True, description="是否启用打标")
-    api_base: str = Field(default="", description="打标专用 API 地址")
-    api_key: str = Field(default="", description="打标专用 API 密钥")
-    model_name: str = Field(default="", description="打标专用模型名称")
-    temperature: float = Field(default=0.4, description="打标温度")
-    max_tokens: int = Field(default=1200, description="打标最大输出token")
+    __ui_label__: ClassVar[str] = "图片打标配置"
+    __ui_order__: ClassVar[int] = 8
+    enabled: bool = Field(
+        default=True, description="是否启用打标",
+        json_schema_extra=_ui("启用打标", order=0, hint="角色参考模式（/ad r、/ad rh）的 VLM 图片分析"),
+    )
+    api_base: str = Field(
+        default="", description="打标专用 API 地址",
+        json_schema_extra=_ui("打标 API 地址", order=1, placeholder="留空沿用提示词生成配置"),
+    )
+    api_key: str = Field(
+        default="", description="打标专用 API 密钥",
+        json_schema_extra=_ui("打标 API 密钥", order=2, placeholder="sk-...", **{"x-widget": "password"}),
+    )
+    model_name: str = Field(
+        default="", description="打标专用模型名称",
+        json_schema_extra=_ui("打标模型名称", order=3, placeholder="留空沿用提示词生成模型"),
+    )
+    temperature: float = Field(
+        default=0.4, description="打标温度",
+        json_schema_extra=_ui("打标温度", order=4, step=0.1),
+    )
+    max_tokens: int = Field(
+        default=1200, description="打标最大输出token",
+        json_schema_extra=_ui("最大输出 token", order=5),
+    )
 
 
 class CustomPromptSection(PluginConfigBase):
-    __ui_label__ = "自定义系统提示词"
-    system_prompt: str = Field(default="", description="自定义系统提示词")
+    __ui_label__: ClassVar[str] = "自定义系统提示词"
+    __ui_order__: ClassVar[int] = 9
+    system_prompt: str = Field(
+        default="", description="自定义系统提示词",
+        json_schema_extra=_ui(
+            "自定义系统提示词", order=0, rows=5, placeholder="留空使用内置系统提示词",
+            hint="覆盖提示词生成的系统提示词，留空则用内置",
+            **{"x-widget": "textarea"},
+        ),
+    )
+
 
 
 class AiDrawPluginConfig(PluginConfigBase):
