@@ -9,9 +9,10 @@ force_forward_when_nsfw_off = true            # NSFW 过滤关闭时强制合并
 use_http_direct = false                       # 是否直连本机 HTTP API（默认 false 走 SDK passthrough）；慢环境可设 true 提速，配置见 README
 napcat_http_url = "http://127.0.0.1:5780"     # HTTP 直连地址（仅 use_http_direct=true 生效，仅允许本机回环）
 napcat_http_token = ""                        # HTTP 直连令牌（与 NapCat/SnowLuma 的 HTTP 服务器 token 一致，无则留空）
+y_apply_artist_preset = false                 # /ad y（提示词预设）是否叠加当前风格预设（画师串），默认 false 只用提示词预设本身
 
 [admin]
-admin_users = ["123456789"]   # 管理员 QQ 号列表
+admin_users = [""]   # 管理员 QQ 号列表
 default_admin_mode = false     # 启用后仅管理员可使用生图命令
 
 [prompt_generator]
@@ -37,18 +38,18 @@ enabled = true
 filter_tags = "{{{{{nsfw}}}}}"
 
 [prompt_show]
-enabled = false
+enabled = true
 hide_selfie_prompt_add = false
 selfie_prompt_add = ""
 negative_prompt_add = ""
 selfie_ref_image = ""   # 自拍参考图（selfie_refs/ 目录），留空则用文字提示词
 
-# 全局画师预设（所有模型共享，模型里用 artist_preset = "名称" 引用）
+# 全局风格预设（画师串）（所有模型共享，模型里用 artist_preset = "名称" 引用）
 
 [artist_presets]
-"无" = "no shading"
+"无" = ""
 
-# 风格预设（/ad y 命令使用）
+# 提示词预设（/ad y 命令使用）
 
 [styles]
 "线描" = "line art style, single weight lines, no shading, white background, clean contours, vector-like precision"
@@ -82,7 +83,7 @@ default_model = "model1"
 [models.model1]
 name = "BestNAI V4.5"
 format = "bestnai"
-base_url = "https://api.tuercha.com"
+base_url = ""
 api_key = ""
 model = "nai-diffusion-4-5-full"
 endpoint = "/v1/chat/completions"

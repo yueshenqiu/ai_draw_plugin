@@ -92,6 +92,13 @@ class PluginSectionConfig(PluginConfigBase):
             **{"x-widget": "password"},
         ),
     )
+    y_apply_artist_preset: bool = Field(
+        default=False, description="使用 /ad y（提示词预设）时是否叠加当前风格预设（画师串）",
+        json_schema_extra=_ui(
+            "「/ad y 提示词预设」叠加风格预设（画师串）", order=6,
+            hint="开启后 /ad y 会在提示词预设之上再叠加当前选中的风格预设（画师串）；默认关闭，只用提示词预设本身",
+        ),
+    )
     config_version: str = Field(
         default="2.0.0", description="配置版本号",
         json_schema_extra=_ui("配置版本", order=99, hidden=True, disabled=True),
@@ -503,8 +510,11 @@ class AiDrawPlugin(MaiBotPlugin):
     # Model config resolution
     # ================================================================
 
-    def _get_model_config_from_kwargs(self, kwargs: dict) -> dict:
-        """构建合并后的模型配置字典（从 [models.modelX] 中获取完整配置）。"""
+    def _get_model_config_from_kwargs(self, kwargs: dict, apply_artist_preset: bool = True) -> dict:
+        """构建合并后的模型配置字典（从 [models.modelX] 中获取完整配置）。
+
+        apply_artist_preset=False 时跳过风格预设（画师串）的叠加，供 /ad y 提示词预设按配置控制。
+        """
         info = self._extract_session_info(kwargs)
 
         # 确定当前使用的 model_id
@@ -533,8 +543,8 @@ class AiDrawPlugin(MaiBotPlugin):
             if selected_name and selected_name in BESTNAI_MODEL_IDS:
                 base["model"] = selected_name
 
-        # Artist preset selection（从当前 model 的 artist_presets 中选）
-        if info["chat_id"] and default_model_id:
+        # Artist preset selection（风格预设/画师串，从当前 model 的 artist_presets 中选）
+        if apply_artist_preset and info["chat_id"] and default_model_id:
             selected_preset = self._session_state.get_selected_artist_preset_config(
                 info["platform"], info["chat_id"], default_model_id,
             )
@@ -640,7 +650,7 @@ class AiDrawPlugin(MaiBotPlugin):
         matched = kwargs.get("matched_groups", {})
         return await handle_ad_prompt_show(matched.get("action", "").strip().lower(), kwargs)
 
-    # /ad st|sp 管理员模式 · /ad w|m 模型 · /ad s 尺寸 · /ad art 画师 · /ad help 帮助
+    # /ad st|sp 管理员模式 · /ad w|m 模型 · /ad s 尺寸 · /ad art 风格预设(画师串) · /ad help 帮助
     @Command("ad_admin_st_sp", pattern=r"^/ad\s+(?P<action>st|sp)$")
     async def handle_ad_admin_toggle(self, **kwargs) -> tuple:
         from .components.command import handle_ad_admin_toggle
@@ -670,7 +680,7 @@ class AiDrawPlugin(MaiBotPlugin):
         matched = kwargs.get("matched_groups", {})
         return await handle_ad_switch_artist((matched.get("param") or "").strip(), kwargs)
 
-    # /ad y <风格名> — 风格预设图生图
+    # /ad y <名称> — 提示词预设图生图
     @Command("ad_style", pattern=r"(?:[\s\S]*，说：\s*)?/ad\s+y\s+(?P<style>.+)$")
     async def handle_ad_style(self, **kwargs) -> tuple:
         from .components.command import handle_ad_style

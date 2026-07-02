@@ -17,7 +17,7 @@ class ImageFeature(str, Enum):
     CHARACTER_REF = "character_ref"      # 角色参考
     STYLE_REF = "style_ref"              # 画风参考
     CHARACTER_STYLE_REF = "character_style_ref"  # 角色+画风参考
-    ARTIST_PRESETS = "artist_presets"    # 画师风格预设
+    ARTIST_PRESETS = "artist_presets"    # 风格预设（画师串）
     SELFIE_MODE = "selfie_mode"          # 自拍模式
     NSFW = "nsfw"                        # NSFW 内容
 
