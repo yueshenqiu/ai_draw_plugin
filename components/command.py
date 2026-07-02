@@ -541,7 +541,7 @@ async def handle_ad_style(style_name: str, kwargs: dict) -> tuple:
 # ================================================================
 
 async def handle_dr0_ref_draw(mode: str, tags: str, kwargs: dict) -> tuple:
-    """直接参考生图：/ad0 rh|r|h|t <英文标签> — 跳过 LLM/VLM，直传参考图+标签"""
+    """直接参考生图：/ad0 rh|r|h|t <英文标签> — 跳过 LLM，直传参考图+标签"""
     plugin = get_plugin_instance()
     stream_id = kwargs.get("stream_id", "")
 
@@ -1062,8 +1062,6 @@ def _render_generator_prompt(template: str, request: str, is_action: bool = Fals
     if not is_action:
         prompt = prompt.replace("<<PREVIOUS_PROMPT>>", "")
     prompt = prompt.replace("<<SELFIE_SCENE_CONTEXT>>", selfie_scene_context or "")
-    # 角色/画风隔离已内置进模板，占位符置空即可
-    prompt = prompt.replace("<<CHARACTER_REF_CONTEXT>>", "")
     prompt = prompt.replace("<<USER_REQUEST>>", request.strip() or "N/A")
     prompt = prompt.replace("<<CURRENT_TIME_CONTEXT>>", current_time)
     prompt = prompt.replace("<<SELFIE_HINT>>", selfie_hint)
