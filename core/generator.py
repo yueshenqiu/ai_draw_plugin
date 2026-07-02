@@ -550,14 +550,14 @@ def extract_text_from_napcat_message(msg: dict) -> str:
     return " ".join(texts)
 
 
-def is_nai_bot_message(msg: dict, display_text: str = "") -> bool:
+def is_ai_draw_bot_message(msg: dict, display_text: str = "") -> bool:
     """判断消息是否为本插件 bot 发送的图片消息。
 
     匹配规则（满足任一即可）：
     1. bot 自己发送的合并转发/JSON 消息
     2. bot 自己发送的图片消息（send.image 直发）
     3. bot 自己发送的文件消息（PDF回退）
-    4. 文本包含 [NAI] 标记
+    4. 文本包含 [AI绘图] 标记
     """
     segments = msg.get("message", msg.get("raw_message", []))
     sender = msg.get("sender", {}) or {}
@@ -588,7 +588,7 @@ def is_nai_bot_message(msg: dict, display_text: str = "") -> bool:
             if "ai_draw" in file_name:
                 has_file = True
 
-    # 合并转发：bot 自己的就是 NAI 消息
+    # 合并转发：bot 自己的就是本插件消息
     if has_forward:
         return is_self
 
@@ -600,10 +600,10 @@ def is_nai_bot_message(msg: dict, display_text: str = "") -> bool:
     if has_file and is_self:
         return True
 
-    # 文本内容含 [NAI] 标记
+    # 文本内容含 [AI绘图] 标记
     content = extract_text_from_napcat_message(msg)
     if content:
-        if "[NAI]" in content:
+        if "[AI绘图]" in content:
             return True
         if display_text and content == display_text:
             return True
@@ -1201,7 +1201,7 @@ async def auto_recall_task(stream_id: str = "", group_id: str = "", user_id: str
             msg_time = int(msg.get("time", 0) or 0)
             if after_ts and msg_time > 0 and msg_time < after_ts - 2:
                 continue
-            if is_nai_bot_message(msg):
+            if is_ai_draw_bot_message(msg):
                 candidates.append((msg_time, msg_id))
 
         if not candidates:

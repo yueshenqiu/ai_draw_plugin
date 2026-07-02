@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 提示词生成规则 - 公共模块
-统一 ai_draw_action.py 和 nai_draw_command.py 的提示词生成规则
+AI Draw 插件生图动作与命令共用的提示词生成规则
 基于 NovelAI 4/4.5 最新特性优化
 """
 

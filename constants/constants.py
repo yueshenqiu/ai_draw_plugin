@@ -13,11 +13,11 @@
 # ---- 消息标记 ----
 
 # 用于标记"本插件发送的图片消息"的 display_message
-NAI_PIC_IMAGE_DISPLAY_MARKER = "[ai_draw_plugin:image]"
+AI_DRAW_IMAGE_DISPLAY_MARKER = "[ai_draw_plugin:image]"
 
 # Action 图片展示文案前缀
-NAI_ACTION_IMAGE_DISPLAY_PREFIX = "[NAI图片:"
-NAI_ACTION_IMAGE_DISPLAY_FALLBACK = "[NAI图片]"
+AI_DRAW_IMAGE_DISPLAY_PREFIX = "[AI绘图:"
+AI_DRAW_IMAGE_DISPLAY_FALLBACK = "[AI绘图]"
 
 
 # ---- 模型格式（Provider 类型） ----

@@ -17,7 +17,7 @@ HELP_TEXT = (
     "/ad send <d|f> — 发送方式（d=直发快 / f=合并转发隐蔽）\n"
     "/ad pt <on|off> — 提示词显示开关\n"
     "/ad st|sp — 管理员模式开关\n"
-    "/ad 撤回 — 手动撤回 NAI 消息"
+    "/ad 撤回 — 手动撤回 AI绘图消息"
 )
 
 COMMAND_LIST = [

@@ -39,7 +39,7 @@ from .image_utils import (
     save_base64_image_to_file,
     process_api_response,
     build_action_image_display_message,
-    is_nai_action_image_display_message,
+    is_ai_draw_image_display_message,
 )
 from .random_scene import (
     normalize_random_scene_description,
@@ -80,7 +80,7 @@ __all__ = [
     "save_base64_image_to_file",
     "process_api_response",
     "build_action_image_display_message",
-    "is_nai_action_image_display_message",
+    "is_ai_draw_image_display_message",
     "normalize_random_scene_description",
     "is_random_scene_too_similar",
     "get_random_scene_similarity_score",

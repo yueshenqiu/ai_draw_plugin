@@ -43,7 +43,7 @@ class SessionStateManager:
         self._nsfw_filter: Dict[str, bool] = {}
         self._prompt_show: Dict[str, bool] = {}
         self._send_mode: Dict[str, str] = {}  # /ad send direct|forward 会话级发送方式
-        self._last_nai_context: Dict[str, Tuple[str, str, float]] = {}
+        self._last_draw_context: Dict[str, Tuple[str, str, float]] = {}
         self._last_selfie_context: Dict[str, Tuple[str, str, str, Dict[str, List[str]], float]] = {}
         self._loaded_models: Dict[str, dict] = {}  # 由 plugin.on_load 注入
 
@@ -317,29 +317,29 @@ class SessionStateManager:
 
     # ==================== 上一轮提示词上下文（Action 专用）====================
 
-    def get_last_nai_context(self, chat_stream_id: str, ttl: float = 0) -> Tuple[Optional[str], Optional[str]]:
+    def get_last_draw_context(self, chat_stream_id: str, ttl: float = 0) -> Tuple[Optional[str], Optional[str]]:
         if not chat_stream_id:
             return None, None
-        entry = self._last_nai_context.get(chat_stream_id)
+        entry = self._last_draw_context.get(chat_stream_id)
         if entry is None:
             return None, None
         prompt, request, ts = entry
         if ttl > 0 and (time.time() - ts) > ttl:
-            self._last_nai_context.pop(chat_stream_id, None)
+            self._last_draw_context.pop(chat_stream_id, None)
             return None, None
         return prompt, request or None
 
-    def set_last_nai_context(self, chat_stream_id: str, prompt: str, request: str = ""):
+    def set_last_draw_context(self, chat_stream_id: str, prompt: str, request: str = ""):
         if not chat_stream_id or not isinstance(prompt, str) or not prompt.strip():
             return
-        self._last_nai_context[chat_stream_id] = (prompt.strip(), (request or "").strip(), time.time())
+        self._last_draw_context[chat_stream_id] = (prompt.strip(), (request or "").strip(), time.time())
 
-    def get_last_nai_prompt(self, chat_stream_id: str) -> Optional[str]:
-        prompt, _ = self.get_last_nai_context(chat_stream_id)
+    def get_last_draw_prompt(self, chat_stream_id: str) -> Optional[str]:
+        prompt, _ = self.get_last_draw_context(chat_stream_id)
         return prompt
 
-    def set_last_nai_prompt(self, chat_stream_id: str, prompt: str):
-        self.set_last_nai_context(chat_stream_id, prompt)
+    def set_last_draw_prompt(self, chat_stream_id: str, prompt: str):
+        self.set_last_draw_context(chat_stream_id, prompt)
 
     # ==================== 上一轮自拍场景 ====================
 

@@ -371,7 +371,7 @@ async def handle_ad_manual_recall(kwargs: dict) -> tuple:
     stream_id = kwargs.get("stream_id", "")
     info = plugin._extract_session_info(kwargs)
 
-    from ..core.generator import fetch_recent_messages, is_nai_bot_message
+    from ..core.generator import fetch_recent_messages, is_ai_draw_bot_message
     plugin.ctx.logger.info("[手动撤回] 执行撤回")
 
     try:
@@ -393,7 +393,7 @@ async def handle_ad_manual_recall(kwargs: dict) -> tuple:
             msg_id = str(msg.get("message_id", "") or "")
             if not msg_id:
                 continue
-            if is_nai_bot_message(msg):
+            if is_ai_draw_bot_message(msg):
                 ids_to_recall.append(msg_id)
                 sender = msg.get("sender", {}) or {}
                 sid = str(sender.get("user_id", ""))
@@ -425,9 +425,9 @@ async def handle_ad_manual_recall(kwargs: dict) -> tuple:
             await asyncio.sleep(0.4)
 
         if recalled:
-            await plugin.ctx.send.text(f"已撤回 {recalled} 条 NAI 消息", stream_id)
+            await plugin.ctx.send.text(f"已撤回 {recalled} 条 AI绘图消息", stream_id)
         else:
-            await plugin.ctx.send.text("未找到可撤回的 NAI 消息", stream_id)
+            await plugin.ctx.send.text("未找到可撤回的 AI绘图消息", stream_id)
     except Exception as e:
         plugin.ctx.logger.error(f"[手动撤回] 失败: {e}")
         await plugin.ctx.send.text(f"撤回失败: {str(e)[:100]}", stream_id)
