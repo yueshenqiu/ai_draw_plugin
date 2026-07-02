@@ -309,7 +309,7 @@ async def handle_ad_switch_size(param: str, kwargs: dict) -> tuple:
 
 
 # ================================================================
-# /ad art <序号> — 切换画师预设
+# /ad art <序号> — 切换风格预设（画师串）
 # ================================================================
 
 async def handle_ad_switch_artist(param: str, kwargs: dict) -> tuple:
@@ -332,24 +332,24 @@ async def handle_ad_switch_artist(param: str, kwargs: dict) -> tuple:
     presets = plugin._session_state._parse_artist_presets(presets_raw or [])
 
     if not presets:
-        await plugin.ctx.send.text("当前模型没有配置画师风格预设", stream_id)
-        return False, "无画师预设", 1
+        await plugin.ctx.send.text("当前模型没有配置风格预设（画师串）", stream_id)
+        return False, "无风格预设", 1
 
     if not param:
         current_idx = plugin._session_state.get_effective_artist_index(
             info["platform"], info["chat_id"], model_id,
         )
         current_name = presets[current_idx - 1].get("name", f"#{current_idx}") if 1 <= current_idx <= len(presets) else "无"
-        lines = [f"当前画师: #{current_idx} {current_name}", "可用画师:"]
+        lines = [f"当前风格预设（画师串）: #{current_idx} {current_name}", "可用风格预设（画师串）:"]
         for i, p in enumerate(presets, 1):
             lines.append(f"  #{i} {p.get('name', '')}")
         await plugin.ctx.send.text("\n".join(lines), stream_id)
-        return True, "已查询画师", 1
+        return True, "已查询风格预设", 1
 
     try:
         idx = int(param)
     except ValueError:
-        await plugin.ctx.send.text("请提供有效的画师序号（数字）", stream_id)
+        await plugin.ctx.send.text("请提供有效的风格预设序号（数字）", stream_id)
         return False, "无效序号", 1
 
     if not (1 <= idx <= len(presets)):
@@ -358,8 +358,8 @@ async def handle_ad_switch_artist(param: str, kwargs: dict) -> tuple:
 
     plugin._session_state.set_selected_artist_index(info["platform"], info["chat_id"], idx)
     name = presets[idx - 1].get("name", f"#{idx}")
-    await plugin.ctx.send.text(f"已切换画师: #{idx} {name}", stream_id)
-    return True, f"已切换画师: #{idx}", 2
+    await plugin.ctx.send.text(f"已切换风格预设（画师串）: #{idx} {name}", stream_id)
+    return True, f"已切换风格预设: #{idx}", 2
 
 
 # ================================================================
@@ -435,14 +435,14 @@ async def handle_ad_manual_recall(kwargs: dict) -> tuple:
 
 
 # ================================================================
-# /ad y <风格名> — 引用图片 + 预设风格提示词 → 图生图
+# /ad y <名称> — 引用图片 + 提示词预设 → 图生图
 # ================================================================
 
 _styles_cache: Optional[dict] = None
 
 
 def _load_styles() -> dict:
-    """从 config.toml [styles] 加载风格预设（缓存）。"""
+    """从 config.toml [styles] 加载提示词预设（缓存）。"""
     global _styles_cache
     if _styles_cache is not None:
         return _styles_cache
@@ -458,7 +458,7 @@ def _load_styles() -> dict:
 
 
 def _resolve_style(name: str) -> Optional[str]:
-    """根据名称（模糊匹配）查找风格 prompt。"""
+    """根据名称（模糊匹配）查找提示词预设 prompt。"""
     styles = _load_styles()
     if not styles:
         return None
@@ -477,16 +477,16 @@ async def handle_ad_style(style_name: str, kwargs: dict) -> tuple:
     stream_id = kwargs.get("stream_id", "")
 
     if not style_name.strip():
-        await plugin.ctx.send.text("请指定风格名，例如：/ad y 人物拆解", stream_id)
-        return False, "未指定风格", 1
+        await plugin.ctx.send.text("请指定提示词预设名，例如：/ad y 线描", stream_id)
+        return False, "未指定提示词预设", 1
 
-    # 查找风格 prompt
+    # 查找提示词预设 prompt
     style_prompt = _resolve_style(style_name.strip())
     if not style_prompt:
         styles = _load_styles()
         names = ", ".join(list(styles.keys())[:10])
-        await plugin.ctx.send.text(f"未找到风格 '{style_name}'。可用：{names}...", stream_id)
-        return False, f"未找到风格: {style_name}", 1
+        await plugin.ctx.send.text(f"未找到提示词预设 '{style_name}'。可用：{names}...", stream_id)
+        return False, f"未找到提示词预设: {style_name}", 1
 
     # 获取参考图
     from ..core.generator import fetch_ref_image
@@ -504,7 +504,10 @@ async def handle_ad_style(style_name: str, kwargs: dict) -> tuple:
         await plugin.ctx.send.text(err, stream_id)
         return False, err, 1
 
-    model_config = plugin._get_model_config_from_kwargs(kwargs)
+    model_config = plugin._get_model_config_from_kwargs(
+        kwargs,
+        apply_artist_preset=getattr(plugin.config.plugin, "y_apply_artist_preset", False),
+    )
     if not model_config or not model_config.get("base_url"):
         await plugin.ctx.send.text("模型配置错误，请检查配置文件", stream_id)
         return False, "配置错误", 1
@@ -516,14 +519,14 @@ async def handle_ad_style(style_name: str, kwargs: dict) -> tuple:
     ):
         found = _filter_nsfw_tags_from_prompt(style_prompt)
         if found:
-            plugin.ctx.logger.info("[风格生图] NSFW过滤拦截: %s", ", ".join(found))
+            plugin.ctx.logger.info("[提示词预设生图] NSFW过滤拦截: %s", ", ".join(found))
             await plugin.ctx.send.text(
-                f"NSFW 过滤已开启，风格 '{style_name}' 被拦截。请使用 /ad nsfw off 关闭过滤。",
+                f"NSFW 过滤已开启，提示词预设 '{style_name}' 被拦截。请使用 /ad nsfw off 关闭过滤。",
                 stream_id,
             )
             return False, f"NSFW过滤拦截: {found}", 1
 
-    plugin.ctx.logger.info("[风格生图] 风格=%s", style_name[:30])
+    plugin.ctx.logger.info("[提示词预设生图] 预设=%s", style_name[:30])
     from ..core.generator import generate_and_send
     plugin._track_task(asyncio.create_task(
         generate_and_send(style_prompt, model_config, stream_id,
@@ -789,30 +792,8 @@ async def ad_workflow(
         info["platform"], info["chat_id"], plugin._get_config_callable(),
     )
 
-    # 角色参考模式：分析参考图角色特征，防止 LLM 编造外貌
-    char_ref_context = ""
-    if ref_image and ("character" in ref_mode):
-        from ..core.prompt_engine import analyze_ref_image_character, build_character_ref_context
-
-        # 尝试用 VLM 分析参考图角色特征
-        char_features = None
-        tagger_cfg = plugin.config.tagger
-        if tagger_cfg.enabled and tagger_cfg.api_base and tagger_cfg.api_key and tagger_cfg.model_name:
-            try:
-                char_features = await analyze_ref_image_character(
-                    image_base64=ref_image,
-                    api_base=tagger_cfg.api_base,
-                    api_key=tagger_cfg.api_key,
-                    model=tagger_cfg.model_name,
-                )
-            except Exception as e:
-                plugin.ctx.logger.warning(f"[角色参考] VLM 分析失败: {e}")
-
-        char_ref_context = build_character_ref_context(ref_mode, char_features)
-        if char_features:
-            plugin.ctx.logger.info("[角色参考] 已提取参考图角色特征，嵌入 LLM 提示词")
-        else:
-            plugin.ctx.logger.info("[角色参考] 未提取到角色特征，LLM 将跳过外貌标签")
+    # 角色/画风参考的隔离规则已内置进各自专属提示词模板（见 prompt_rules.get_generator_template），
+    # 按 ref_mode 选模板即可，无需再在运行时向 base 注入“禁止外貌”块。
 
     # 自拍场景增强：从日程 + LLM 获取 action/environment/expression/lighting
     selfie_scene_context = ""
@@ -839,8 +820,9 @@ async def ad_workflow(
 
     generated_prompt = await _generate_prompt_with_llm(
         description, stream_id, is_action, nsfw_enabled,
-        char_ref_context=char_ref_context,
+        ref_mode=ref_mode,
         selfie_scene_context=selfie_scene_context,
+        is_selfie=is_selfie,
     )
     if not generated_prompt:
         await plugin.ctx.send.text("提示词生成失败，请稍后再试~", stream_id)
@@ -1009,8 +991,9 @@ def _process_selfie_prompt(description: str, raw_request: str,
 async def _generate_prompt_with_llm(
     request_text: str, stream_id: str = "",
     is_action: bool = False, nsfw_enabled: bool = False,
-    char_ref_context: str = "",
+    ref_mode: str = "",
     selfie_scene_context: str = "",
+    is_selfie: bool = False,
 ) -> Optional[str]:
     plugin = get_plugin_instance()
     gen_cfg = plugin.config.prompt_generator
@@ -1018,23 +1001,16 @@ async def _generate_prompt_with_llm(
     if not request_text.strip():
         return None
 
-    # 加载模板
-    from ..core.rules.prompt_rules import (
-        PROMPT_GENERATOR_TEMPLATE, PROMPT_GENERATOR_JSON_TEMPLATE,
-        SFW_PROMPT_GENERATOR_TEMPLATE, SFW_PROMPT_GENERATOR_JSON_TEMPLATE,
-    )
-    from ..core.selfie_engine import get_selfie_hint
+    # 按参考模式 + NSFW 过滤开关 + 输出格式，取该指令专属的提示词模板
+    from ..core.rules.prompt_rules import get_generator_template
 
     output_format = (gen_cfg.output_format or "json").strip().lower()
-    if nsfw_enabled:
-        default_tpl = SFW_PROMPT_GENERATOR_JSON_TEMPLATE if output_format == "json" else SFW_PROMPT_GENERATOR_TEMPLATE
-    else:
-        default_tpl = PROMPT_GENERATOR_JSON_TEMPLATE if output_format == "json" else PROMPT_GENERATOR_TEMPLATE
+    default_tpl = get_generator_template(ref_mode, nsfw_enabled, output_format)
 
     template = gen_cfg.prompt_template or default_tpl
     prompt = _render_generator_prompt(template, request_text, is_action=is_action,
-                                      char_ref_context=char_ref_context,
-                                      selfie_scene_context=selfie_scene_context)
+                                      selfie_scene_context=selfie_scene_context,
+                                      is_selfie=is_selfie)
 
     # LLM 调用
     from ..core.prompt_engine import call_custom_llm_api, has_custom_api_config, cleanup_llm_prompt
@@ -1068,8 +1044,8 @@ async def _generate_prompt_with_llm(
 
 
 def _render_generator_prompt(template: str, request: str, is_action: bool = False,
-                             char_ref_context: str = "",
-                             selfie_scene_context: str = "") -> str:
+                             selfie_scene_context: str = "",
+                             is_selfie: bool = False) -> str:
     plugin = get_plugin_instance()
     from ..core.selfie_engine import get_selfie_hint
     from ..core.prompt_engine import build_current_time_context
@@ -1078,18 +1054,19 @@ def _render_generator_prompt(template: str, request: str, is_action: bool = Fals
     if custom_sys:
         custom_sys = custom_sys.strip() + "\n\n"
 
-    selfie_hint = get_selfie_hint()
+    # 自拍规则块（约 40 行）仅在判定为自拍时注入；普通生图不带，节省 token
+    selfie_hint = get_selfie_hint() if is_selfie else ""
     current_time = build_current_time_context()
 
     prompt = template.replace("<<CUSTOM_SYSTEM_PROMPT>>", custom_sys)
     if not is_action:
         prompt = prompt.replace("<<PREVIOUS_PROMPT>>", "")
     prompt = prompt.replace("<<SELFIE_SCENE_CONTEXT>>", selfie_scene_context or "")
-    prompt = prompt.replace("<<CHARACTER_REF_CONTEXT>>", char_ref_context)
+    # 角色/画风隔离已内置进模板，占位符置空即可
+    prompt = prompt.replace("<<CHARACTER_REF_CONTEXT>>", "")
     prompt = prompt.replace("<<USER_REQUEST>>", request.strip() or "N/A")
     prompt = prompt.replace("<<CURRENT_TIME_CONTEXT>>", current_time)
     prompt = prompt.replace("<<SELFIE_HINT>>", selfie_hint)
-    prompt = prompt.replace("<<TAG_CANDIDATES>>", "")
     return prompt.strip()
 
 

@@ -6,6 +6,8 @@ from .prompt_rules import (
     PROMPT_GENERATOR_JSON_TEMPLATE,
     SFW_PROMPT_GENERATOR_TEMPLATE,
     SFW_PROMPT_GENERATOR_JSON_TEMPLATE,
+    get_generator_template,
+    classify_ref_mode,
 )
 
 __all__ = [
@@ -13,4 +15,6 @@ __all__ = [
     "PROMPT_GENERATOR_JSON_TEMPLATE",
     "SFW_PROMPT_GENERATOR_TEMPLATE",
     "SFW_PROMPT_GENERATOR_JSON_TEMPLATE",
+    "get_generator_template",
+    "classify_ref_mode",
 ]
