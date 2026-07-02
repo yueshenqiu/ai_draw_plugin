@@ -2,7 +2,7 @@
 """BestNAI / NovelAI 兼容 Provider。
 
 通过 OpenAI Chat Completions 兼容接口调用 NovelAI 图片生成服务。
-从 core/clients/nai_web_client.py 迁移，适配 BaseImageProvider 接口。
+实现 BaseImageProvider 接口。
 """
 
 import asyncio

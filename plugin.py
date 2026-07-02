@@ -588,7 +588,7 @@ class AiDrawPlugin(MaiBotPlugin):
 
     # @Tool — LLM 触发生图
     @Tool(
-        "nai_web_draw",
+        "ai_draw",
         brief_description="生成图片、自拍、照片。用于画图、自拍、拍照、发照片等一切需要生成图像的场景。",
         detailed_description=(
             "使用 BestNAI / NovelAI 根据描述生成二次元插画。\n"
@@ -601,7 +601,7 @@ class AiDrawPlugin(MaiBotPlugin):
                               description="图片尺寸（默认从配置获取）", required=False),
         ],
     )
-    async def handle_nai_web_draw(self, description: str = "", size: str = "", **kwargs) -> dict:
+    async def handle_ai_draw(self, description: str = "", size: str = "", **kwargs) -> dict:
         from .components.command import handle_ad_web_draw
         return await handle_ad_web_draw(description, size, kwargs)
 

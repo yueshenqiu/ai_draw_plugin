@@ -17,8 +17,8 @@ from typing import Optional, List, Tuple
 _logger = logging.getLogger("ai_draw_plugin")
 
 # ---- 常量 ----
-NAI_ACTION_IMAGE_DISPLAY_PREFIX = "[NAI图片:"
-NAI_ACTION_IMAGE_DISPLAY_FALLBACK = "[NAI图片]"
+AI_DRAW_IMAGE_DISPLAY_PREFIX = "[AI绘图:"
+AI_DRAW_IMAGE_DISPLAY_FALLBACK = "[AI绘图]"
 
 _PLUGIN_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _PROJECT_ROOT_DIR = os.path.abspath(os.path.join(_PLUGIN_ROOT_DIR, "..", ".."))
@@ -108,7 +108,7 @@ def save_base64_image_to_file(image_base64: str) -> Optional[str]:
 
     image_type = detect_image_type(image_bytes)
     extension = "jpg" if image_type == "jpeg" else image_type
-    file_name = f"nai_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}.{extension}"
+    file_name = f"ai_draw_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}.{extension}"
     file_path = os.path.join(_IMAGE_OUTPUT_DIR, file_name)
 
     try:
@@ -126,17 +126,17 @@ def save_base64_image_to_file(image_base64: str) -> Optional[str]:
 def build_action_image_display_message(description: Optional[str]) -> str:
     normalized = " ".join(str(description or "").split())
     if not normalized:
-        return NAI_ACTION_IMAGE_DISPLAY_FALLBACK
-    return f"{NAI_ACTION_IMAGE_DISPLAY_PREFIX}{normalized}]"
+        return AI_DRAW_IMAGE_DISPLAY_FALLBACK
+    return f"{AI_DRAW_IMAGE_DISPLAY_PREFIX}{normalized}]"
 
 
-def is_nai_action_image_display_message(text: Optional[str]) -> bool:
+def is_ai_draw_image_display_message(text: Optional[str]) -> bool:
     if not isinstance(text, str):
         return False
     normalized = text.strip()
     return (
-        normalized == NAI_ACTION_IMAGE_DISPLAY_FALLBACK
-        or normalized.startswith(NAI_ACTION_IMAGE_DISPLAY_PREFIX)
+        normalized == AI_DRAW_IMAGE_DISPLAY_FALLBACK
+        or normalized.startswith(AI_DRAW_IMAGE_DISPLAY_PREFIX)
     )
 
 
