@@ -356,7 +356,6 @@ NAI4/4.5 可接受自然语言短句，但不是推荐输出方式。JSON 模式
 SFW_PROMPT_GENERATOR_TEMPLATE = f"""
 {SFW_PROMPT_RULES_TEXT}
 
-<<CHARACTER_REF_CONTEXT>>
 <<PREVIOUS_PROMPT>>
 <user_request>
 <<USER_REQUEST>>
@@ -379,7 +378,6 @@ SFW_PROMPT_GENERATOR_TEMPLATE = f"""
 SFW_PROMPT_GENERATOR_JSON_TEMPLATE = f"""
 {SFW_PROMPT_RULES_TEXT}
 
-<<CHARACTER_REF_CONTEXT>>
 <<PREVIOUS_PROMPT>>
 <user_request>
 <<USER_REQUEST>>
@@ -990,7 +988,6 @@ NovelAI 4/4.5 在极少数情况下可以接受自然语言短句作为补充描
 PROMPT_GENERATOR_TEMPLATE = f"""
 {PROMPT_RULES_TEXT}
 
-<<CHARACTER_REF_CONTEXT>>
 <<PREVIOUS_PROMPT>>
 <user_request>
 <<USER_REQUEST>>
@@ -1152,7 +1149,6 @@ def get_generator_template(ref_mode: str, nsfw_filter_enabled: bool, output_form
 PROMPT_GENERATOR_JSON_TEMPLATE = f"""
 {PROMPT_RULES_TEXT}
 
-<<CHARACTER_REF_CONTEXT>>
 <<PREVIOUS_PROMPT>>
 <user_request>
 <<USER_REQUEST>>

@@ -305,35 +305,6 @@ class RandomSceneSection(PluginConfigBase):
     )
 
 
-class TaggerSection(PluginConfigBase):
-    __ui_label__: ClassVar[str] = "图片打标配置"
-    __ui_order__: ClassVar[int] = 8
-    enabled: bool = Field(
-        default=True, description="是否启用打标",
-        json_schema_extra=_ui("启用打标", order=0, hint="角色参考模式（/ad r、/ad rh）的 VLM 图片分析"),
-    )
-    api_base: str = Field(
-        default="", description="打标专用 API 地址",
-        json_schema_extra=_ui("打标 API 地址", order=1, placeholder="留空沿用提示词生成配置"),
-    )
-    api_key: str = Field(
-        default="", description="打标专用 API 密钥",
-        json_schema_extra=_ui("打标 API 密钥", order=2, placeholder="sk-...", **{"x-widget": "password"}),
-    )
-    model_name: str = Field(
-        default="", description="打标专用模型名称",
-        json_schema_extra=_ui("打标模型名称", order=3, placeholder="留空沿用提示词生成模型"),
-    )
-    temperature: float = Field(
-        default=0.4, description="打标温度",
-        json_schema_extra=_ui("打标温度", order=4, step=0.1),
-    )
-    max_tokens: int = Field(
-        default=1200, description="打标最大输出token",
-        json_schema_extra=_ui("最大输出 token", order=5),
-    )
-
-
 class CustomPromptSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "自定义系统提示词"
     __ui_order__: ClassVar[int] = 9
@@ -358,7 +329,6 @@ class AiDrawPluginConfig(PluginConfigBase):
     nsfw_filter: NsfwFilterSection = Field(default_factory=NsfwFilterSection)
     prompt_generator: PromptGeneratorSection = Field(default_factory=PromptGeneratorSection)
     random_scene: RandomSceneSection = Field(default_factory=RandomSceneSection)
-    tagger: TaggerSection = Field(default_factory=TaggerSection)
     custom_prompt: CustomPromptSection = Field(default_factory=CustomPromptSection)
 
 
@@ -693,7 +663,7 @@ class AiDrawPlugin(MaiBotPlugin):
         from .components.command import handle_ad_manual_recall
         return await handle_ad_manual_recall(kwargs)
 
-    # /ad0 rh|hr|r|h|t <tags> — 直传 tag + 参考图，跳过 LLM/VLM
+    # /ad0 rh|hr|r|h|t <tags> — 直传 tag + 参考图，跳过 LLM
     @Command("dr0_ref_draw", pattern=r"(?:[\s\S]*，说：\s*)?/ad0\s+(?P<mode>rh|hr|r|h|t)\s+(?P<tags>[\s\S]+)$")
     async def handle_dr0_ref_draw(self, **kwargs) -> tuple:
         from .components.command import handle_dr0_ref_draw
