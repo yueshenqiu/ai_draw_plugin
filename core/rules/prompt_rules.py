@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 提示词生成规则 - 公共模块
-AI Draw 插件生图动作与命令共用的提示词生成规则
+统一 ai_draw_action.py 和 nai_draw_command.py 的提示词生成规则
 基于 NovelAI 4/4.5 最新特性优化
 """
 
@@ -295,7 +295,7 @@ NAI4/4.5 可接受自然语言短句，但不是推荐输出方式。JSON 模式
 ## 特殊场景方向（思考方向，具体标签自由发挥）
 
 - 可爱/萌系：柔和色调、可爱元素、甜美氛围
-- 漫画/特殊风格：画风由风格预设（画师串）统一控制，不要自行添加风格标签（用户明确要求某画风时除外）
+- 漫画/特殊风格：monochrome, color splash, pixel art 等风格标签
 - 特定性格（傲娇/病娇/天然）：通过表情、姿态、视角传达
 - 战斗/动态：动感、冲击力、戏剧性光影
 - 性感暗示（SFW）：服装选择、姿态暗示、光影营造氛围，禁止露骨标签
@@ -309,7 +309,6 @@ NAI4/4.5 可接受自然语言短句，但不是推荐输出方式。JSON 模式
 
 - 禁止添加质量词：不加 masterpiece, best quality 等（系统会自动添加）
 - 禁止添加画师标签：不加 artist:xxx（系统会自动添加）
-- 禁止自行添加画风/风格标签（monochrome, pixel art, watercolor, oil painting, sketch, cel shading, flat color, retro 等）——画风由风格预设（画师串）统一控制；仅当用户本轮明确要求某画风时才按用户的写
 - 禁止输出非提示词内容：只输出纯粹的英文提示词，不要解释
 - 禁止过度补充：不要为了补充而补充，简洁的描述有时更好
 - 禁止语义重复：不要使用意思相近的多个词，应精简为最准确的一个
@@ -356,6 +355,8 @@ NAI4/4.5 可接受自然语言短句，但不是推荐输出方式。JSON 模式
 SFW_PROMPT_GENERATOR_TEMPLATE = f"""
 {SFW_PROMPT_RULES_TEXT}
 
+<<CHARACTER_REF_CONTEXT>>
+<<TAG_CANDIDATES>>
 <<PREVIOUS_PROMPT>>
 <user_request>
 <<USER_REQUEST>>
@@ -378,6 +379,8 @@ SFW_PROMPT_GENERATOR_TEMPLATE = f"""
 SFW_PROMPT_GENERATOR_JSON_TEMPLATE = f"""
 {SFW_PROMPT_RULES_TEXT}
 
+<<CHARACTER_REF_CONTEXT>>
+<<TAG_CANDIDATES>>
 <<PREVIOUS_PROMPT>>
 <user_request>
 <<USER_REQUEST>>
@@ -902,7 +905,8 @@ NovelAI 4/4.5 在极少数情况下可以接受自然语言短句作为补充描
 - **思路**：考虑服装的可爱细节、表情的甜美感、环境的温馨感
 
 ### 漫画/特殊风格
-- 画风由风格预设（画师串）统一控制，不要自行添加风格/画风标签（用户明确要求某画风时除外）
+- **方向**：添加对应的风格标签改变整体呈现方式
+- **思路**：黑白漫画、彩色插画、像素风等各有不同的风格标签
 
 ### 雌小鬼/特定性格
 - **方向**：通过表情、姿态、视角传达性格特点
@@ -940,7 +944,6 @@ NovelAI 4/4.5 在极少数情况下可以接受自然语言短句作为补充描
 
 - 禁止添加质量词：不加 masterpiece, best quality 等（系统会自动添加）
 - 禁止添加画师标签：不加 artist:xxx（系统会自动添加）
-- 禁止自行添加画风/风格标签（monochrome, pixel art, watercolor, oil painting, sketch, cel shading, flat color, retro 等）——画风由风格预设（画师串）统一控制；仅当用户本轮明确要求某画风时才按用户的写
 - 禁止输出非提示词内容：只输出纯粹的英文提示词，不要解释
 - 禁止过度补充：不要为了补充而补充，简洁的描述有时更好
 - 禁止语义重复：不要使用意思相近的多个词，应精简为最准确的一个
@@ -988,6 +991,8 @@ NovelAI 4/4.5 在极少数情况下可以接受自然语言短句作为补充描
 PROMPT_GENERATOR_TEMPLATE = f"""
 {PROMPT_RULES_TEXT}
 
+<<CHARACTER_REF_CONTEXT>>
+<<TAG_CANDIDATES>>
 <<PREVIOUS_PROMPT>>
 <user_request>
 <<USER_REQUEST>>
@@ -1007,148 +1012,11 @@ PROMPT_GENERATOR_TEMPLATE = f"""
 </output_instruction>
 """.strip()
 
-# ================================================================
-# 按参考模式区分的提示词（一个文件内用代码区分，每条指令只取专属那份）
-# ----------------------------------------------------------------
-#   plain      /ad、/ad t、Tool ：完整 base，人物外貌/画风照常描述
-#   char_ref   /ad r            ：参考图定义角色 → 禁止 LLM 编外貌/服装
-#   style_ref  /ad h            ：参考图定义画风 → 禁止 LLM 输出画风/画师标签（人物照常）
-#   char_style /ad rh、/ad hr   ：两者都禁
-# plain 模式逐字等于原始模板（见文件尾自检脚本 / 运行时不改行为）。
-# ================================================================
-
-MODE_PLAIN = "plain"
-MODE_CHAR_REF = "char_ref"
-MODE_STYLE_REF = "style_ref"
-MODE_CHAR_STYLE = "char_style"
-
-
-def classify_ref_mode(ref_mode: str) -> str:
-    """把 provider 层的 ref_mode 归类到提示词模式。"""
-    m = (ref_mode or "").strip().lower()
-    has_char = "character" in m
-    has_style = "style" in m
-    if has_char and has_style:
-        return MODE_CHAR_STYLE
-    if has_char:
-        return MODE_CHAR_REF
-    if has_style:
-        return MODE_STYLE_REF
-    return MODE_PLAIN
-
-
-# ---- 角色参考：删掉“主动写外貌/服装”的段落，换成禁写外貌的版本 ----
-
-_CHAR_HANDLING_OLD = """### 角色处理（重要！）
-角色有3种形式，处理方式不同：
-
-**形式1：有具体出处和名字的角色**
-- 直接写角色名和出处，如 flandre scarlet (touhou)、rem (re zero)
-- 日本名字用罗马音，必须用完整名字而非昵称
-- ⚠️ 禁止写入发色、瞳色、发型等外貌描写！除非用户特别指定要改变
-- 角色的默认外貌由模型自动识别，手动添加反而会冲突
-
-**形式2：原创人物（无具体出处）**
-- 需要描写人物的外貌特征：发色、发型、瞳色、体型等
-- 可添加性格/属性特色词
-- 可添加服装风格特色
-
-**形式3：已知角色但换装/改造**
-- 角色进行了换装、cosplay、身体改造、特定场合着装等
-- 需要同时写角色名+出处，并在后方写入改变的外貌特征
-- 例：rem (re zero), white hair, red eyes, gothic dress（雷姆换装版）"""
-
-_CHAR_HANDLING_REF = """### 角色处理（参考图模式）
-本轮为角色参考模式：参考图只用来锁定该角色的“固有长相”（脸型、发色、发型、瞳色、肤色、体型）。除了固有长相，用户指令优先级最高，你要精准翻译并智能补全。
-- 固有长相标签（发色 / 发型 / 瞳色 / 肤色 / 脸型 / 体型：hair / long hair / short hair / bangs / twintails / ponytail / braid / eyes / *-eyed / skin 等）不要凭空输出，交给参考图——除非用户本轮明确要求改变长相
-- 服装：不要凭空补参考角色的原有服装；但用户明确指定的服装必须输出（如“女仆服”→ maid outfit / maid），并替换掉参考图里的原服装
-- 用户没有提到的画面要素（场景、动作、姿势、表情、镜头、光影、氛围等）由你智能补全，让画面完整生动，不要因为是参考模式就省略
-- 用户要求的身体表现/画面尺度照常输出，但露骨或收敛程度仍遵循上下文的 SFW / NSFW 分级规则，不因“用户要求”而绕过分级
-- 若用户提到已知角色名，可写 角色名 (作品名)"""
-
-_EXAMPLE1_OLD = "输出: solo, 1girl, crying, tears, wet hair, wet clothes, looking down, rain, cloudy sky, emotional, backlighting"
-_EXAMPLE1_REF = "输出: solo, 1girl, crying, tears, looking down, rain, cloudy sky, emotional, backlighting"
-
-_EXAMPLE3_OLD = """### 示例 3：已知角色，用户明确要求外貌时才补
-输入: "画蕾姆，必须是蓝色头发，一定要微笑"
-输出: solo, 1girl, {rem (re zero)}, {{{blue hair}}}, {{{smile}}}, looking at viewer, soft lighting"""
-_EXAMPLE3_REF = """### 示例 3：参考图模式，只写动作/场景，不补外貌
-输入: "让她在窗边回头对镜头微笑"
-输出: solo, 1girl, by window, looking back, {{{smile}}}, looking at viewer, soft lighting"""
-
-_REF_ISOLATION_BLOCK = """<reference_isolation>
-【角色参考补充规则 - 优先级高】
-参考图已经锁定该角色的固有长相，其余一切以用户指令为准（精准翻译 + 智能补全）：
-- 绝对不要凭空输出角色的固有长相（发色/发型/瞳色/肤色/脸型/体型），包括但不限于：
-  black hair, brown hair, blonde hair, white hair, red hair, pink hair, silver hair, blue hair, purple hair, green hair,
-  long hair, short hair, medium hair, very long hair, twintails, ponytail, braid, bob cut, bangs, hime cut,
-  blue eyes, green eyes, red eyes, brown eyes, purple eyes, yellow eyes, pink eyes, heterochromia,
-  dark skin, pale skin, tan, fair skin —— 以上及同类一律不写，交给参考图（除非用户本轮明确要求改变长相）
-- 用户明确指定的服装必须照常输出，并替换掉参考图原服装；用户没提到的场景、动作、姿势、镜头、光影等由你智能补全
-- 本规则只负责“别替参考图重画固有长相、别凭空给它套原服装”，不控制露骨程度；画面的露骨或收敛完全遵循上文的 SFW / NSFW 分级规则
-</reference_isolation>"""
-
-# ---- 画风参考：画风“不自行添加”已在 base 的 <forbidden>/特殊场景 里统一约束，这里只追加参考图专属隔离说明 ----
-
-_STYLE_ISOLATION_BLOCK = """<style_reference_isolation>
-【画风参考补充规则】
-参考图已经定义了整幅画的画风 / 笔触 / 上色方式，所以本轮只约束“画风”，不接管画面内容与尺度：
-- 不要输出任何画风 / 风格 / 画师标签（monochrome, pixel art, color splash, sketch, watercolor, oil painting, flat color, cel shading, retro, 1980s (style), impasto 等）——画风由参考图决定
-- 人物的外貌、服装、姿势、动作、场景，以及用户要求的身体表现/画面尺度，全部照常正常输出
-- 本规则只负责“别指定画风”，不负责控制露骨程度；画面的露骨或收敛完全遵循上文的 SFW / NSFW 分级规则
-</style_reference_isolation>"""
-
-
-def _replace_required(text: str, old: str, new: str, label: str) -> str:
-    if old not in text:
-        raise ValueError(f"[prompt_rules] 模式模板构建失败：未找到片段 {label}")
-    return text.replace(old, new, 1)
-
-
-def _apply_char_ref(rules: str) -> str:
-    t = _replace_required(rules, _CHAR_HANDLING_OLD, _CHAR_HANDLING_REF, "角色处理")
-    t = _replace_required(t, _EXAMPLE1_OLD, _EXAMPLE1_REF, "示例1")
-    t = _replace_required(t, _EXAMPLE3_OLD, _EXAMPLE3_REF, "示例3")
-    return t.rstrip() + "\n\n" + _REF_ISOLATION_BLOCK
-
-
-def _apply_style_ref(rules: str) -> str:
-    # 画风“不自行添加”已由 base 的 <forbidden>/特殊场景 统一约束；此处只追加画风参考专属隔离块（画风来自参考图）
-    return rules.rstrip() + "\n\n" + _STYLE_ISOLATION_BLOCK
-
-
-def _build_mode_rules(base: str, mode: str) -> str:
-    if mode == MODE_CHAR_REF:
-        return _apply_char_ref(base)
-    if mode == MODE_STYLE_REF:
-        return _apply_style_ref(base)
-    if mode == MODE_CHAR_STYLE:
-        return _apply_style_ref(_apply_char_ref(base))
-    return base
-
-
-def get_generator_template(ref_mode: str, nsfw_filter_enabled: bool, output_format: str) -> str:
-    """返回该指令专属的完整提示词模板（按参考模式 + NSFW 过滤开关 + 输出格式组装）。
-
-    nsfw_filter_enabled=True 表示 NSFW 过滤开启 → 使用 SFW 模板（与原逻辑一致）。
-    tail = 原始模板去掉开头 rules_text 的部分；plain 模式 rules 不变，
-    因此 plain 组装结果与原始模板逐字一致（普通生图零行为变化）。
-    """
-    mode = classify_ref_mode(ref_mode)
-    is_json = (output_format or "json").strip().lower() == "json"
-    if nsfw_filter_enabled:  # 过滤开启 → SFW
-        base = SFW_PROMPT_RULES_TEXT
-        tpl = SFW_PROMPT_GENERATOR_JSON_TEMPLATE if is_json else SFW_PROMPT_GENERATOR_TEMPLATE
-    else:  # 过滤关闭 → 允许 NSFW
-        base = PROMPT_RULES_TEXT
-        tpl = PROMPT_GENERATOR_JSON_TEMPLATE if is_json else PROMPT_GENERATOR_TEMPLATE
-    tail = tpl[len(base):]
-    return _build_mode_rules(base, mode) + tail
-
-
 PROMPT_GENERATOR_JSON_TEMPLATE = f"""
 {PROMPT_RULES_TEXT}
 
+<<CHARACTER_REF_CONTEXT>>
+<<TAG_CANDIDATES>>
 <<PREVIOUS_PROMPT>>
 <user_request>
 <<USER_REQUEST>>
