@@ -792,9 +792,6 @@ async def ad_workflow(
         info["platform"], info["chat_id"], plugin._get_config_callable(),
     )
 
-    # 角色/画风参考的隔离规则已内置进各自专属提示词模板（见 prompt_rules.get_generator_template），
-    # 按 ref_mode 选模板即可，无需再在运行时向 base 注入“禁止外貌”块。
-
     # 自拍场景增强：从日程 + LLM 获取 action/environment/expression/lighting
     selfie_scene_context = ""
     if is_selfie and plugin.config.prompt_generator.scene_llm_enabled:
@@ -820,9 +817,7 @@ async def ad_workflow(
 
     generated_prompt = await _generate_prompt_with_llm(
         description, stream_id, is_action, nsfw_enabled,
-        ref_mode=ref_mode,
         selfie_scene_context=selfie_scene_context,
-        is_selfie=is_selfie,
     )
     if not generated_prompt:
         await plugin.ctx.send.text("提示词生成失败，请稍后再试~", stream_id)
@@ -991,9 +986,7 @@ def _process_selfie_prompt(description: str, raw_request: str,
 async def _generate_prompt_with_llm(
     request_text: str, stream_id: str = "",
     is_action: bool = False, nsfw_enabled: bool = False,
-    ref_mode: str = "",
     selfie_scene_context: str = "",
-    is_selfie: bool = False,
 ) -> Optional[str]:
     plugin = get_plugin_instance()
     gen_cfg = plugin.config.prompt_generator
@@ -1001,16 +994,21 @@ async def _generate_prompt_with_llm(
     if not request_text.strip():
         return None
 
-    # 按参考模式 + NSFW 过滤开关 + 输出格式，取该指令专属的提示词模板
-    from ..core.rules.prompt_rules import get_generator_template
+    # 加载模板
+    from ..core.rules.prompt_rules import (
+        PROMPT_GENERATOR_TEMPLATE, PROMPT_GENERATOR_JSON_TEMPLATE,
+        SFW_PROMPT_GENERATOR_TEMPLATE, SFW_PROMPT_GENERATOR_JSON_TEMPLATE,
+    )
 
     output_format = (gen_cfg.output_format or "json").strip().lower()
-    default_tpl = get_generator_template(ref_mode, nsfw_enabled, output_format)
+    if nsfw_enabled:
+        default_tpl = SFW_PROMPT_GENERATOR_JSON_TEMPLATE if output_format == "json" else SFW_PROMPT_GENERATOR_TEMPLATE
+    else:
+        default_tpl = PROMPT_GENERATOR_JSON_TEMPLATE if output_format == "json" else PROMPT_GENERATOR_TEMPLATE
 
     template = gen_cfg.prompt_template or default_tpl
     prompt = _render_generator_prompt(template, request_text, is_action=is_action,
-                                      selfie_scene_context=selfie_scene_context,
-                                      is_selfie=is_selfie)
+                                      selfie_scene_context=selfie_scene_context)
 
     # LLM 调用
     from ..core.prompt_engine import call_custom_llm_api, has_custom_api_config, cleanup_llm_prompt
@@ -1044,8 +1042,7 @@ async def _generate_prompt_with_llm(
 
 
 def _render_generator_prompt(template: str, request: str, is_action: bool = False,
-                             selfie_scene_context: str = "",
-                             is_selfie: bool = False) -> str:
+                             selfie_scene_context: str = "") -> str:
     plugin = get_plugin_instance()
     from ..core.selfie_engine import get_selfie_hint
     from ..core.prompt_engine import build_current_time_context
@@ -1054,17 +1051,18 @@ def _render_generator_prompt(template: str, request: str, is_action: bool = Fals
     if custom_sys:
         custom_sys = custom_sys.strip() + "\n\n"
 
-    # 自拍规则块（约 40 行）仅在判定为自拍时注入；普通生图不带，节省 token
-    selfie_hint = get_selfie_hint() if is_selfie else ""
+    selfie_hint = get_selfie_hint()
     current_time = build_current_time_context()
 
     prompt = template.replace("<<CUSTOM_SYSTEM_PROMPT>>", custom_sys)
     if not is_action:
         prompt = prompt.replace("<<PREVIOUS_PROMPT>>", "")
     prompt = prompt.replace("<<SELFIE_SCENE_CONTEXT>>", selfie_scene_context or "")
+    prompt = prompt.replace("<<CHARACTER_REF_CONTEXT>>", "")
     prompt = prompt.replace("<<USER_REQUEST>>", request.strip() or "N/A")
     prompt = prompt.replace("<<CURRENT_TIME_CONTEXT>>", current_time)
     prompt = prompt.replace("<<SELFIE_HINT>>", selfie_hint)
+    prompt = prompt.replace("<<TAG_CANDIDATES>>", "")
     return prompt.strip()
 
 
