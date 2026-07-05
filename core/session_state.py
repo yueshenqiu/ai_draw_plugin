@@ -386,6 +386,12 @@ def _normalize_artist_presets(presets) -> List[Dict]:
 _global_presets_cache: Optional[List[Dict]] = None
 
 
+def clear_global_presets_cache() -> None:
+    """清除全局画师预设缓存，供配置热重载调用（否则换了 config.toml 仍读旧缓存）。"""
+    global _global_presets_cache
+    _global_presets_cache = None
+
+
 def _load_global_artist_presets() -> Optional[List[Dict]]:
     """从 config.toml 的 [artist_presets] 节加载全局画师预设（缓存）。"""
     global _global_presets_cache
@@ -401,10 +407,14 @@ def _load_global_artist_presets() -> Optional[List[Dict]]:
             return None
         with open(config_path, "rb") as f:
             data = _toml.load(f)
-        presets = data.get("artist_presets", {})
-        if isinstance(presets, dict) and presets:
-            _global_presets_cache = _normalize_artist_presets(presets)
-            return _global_presets_cache
+        raw = data.get("artist_presets", {})
+        # 新结构 {"presets": [{name, prompt}]} 取内层列表；旧扁平字典 {名称: 提示词} 直接用
+        if isinstance(raw, dict) and "presets" in raw:
+            raw = raw.get("presets") or []
+        if raw:
+            normalized = _normalize_artist_presets(raw)
+            _global_presets_cache = normalized
+            return normalized if normalized else None
         _global_presets_cache = []
         return None
     except Exception:
