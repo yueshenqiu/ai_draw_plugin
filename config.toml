@@ -4,57 +4,63 @@
 [plugin]
 enabled = true
 config_version = "2.0.0"
-send_mode = "direct"                          # direct=普通直发（快） / forward=合并转发（隐蔽但慢）
-force_forward_when_nsfw_off = true            # NSFW 过滤关闭时强制合并转发
-use_http_direct = false                       # 是否直连本机 HTTP API（默认 false 走 SDK passthrough）；慢环境可设 true 提速，配置见 README
-napcat_http_url = "http://127.0.0.1:5780"     # HTTP 直连地址（仅 use_http_direct=true 生效，仅允许本机回环）
-napcat_http_token = ""                        # HTTP 直连令牌（与 NapCat/SnowLuma 的 HTTP 服务器 token 一致，无则留空）
-y_apply_artist_preset = false                 # /ad y（提示词预设）是否叠加当前风格预设（画师串），默认 false 只用提示词预设本身
+send_mode = "direct"
+force_forward_when_nsfw_off = true
+use_http_direct = false
+napcat_http_url = "http://127.0.0.1:5780"
+napcat_http_token = ""
+y_apply_artist_preset = false
 
 [admin]
-admin_users = [""]   # 管理员 QQ 号列表
-default_admin_mode = false     # 启用后仅管理员可使用生图命令
+admin_users = ["123456789"]
+default_admin_mode = false
 
 [prompt_generator]
 model_name = "deepseek-v4-flash"
 api_base = "https://api.deepseek.com"
 api_key = ""
-output_format = "json"              # json / text
-selfie_appearance_policy = "auto"   # 自拍外貌标签策略：auto / never / keep
+output_format = "json"
+selfie_appearance_policy = "auto"
 enforce_tag_order = false
-scene_llm_enabled = true            # 自拍场景 LLM 增强
+scene_llm_enabled = true
 temperature = 0.2
 max_tokens = 4000
 prompt_template = ""
-inherit_ttl = 3600                  # 上一轮提示词继承有效时间（秒）
+inherit_ttl = 3600
 
 [auto_recall]
 enabled = true
-delay_seconds = 50            # 撤回延迟（秒）
-allowed_groups = []           # 撤回白名单（platform:chat_id），空=全部允许
+delay_seconds = 50
+allowed_groups = []
 
 [nsfw_filter]
 enabled = true
 filter_tags = "{{{{{nsfw}}}}}"
 
 [prompt_show]
-enabled = true
+enabled = false
 hide_selfie_prompt_add = false
-selfie_prompt_add = ""
+selfie_prompt_add = "1girl, long brown hair"
 negative_prompt_add = ""
-selfie_ref_image = ""   # 自拍参考图（selfie_refs/ 目录），留空则用文字提示词
+selfie_ref_image = ""
 
-# 全局风格预设（画师串）（所有模型共享，模型里用 artist_preset = "名称" 引用）
-
+# 全局风格预设（画师串）；模型里用 artist_preset = "名称" 引用
 [artist_presets]
-"无" = ""
+[[artist_presets.presets]]
+name = "无"
+prompt = ""
+[[artist_presets.presets]]
+name = "超漂亮好看"
+prompt = "0.7::nekodayo22,::, 0.8::qiandaiyiyu::, 0.85::aiue oka::, 0.9::lunch (shin new)::, 1.1::cola (gotouryouta)::, 1.3::dishwasher1910,::, 1.4::healthyman::, 1.65::freng::, 1.7::quasarcake::, 1.75::kim eb::, 1.8::wanke::"
 
 # 提示词预设（/ad y 命令使用）
-
 [styles]
-"线描" = "line art style, single weight lines, no shading, white background, clean contours, vector-like precision"
-
-# 随机场景（留空则自动使用 prompt_generator 的模型）
+[[styles.presets]]
+name = "像素风"
+prompt = "pixel art style, 16-bit color palette, blocky pixels, retro game aesthetic, sharp edges, nostalgic vibe"
+[[styles.presets]]
+name = "线描"
+prompt = "line art style, single weight lines, no shading, white background, clean contours, vector-like precision"
 
 [random_scene]
 temperature = 1.0
@@ -66,11 +72,11 @@ system_prompt = ""
 # ======================================================================
 # 多模型配置
 # ======================================================================
-
 [models]
 default_model = "model1"
 
-[models.model1]
+[[models.entries]]
+id = "model1"
 name = "BestNAI V4.5"
 format = "bestnai"
 base_url = ""
@@ -87,7 +93,8 @@ default_size = "832x1216"
 size_preset = "竖图"
 artist_preset = "无"
 
-[models.model2]
+[[models.entries]]
+id = "model2"
 name = "BestNAI V4.5"
 format = "bestnai"
 base_url = ""
@@ -104,7 +111,8 @@ default_size = "832x1216"
 size_preset = "竖图"
 artist_preset = "无"
 
-[models.model3]
+[[models.entries]]
+id = "model3"
 name = "BestNAI V4 "
 format = "bestnai"
 base_url = ""

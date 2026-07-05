@@ -11,7 +11,7 @@ from typing import Any, ClassVar, Dict, List, Literal, Optional
 
 from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
-from pydantic import ConfigDict, field_validator
+from pydantic import ConfigDict, field_validator, model_validator
 
 from .constants.constants import MODEL_MAPPINGS, SIZE_MAPPINGS, BESTNAI_MODEL_IDS
 from .instance import set_plugin_instance, clear_plugin_instance
@@ -111,19 +111,88 @@ class PluginSectionConfig(PluginConfigBase):
         return s if s in {"direct", "forward"} else "direct"
 
 
+class ModelItem(PluginConfigBase):
+    """单个生图模型配置（WebUI 列表卡片编辑）。id 为模型标识（如 model1），代码按 id 查找。"""
+    # extra="allow"：兜底保留未显式声明的模型字段（如 extra_params 等），保存不丢
+    model_config = ConfigDict(validate_assignment=True, extra="allow")
+    id: str = Field(default="", description="模型 ID（唯一标识，如 model1）",
+                    json_schema_extra=_ui("模型 ID", order=0, placeholder="model1"))
+    name: str = Field(default="", description="模型显示名",
+                      json_schema_extra=_ui("显示名", order=1, placeholder="BestNAI V4.5"))
+    format: str = Field(default="bestnai", description="服务商格式",
+                        json_schema_extra=_ui("服务商格式", order=2, placeholder="bestnai"))
+    base_url: str = Field(default="", description="API 地址",
+                          json_schema_extra=_ui("API 地址", order=3, placeholder="https://..."))
+    api_key: str = Field(default="", description="API 密钥",
+                         json_schema_extra=_ui("API 密钥", order=4, placeholder="sk-...", **{"x-widget": "password"}))
+    model: str = Field(default="nai-diffusion-4-5-full", description="底层模型名",
+                       json_schema_extra=_ui("底层模型名", order=5, placeholder="nai-diffusion-4-5-full"))
+    endpoint: str = Field(default="/v1/chat/completions", description="接口路径",
+                          json_schema_extra=_ui("接口路径", order=6))
+    max_tokens: int = Field(default=100000, description="最大 token",
+                            json_schema_extra=_ui("最大 token", order=7))
+    sampler: str = Field(default="k_euler_ancestral", description="采样器",
+                         json_schema_extra=_ui("采样器", order=8))
+    steps: int = Field(default=28, description="步数",
+                       json_schema_extra=_ui("步数", order=9))
+    scale: float = Field(default=6.0, description="引导强度 scale",
+                         json_schema_extra=_ui("引导强度", order=10, step=0.1))
+    cfg: float = Field(default=0.0, description="cfg_rescale (0~1)",
+                       json_schema_extra=_ui("cfg_rescale", order=11, step=0.1))
+    noise_schedule: str = Field(default="karras", description="噪声调度",
+                                json_schema_extra=_ui("噪声调度", order=12))
+    default_size: str = Field(default="832x1216", description="默认尺寸",
+                              json_schema_extra=_ui("默认尺寸", order=13))
+    size_preset: str = Field(default="竖图", description="尺寸预设",
+                             json_schema_extra=_ui("尺寸预设", order=14))
+    artist_preset: str = Field(default="无", description="引用的风格预设（画师串）名",
+                               json_schema_extra=_ui("风格预设名", order=15, placeholder="无"))
+
+
+def _legacy_flat_models_to_entries(data: Any) -> Any:
+    """把旧 [models.modelX] 扁平结构迁移成 {default_model, entries:[{id,...}]}。
+
+    兼容：新结构（含 entries 键，原样）、旧扁平（default_model + 多个 modelX 子表）。
+    """
+    if not isinstance(data, dict):
+        return data
+    if "entries" in data:
+        return data
+    default_model = data.get("default_model", "model1")
+    entries = []
+    for key, value in data.items():
+        if key in ("default_model", "hint"):
+            continue
+        if isinstance(value, dict):
+            entry = dict(value)
+            entry.setdefault("id", key)
+            entries.append(entry)
+    if entries:
+        return {"default_model": default_model, "entries": entries}
+    return data
+
+
 class ModelsSectionConfig(PluginConfigBase):
-    # extra="allow"：保留动态 [models.modelX] 段（SDK schema 无法声明这些键），
-    # 否则归一化丢弃 model1/2/3，WebUI 表单保存时会把模型详情写丢。
+    # extra="allow"：兜底保留未声明字段
     model_config = ConfigDict(validate_assignment=True, extra="allow")
     __ui_label__: ClassVar[str] = "多模型配置"
-    __ui_order__: ClassVar[int] = 1
+    __ui_order__: ClassVar[int] = 10
     default_model: str = Field(
         default="model1", description="默认使用的模型 ID",
         json_schema_extra=_ui(
             "默认模型 ID", order=0, placeholder="model1",
-            hint="对应 config.toml 中 [models.modelX] 的 X（如 model1）。各模型详细参数请直接编辑 config.toml",
+            hint="对应下方某个模型的 ID（如 model1）",
         ),
     )
+    entries: List[ModelItem] = Field(
+        default_factory=list, description="生图模型列表",
+        json_schema_extra=_ui("生图模型列表", order=1, hint="每个模型含 API、参数、引用的风格预设名；代码按 id 查找"),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy(cls, data: Any) -> Any:
+        return _legacy_flat_models_to_entries(data)
 
 
 class AutoRecallSection(PluginConfigBase):
@@ -153,7 +222,7 @@ class AutoRecallSection(PluginConfigBase):
 
 class AdminSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "管理员权限配置"
-    __ui_order__: ClassVar[int] = 2
+    __ui_order__: ClassVar[int] = 1
     admin_users: List[str] = Field(
         default_factory=list, description="管理员用户ID列表",
         json_schema_extra=_ui(
@@ -174,7 +243,7 @@ class AdminSection(PluginConfigBase):
 
 class PromptShowSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "提示词显示配置"
-    __ui_order__: ClassVar[int] = 4
+    __ui_order__: ClassVar[int] = 5
     enabled: bool = Field(
         default=False, description="是否默认启用提示词显示",
         json_schema_extra=_ui("启用提示词显示", order=0, hint="开启后发图时一并展示最终提示词，可用 /ad 指令热切换"),
@@ -212,7 +281,7 @@ class PromptShowSection(PluginConfigBase):
 
 class NsfwFilterSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "NSFW 内容过滤配置"
-    __ui_order__: ClassVar[int] = 5
+    __ui_order__: ClassVar[int] = 4
     enabled: bool = Field(
         default=True, description="是否默认启用NSFW内容过滤",
         json_schema_extra=_ui("启用 NSFW 过滤", order=0, hint="开启后向提示词注入过滤标签，可用 /ad 指令按会话热切换"),
@@ -226,7 +295,7 @@ class NsfwFilterSection(PluginConfigBase):
 
 class PromptGeneratorSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "提示词生成配置"
-    __ui_order__: ClassVar[int] = 6
+    __ui_order__: ClassVar[int] = 2
     model_name: str = Field(
         default="deepseek-v4-pro", description="LLM模型代号",
         json_schema_extra=_ui("LLM 模型代号", order=0, placeholder="deepseek-v4-pro"),
@@ -294,7 +363,7 @@ class PromptGeneratorSection(PluginConfigBase):
 
 class RandomSceneSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "随机场景生成配置"
-    __ui_order__: ClassVar[int] = 7
+    __ui_order__: ClassVar[int] = 8
     temperature: float = Field(
         default=1.0, description="LLM温度",
         json_schema_extra=_ui("LLM 温度", order=0, step=0.1, hint="随机场景生成温度，越高越多样"),
@@ -319,8 +388,71 @@ class CustomPromptSection(PluginConfigBase):
 
 
 
+class PresetItem(PluginConfigBase):
+    """单条预设：名称 + 提示词。用于风格预设（画师串）与提示词预设的 WebUI 列表编辑。"""
+    name: str = Field(
+        default="", description="预设名称",
+        json_schema_extra=_ui("名称", order=0, placeholder="如 梦幻柔美2.0"),
+    )
+    prompt: str = Field(
+        default="", description="预设内容（提示词 / 画师串）",
+        json_schema_extra=_ui(
+            "内容", order=1, rows=4, placeholder="英文提示词 / 画师串（支持 NAI 权重语法）",
+            **{"x-widget": "textarea"},
+        ),
+    )
+
+
+def _legacy_flat_to_presets(data: Any) -> Any:
+    """把旧扁平字典 {名称: 提示词} 归一成新结构 {"presets": [{name, prompt}]}。
+
+    兼容三种输入：新结构（含 presets 键，原样返回）、旧扁平字典、直接列表。
+    这样旧 config.toml 无需改动即可通过校验；WebUI 首次保存后自然写成新结构。
+    """
+    if not isinstance(data, dict):
+        if isinstance(data, list):
+            return {"presets": data}
+        return data
+    if "presets" in data:
+        return data
+    items = [{"name": str(k), "prompt": v} for k, v in data.items() if isinstance(v, str)]
+    return {"presets": items} if items else data
+
+
+class ArtistPresetsSection(PluginConfigBase):
+    __ui_label__: ClassVar[str] = "风格预设（画师串）"
+    __ui_order__: ClassVar[int] = 6
+    presets: List[PresetItem] = Field(
+        default_factory=list, description="风格预设（画师串）列表；模型里用 artist_preset = 名称 引用",
+        json_schema_extra=_ui("风格预设（画师串）", order=0, hint="每条含名称+画师串内容；模型用 artist_preset 引用名称"),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy(cls, data: Any) -> Any:
+        return _legacy_flat_to_presets(data)
+
+
+class StylesSection(PluginConfigBase):
+    __ui_label__: ClassVar[str] = "提示词预设"
+    __ui_order__: ClassVar[int] = 7
+    presets: List[PresetItem] = Field(
+        default_factory=list, description="提示词预设列表（/ad y 命令使用）",
+        json_schema_extra=_ui("提示词预设", order=0, hint="每条含名称+完整提示词；/ad y <名称> 引用"),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy(cls, data: Any) -> Any:
+        return _legacy_flat_to_presets(data)
+
+
 class AiDrawPluginConfig(PluginConfigBase):
     """AI Draw 图片生成插件完整配置"""
+    # extra="allow"：保留未显式声明的顶层段（如动态 [models.modelX]），
+    # 否则 PluginConfigBase 默认 extra="ignore" 会在 WebUI 保存时把这些段整段写丢。
+    model_config = ConfigDict(validate_assignment=True, extra="allow")
+
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     models: ModelsSectionConfig = Field(default_factory=ModelsSectionConfig)
     admin: AdminSection = Field(default_factory=AdminSection)
@@ -328,6 +460,8 @@ class AiDrawPluginConfig(PluginConfigBase):
     prompt_show: PromptShowSection = Field(default_factory=PromptShowSection)
     nsfw_filter: NsfwFilterSection = Field(default_factory=NsfwFilterSection)
     prompt_generator: PromptGeneratorSection = Field(default_factory=PromptGeneratorSection)
+    artist_presets: ArtistPresetsSection = Field(default_factory=ArtistPresetsSection)
+    styles: StylesSection = Field(default_factory=StylesSection)
     random_scene: RandomSceneSection = Field(default_factory=RandomSceneSection)
     custom_prompt: CustomPromptSection = Field(default_factory=CustomPromptSection)
 
@@ -369,6 +503,9 @@ class AiDrawPlugin(MaiBotPlugin):
         self._last_structured_prompt_payload: Optional[Dict[str, Any]] = None
         self._pending_tasks: list = []
 
+        # 清预设缓存，确保加载读的是当前 config.toml（防跨重载残留空缓存）
+        self._clear_preset_caches()
+
         # 加载模型配置
         raw_models = self._load_raw_models_config()
         self._loaded_models = load_models_config(raw_models)
@@ -391,6 +528,8 @@ class AiDrawPlugin(MaiBotPlugin):
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         if scope == "self":
+            # 清画师预设/提示词预设缓存，否则换了 config.toml 仍读旧缓存（导致"读不到预设"）
+            self._clear_preset_caches()
             raw_models = self._load_raw_models_config()
             self._loaded_models = load_models_config(raw_models)
             self._session_state.set_loaded_models(self._loaded_models)
@@ -399,6 +538,20 @@ class AiDrawPlugin(MaiBotPlugin):
             )
         elif scope == "model":
             self.ctx.logger.info(f"全局模型配置已更新: version={version}")
+
+    @staticmethod
+    def _clear_preset_caches() -> None:
+        """清空模块级预设缓存（画师串 + 提示词预设），供热重载/加载时调用。"""
+        try:
+            from .core.session_state import clear_global_presets_cache
+            clear_global_presets_cache()
+        except Exception:
+            pass
+        try:
+            from .components.command import clear_styles_cache
+            clear_styles_cache()
+        except Exception:
+            pass
 
     # ================================================================
     # Config helpers
@@ -429,7 +582,22 @@ class AiDrawPlugin(MaiBotPlugin):
             return {}
 
         raw_models = data.get("models", {})
-        return raw_models if isinstance(raw_models, dict) else {}
+        if not isinstance(raw_models, dict):
+            return {}
+        # 新结构 {default_model, entries:[{id,...}]} → 归一回旧扁平 {modelX: config}，
+        # 使 load_models_config 及下游生图链零改动。旧扁平结构原样返回。
+        if "entries" in raw_models:
+            flat: dict = {"default_model": raw_models.get("default_model", "model1")}
+            for entry in (raw_models.get("entries") or []):
+                if not isinstance(entry, dict):
+                    continue
+                mid = str(entry.get("id", "") or "").strip()
+                if not mid:
+                    continue
+                cfg = {k: v for k, v in entry.items() if k != "id"}
+                flat[mid] = cfg
+            return flat
+        return raw_models
 
     def _get_config_callable(self):
         def get_config(path: str, default=None):
@@ -651,6 +819,7 @@ class AiDrawPlugin(MaiBotPlugin):
         return await handle_ad_switch_artist((matched.get("param") or "").strip(), kwargs)
 
     # /ad y <名称> — 提示词预设图生图
+    # 正则用宽松前缀负责"抠出 /ad 后内容"；防误触发（/ad 藏在长文本内）由 _is_real_ad_command 段守卫负责
     @Command("ad_style", pattern=r"(?:[\s\S]*，说：\s*)?/ad\s+y\s+(?P<style>.+)$")
     async def handle_ad_style(self, **kwargs) -> tuple:
         from .components.command import handle_ad_style

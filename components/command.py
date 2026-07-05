@@ -19,6 +19,13 @@ from ..providers.capabilities import ImageFeature
 from ..providers import get_capabilities
 
 
+# 段守卫用：/ad 前允许的"同段正常前缀"——媒体占位符与 @某人（如私聊"引用图片 + /ad r"）
+_LEADING_NOISE_RE = re.compile(
+    r'^(?:\s*(?:\[image\]|\[图片\]|\[emoji\]|\[表情\]|\[voice\]|\[语音\]|\[file\]|\[文件\]|@[^\s]+)\s*)+',
+    re.IGNORECASE,
+)
+
+
 # ================================================================
 # /ad help — 帮助
 # ================================================================
@@ -441,8 +448,17 @@ async def handle_ad_manual_recall(kwargs: dict) -> tuple:
 _styles_cache: Optional[dict] = None
 
 
+def clear_styles_cache() -> None:
+    """清除提示词预设缓存，供配置热重载调用（否则换了 config.toml 仍读旧缓存）。"""
+    global _styles_cache
+    _styles_cache = None
+
+
 def _load_styles() -> dict:
-    """从 config.toml [styles] 加载提示词预设（缓存）。"""
+    """从 config.toml [styles] 加载提示词预设（缓存），归一成 {名称: 提示词} 字典。
+
+    兼容两种结构：旧扁平字典 {名称: 提示词}，新结构 {"presets": [{name, prompt}]}。
+    """
     global _styles_cache
     if _styles_cache is not None:
         return _styles_cache
@@ -450,7 +466,22 @@ def _load_styles() -> dict:
         import tomllib as _toml
         from pathlib import Path as _Path
         with open(_Path(__file__).parent.parent / "config.toml", "rb") as f:
-            _styles_cache = _toml.load(f).get("styles", {})
+            raw = _toml.load(f).get("styles", {})
+        if isinstance(raw, dict) and "presets" in raw:
+            # 新结构：列表转 {名称: 提示词}
+            result = {}
+            for item in (raw.get("presets") or []):
+                if isinstance(item, dict):
+                    name = str(item.get("name", "") or "").strip()
+                    prompt = item.get("prompt", "")
+                    if name and isinstance(prompt, str):
+                        result[name] = prompt
+            _styles_cache = result
+        elif isinstance(raw, dict):
+            # 旧扁平字典：只保留 str 值
+            _styles_cache = {k: v for k, v in raw.items() if isinstance(v, str)}
+        else:
+            _styles_cache = {}
         return _styles_cache
     except Exception:
         _styles_cache = {}
@@ -501,8 +532,9 @@ async def handle_ad_style(style_name: str, kwargs: dict) -> tuple:
 
     ok, err = _check_plugin_enabled(kwargs)
     if not ok:
-        await plugin.ctx.send.text(err, stream_id)
-        return False, err, 1
+        if err:
+            await plugin.ctx.send.text(err, stream_id)
+        return False, err or "已忽略", 1
 
     model_config = plugin._get_model_config_from_kwargs(
         kwargs,
@@ -564,8 +596,9 @@ async def handle_dr0_ref_draw(mode: str, tags: str, kwargs: dict) -> tuple:
 
     ok, err = _check_plugin_enabled(kwargs)
     if not ok:
-        await plugin.ctx.send.text(err, stream_id)
-        return False, err, 1
+        if err:
+            await plugin.ctx.send.text(err, stream_id)
+        return False, err or "已忽略", 1
 
     # 获取参考图
     from ..core.generator import fetch_ref_image
@@ -626,8 +659,9 @@ async def handle_dr0_draw(description: str, kwargs: dict) -> tuple:
 
     ok, err = _check_plugin_enabled(kwargs)
     if not ok:
-        await plugin.ctx.send.text(err, stream_id)
-        return False, err, 1
+        if err:
+            await plugin.ctx.send.text(err, stream_id)
+        return False, err or "已忽略", 1
 
     plugin.ctx.logger.info("[直接生图] 标签: %s", description)
     model_config = plugin._get_model_config_from_kwargs(kwargs)
@@ -682,8 +716,9 @@ async def handle_ad_ref_draw(mode: str, description: str, kwargs: dict) -> tuple
 
     ok, err = _check_plugin_enabled(kwargs)
     if not ok:
-        await plugin.ctx.send.text(err, stream_id)
-        return False, err, 1
+        if err:
+            await plugin.ctx.send.text(err, stream_id)
+        return False, err or "已忽略", 1
 
     from ..core.generator import fetch_ref_image
     ref_image = await fetch_ref_image(kwargs, stream_id)
@@ -723,8 +758,9 @@ async def handle_ad_draw(description: str, kwargs: dict) -> tuple:
 
     ok, err = _check_plugin_enabled(kwargs)
     if not ok:
-        await plugin.ctx.send.text(err, stream_id)
-        return False, err, 1
+        if err:
+            await plugin.ctx.send.text(err, stream_id)
+        return False, err or "已忽略", 1
 
     plugin.ctx.logger.info("[LLM生图] 收到请求: %s", description[:80])
     plugin._track_task(asyncio.create_task(ad_workflow(description, kwargs, is_action=False)))
@@ -945,9 +981,83 @@ def _filter_nsfw_tags_from_prompt(prompt: str) -> tuple:
     return found
 
 
+def _is_real_ad_command(kwargs: dict) -> bool:
+    """判断 /ad(0) 是否为用户真实指令，而非藏在长文本/引用内容里的误匹配。
+
+    可靠依据：适配器把消息拆成结构化段（reply/at/text 分开）。真实指令的
+    "/ad ..." 是某个 text 段的开头（其前允许有媒体占位符 [image]/[图片] 或 @某人，
+    这些是同段渲染的正常前缀，如私聊"引用图片 + /ad r"）；而引用回放/历史消息里嵌的
+    /ad 前面是实义文字（如"某人说：/ad ..."），才是误触发，应拦截。
+
+    命令正则用 [\\s\\S]* 宽松前缀从任意位置抠 /ad，会把后者误判成指令，
+    故用段结构做权威校验。拿不到结构化段时（老适配器）回退为放行，不误伤。
+    """
+    message = kwargs.get("message", {})
+    if not isinstance(message, dict) or not message:
+        return True  # 无 message 上下文，无法判定，放行（保持旧行为）
+    raw = message.get("raw_message", message.get("message"))
+
+    def _startswith_cmd(text: str) -> bool:
+        # 去掉开头的媒体占位符 / @某人（同段正常前缀），再判断是否以 /ad 开头
+        t = _LEADING_NOISE_RE.sub("", str(text).lstrip())
+        t = t.lstrip()
+        return t.startswith(("/ad ", "/ad0 ", "/ad\t", "/ad0\t")) or t.rstrip() in ("/ad", "/ad0")
+
+    if isinstance(raw, str):
+        return _startswith_cmd(raw)
+    if not isinstance(raw, list) or not raw:
+        return True  # 无结构化段，放行
+    for seg in raw:
+        text = ""
+        if isinstance(seg, dict):
+            if seg.get("type") not in ("text", None):
+                continue
+            data = seg.get("data", "")
+            text = data if isinstance(data, str) else (data.get("text", "") if isinstance(data, dict) else "")
+        elif isinstance(seg, str):
+            text = seg
+        else:
+            continue
+        if _startswith_cmd(text):
+            return True
+    return False
+
+
+def _is_bot_self_message(kwargs: dict) -> bool:
+    """判断触发命令的消息是否为 bot 自己发的。
+
+    bot 自己发的提示文案里可能含 /ad（如"请使用 /ad nsfw off 关闭过滤"），
+    这些不应被当成用户指令。与 _is_real_ad_command 一起构成双重防误触发。
+    """
+    message = kwargs.get("message", {})
+    if not isinstance(message, dict) or not message:
+        return False
+    if message.get("self") is True:
+        return True
+    info = message.get("message_info", {}) or {}
+    user_info = info.get("user_info") or {}
+    sender_id = str(user_info.get("user_id", "") or "")
+    self_id = str(message.get("self_id", "") or "")
+    if sender_id and self_id and sender_id == self_id:
+        return True
+    # 兜底：与已缓存的 bot QQ 号比对（SnowLuma 等会从历史消息剥掉 self_id）
+    try:
+        from ..core.generator import _cached_bot_self_id
+        if _cached_bot_self_id and sender_id and sender_id == str(_cached_bot_self_id):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _check_plugin_enabled(kwargs: dict) -> tuple:
     """检查当前会话插件是否开启。返回 (ok, error_message)。"""
     plugin = get_plugin_instance()
+    # 防误触发（err=None → 调用方静默跳过，不向群里发提示）：
+    # ① /ad 藏在长文本/引用内容里而非段首 → 非真实指令
+    # ② bot 自己发的含 /ad 文案回流
+    if not _is_real_ad_command(kwargs) or _is_bot_self_message(kwargs):
+        return False, None
     info = plugin._extract_session_info(kwargs)
     if not plugin._session_state.is_plugin_enabled(info["platform"], info["chat_id"]):
         return False, "插件已关闭，请使用 /ad on 开启"
