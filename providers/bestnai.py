@@ -317,9 +317,12 @@ class BestNAIProvider(BaseImageProvider):
         extra_params, model="", ref_image="", ref_mode="",
     ) -> Dict[str, Any]:
         """构造 NewAPI 绘图参数。"""
+        # 画师串（含质量词 masterpiece/best quality + 画风/画师标签）拼在最前，
+        # 质量词、画风优先，角色及细节在后；prompt（LLM 译文：角色→外观→服装→
+        # 动作→表情→构图→背景→光线）紧随其后。
         combined_prompt = prompt.strip()
         if artist_prompt:
-            combined_prompt = f"{combined_prompt}, {artist_prompt.strip()}"
+            combined_prompt = f"{artist_prompt.strip()}, {combined_prompt}"
 
         params: Dict[str, Any] = {
             "model": model or "nai-diffusion-4-5-full",
