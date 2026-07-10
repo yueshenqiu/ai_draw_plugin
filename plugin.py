@@ -147,6 +147,20 @@ class ModelItem(PluginConfigBase):
                              json_schema_extra=_ui("尺寸预设", order=14))
     artist_preset: str = Field(default="无", description="引用的风格预设（画师串）名",
                                json_schema_extra=_ui("风格预设名", order=15, placeholder="无"))
+    ref_fidelity: float = Field(
+        default=1.0, description="角色参考保真度 (0~1)。越高越忠实复制参考图一切（含衣服），越低越只抓面部特征",
+        json_schema_extra=_ui(
+            "角色参考保真度", order=16, step=0.05,
+            hint="角色参考 (character) 的 fidelity。1.0=完全复制含衣服；0.5=只参考五官脸型，衣服自由发挥",
+        ),
+    )
+    ref_strength: float = Field(
+        default=1.0, description="角色参考整体强度 (0~1)",
+        json_schema_extra=_ui(
+            "角色参考强度", order=17, step=0.05,
+            hint="角色参考 (character) 的 strength。控制参考图对生成的整体影响力",
+        ),
+    )
 
 
 def _legacy_flat_models_to_entries(data: Any) -> Any:

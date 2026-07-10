@@ -896,8 +896,9 @@ async def ad_workflow(
                     "[自拍参考图] 参考图文件不存在: %s", ref_path
                 )
 
-        # 使用参考图时跳过文字 selfie_prompt_add 合并（图片已定义角色外貌）
-        include_selfie_add = not selfie_ref_used
+        # 固定参考图：合并 selfie_prompt_add 文字外貌（图定义脸，文字补细节）
+        # 手动上传参考图：不合并（用户上传的图已包含完整外貌信息）
+        include_selfie_add = selfie_ref_used or not bool(ref_image)
         generated_prompt = _process_selfie_prompt(generated_prompt, description, include_selfie_add, model_cfg)
 
     if plugin.config.prompt_generator.enforce_tag_order:

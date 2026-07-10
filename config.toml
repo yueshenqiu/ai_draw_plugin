@@ -16,7 +16,7 @@ admin_users = ["123456789"]
 default_admin_mode = false
 
 [prompt_generator]
-model_name = "deepseek-v4-flash"
+model_name = "deepseek-v4-pro"
 api_base = "https://api.deepseek.com"
 api_key = ""
 output_format = "json"
@@ -40,8 +40,9 @@ filter_tags = "{{{{{nsfw}}}}}"
 [prompt_show]
 enabled = false
 hide_selfie_prompt_add = false
-selfie_prompt_add = "1girl, long brown hair"
+selfie_prompt_add = ""
 negative_prompt_add = ""
+
 selfie_ref_image = ""
 
 # 全局风格预设（画师串）；模型里用 artist_preset = "名称" 引用
@@ -52,6 +53,10 @@ prompt = ""
 [[artist_presets.presets]]
 name = "超漂亮好看"
 prompt = "0.7::nekodayo22,::, 0.8::qiandaiyiyu::, 0.85::aiue oka::, 0.9::lunch (shin new)::, 1.1::cola (gotouryouta)::, 1.3::dishwasher1910,::, 1.4::healthyman::, 1.65::freng::, 1.7::quasarcake::, 1.75::kim eb::, 1.8::wanke::"
+[[artist_presets.presets]]
+name = "3d"
+prompt = "1.5::artist:shuffle_(songdatiankong)::, 1.4::artist:nixeu::, 1.3::artist:houkisei::, 0.9::artist:mitsu_(mitsu_art)::,0.7::artist:billyhhyb::, 5::masterpiece, best quality, very aesthetic::, year 2025, location,no text, 1.5::Unreal Engine 5, Octane Render, PBR,hyper photorealistic,hyper realistic skin details, hyper realistic skin texture,skin pores,subsurface scattering::,sharp focus,8k,HDR,-5::2D,anime,flat color::"
+
 
 # 提示词预设（/ad y 命令使用）
 [styles]
@@ -85,13 +90,15 @@ model = "nai-diffusion-4-5-full"
 endpoint = "/v1/chat/completions"
 max_tokens = 100000
 sampler = "k_euler_ancestral"
-steps = 26
+steps = 28
 scale = 5
 cfg = 0.0
 noise_schedule = "karras"
 default_size = "832x1216"
 size_preset = "竖图"
-artist_preset = "无"
+artist_preset = "梦幻柔美2.0"
+ref_fidelity = 0.6
+ref_strength = 0.8
 
 [[models.entries]]
 id = "model2"
@@ -110,6 +117,8 @@ noise_schedule = "karras"
 default_size = "832x1216"
 size_preset = "竖图"
 artist_preset = "无"
+ref_fidelity = 0.6
+ref_strength = 0.8
 
 [[models.entries]]
 id = "model3"
@@ -128,3 +137,5 @@ noise_schedule = "karras"
 default_size = "832x1216"
 size_preset = "竖图"
 artist_preset = "无"
+ref_fidelity = 0.6
+ref_strength = 0.8
