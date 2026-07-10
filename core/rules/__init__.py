@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""提示词规则模板（保留大型模板文件，避免内联到 prompt_engine.py 导致不可维护）。"""
+"""提示词规则模板"""
 
 from .prompt_rules import (
     PROMPT_GENERATOR_TEMPLATE,

@@ -126,6 +126,10 @@ class BestNAIProvider(BaseImageProvider):
                 except (TypeError, ValueError):
                     steps = 23
 
+            # 参考图参数（从模型配置读取，可覆盖硬编码默认值）
+            ref_fidelity = float(model_config.get("ref_fidelity", 1.0))
+            ref_strength = float(model_config.get("ref_strength", 1.0))
+
             # 构建生成参数
             generation_params = self._build_generation_params(
                 prompt=full_prompt,
@@ -142,6 +146,8 @@ class BestNAIProvider(BaseImageProvider):
                 model=model_name,
                 ref_image=ref_image,
                 ref_mode=ref_mode,
+                ref_fidelity=ref_fidelity,
+                ref_strength=ref_strength,
             )
 
             # max_tokens 预算
@@ -315,11 +321,12 @@ class BestNAIProvider(BaseImageProvider):
         self, prompt, artist_prompt, negative_prompt, sampler, steps,
         guidance_scale, cfg_value, noise_schedule, nocache, final_size,
         extra_params, model="", ref_image="", ref_mode="",
+        ref_fidelity: float = 1.0, ref_strength: float = 1.0,
     ) -> Dict[str, Any]:
         """构造 NewAPI 绘图参数。"""
         # 画师串（含质量词 masterpiece/best quality + 画风/画师标签）拼在最前，
-        # 质量词、画风优先，角色及细节在后；prompt（LLM 译文：角色→外观→服装→
-        # 动作→表情→构图→背景→光线）紧随其后。
+        # 符合 NAI 官方"质量词第1、画风第2、角色及细节在后"的提示词顺序；
+        # prompt（LLM 译文：角色→外观→服装→动作→表情→构图→背景→光线）紧随其后。
         combined_prompt = prompt.strip()
         if artist_prompt:
             combined_prompt = f"{artist_prompt.strip()}, {combined_prompt}"
@@ -366,17 +373,28 @@ class BestNAIProvider(BaseImageProvider):
                 self._logger.info(f"{self.log_prefix} (BestNAI) i2i strength=0.5 size={params.get('size')}")
             elif ref_mode == "style":
                 params["controlnet"] = {
-                    "strength": 1.0,
-                    "images": [{"image": image_uri, "info_extracted": 0.7, "strength": 0.6}],
+                    "strength": ref_strength,
+                    "images": [{"image": image_uri, "info_extracted": 0.7, "strength": ref_strength}],
                 }
+                self._logger.info(
+                    f"{self.log_prefix} (BestNAI) style ref: info_extracted=0.7 strength={ref_strength}"
+                )
             elif ref_mode == "character":
                 params["character_references"] = [{
-                    "image": image_uri, "type": "character", "fidelity": 1.0, "strength": 1.0,
+                    "image": image_uri, "type": "character",
+                    "fidelity": ref_fidelity, "strength": ref_strength,
                 }]
+                self._logger.info(
+                    f"{self.log_prefix} (BestNAI) character ref: fidelity={ref_fidelity} strength={ref_strength}"
+                )
             elif ref_mode == "character&style":
                 params["character_references"] = [{
-                    "image": image_uri, "type": "character&style", "fidelity": 1.0, "strength": 1.0,
+                    "image": image_uri, "type": "character&style",
+                    "fidelity": ref_fidelity, "strength": ref_strength,
                 }]
+                self._logger.info(
+                    f"{self.log_prefix} (BestNAI) character&style ref: fidelity={ref_fidelity} strength={ref_strength}"
+                )
 
         return params
 

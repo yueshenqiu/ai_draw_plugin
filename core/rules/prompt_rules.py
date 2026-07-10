@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 提示词生成规则 - 公共模块
-统一 ai_draw_action.py 和 nai_draw_command.py 的提示词生成规则
 基于 NovelAI 4/4.5 最新特性优化
 """
 
@@ -401,7 +400,7 @@ SFW_PROMPT_GENERATOR_JSON_TEMPLATE = f"""
 - format: 仅允许 "single" 或 "multi"
 - intent: 必须显式填写 normal 或 selfie
 - continuity: 必须显式填写 new / keep / adjust / switch
-- global: 场景整体 tag 列表。**必须严格按此顺序排列，不得自由调整**：人数 → 角色名 → 固定外观(发色/发型/瞳色) → 服装 → 动作 → 表情 → 构图/镜头(视角/景别) → 背景/环境 → 光线/氛围。禁止把背景、光线放到前面，禁止把外观放到动作之后
+- global: 场景整体 tag 列表（你可以参考此顺序来排列，同时也可以按你认为的最佳顺序排列）
 - people: 人物 tag 列表的列表（按人物顺序）。single 时可输出空列表 [] 或省略
 
 一致性要求：
@@ -463,7 +462,7 @@ SFW_PROMPT_GENERATOR_JSON_TEMPLATE = f"""
 </output_instruction>
 """.strip()
 
-# ==================== NSFW 模板（原版）====================
+# ==================== NSFW 模板 ====================
 
 PROMPT_RULES_TEXT = """
 <<CUSTOM_SYSTEM_PROMPT>>
@@ -1038,7 +1037,7 @@ PROMPT_GENERATOR_JSON_TEMPLATE = f"""
 - format: 仅允许 "single" 或 "multi"
 - intent: 必须显式填写 normal 或 selfie
 - continuity: 必须显式填写 new / keep / adjust / switch
-- global: 场景整体 tag 列表。**必须严格按此顺序排列，不得自由调整**：人数 → 角色名 → 固定外观(发色/发型/瞳色) → 服装 → 动作 → 表情 → 构图/镜头(视角/景别) → 背景/环境 → 光线/氛围。禁止把背景、光线放到前面，禁止把外观放到动作之后
+- global: 场景整体 tag 列表（你可以参考此顺序来排列，同时也可以按你认为的最佳顺序排列）
 - people: 人物 tag 列表的列表（按人物顺序）。single 时可输出空列表 [] 或省略
 
 一致性要求：
