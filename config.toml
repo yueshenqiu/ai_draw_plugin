@@ -51,11 +51,8 @@ selfie_ref_image = ""
 name = "无"
 prompt = ""
 [[artist_presets.presets]]
-name = "超漂亮好看"
-prompt = "0.7::nekodayo22,::, 0.8::qiandaiyiyu::, 0.85::aiue oka::, 0.9::lunch (shin new)::, 1.1::cola (gotouryouta)::, 1.3::dishwasher1910,::, 1.4::healthyman::, 1.65::freng::, 1.7::quasarcake::, 1.75::kim eb::, 1.8::wanke::"
-[[artist_presets.presets]]
-name = "3d"
-prompt = "1.5::artist:shuffle_(songdatiankong)::, 1.4::artist:nixeu::, 1.3::artist:houkisei::, 0.9::artist:mitsu_(mitsu_art)::,0.7::artist:billyhhyb::, 5::masterpiece, best quality, very aesthetic::, year 2025, location,no text, 1.5::Unreal Engine 5, Octane Render, PBR,hyper photorealistic,hyper realistic skin details, hyper realistic skin texture,skin pores,subsurface scattering::,sharp focus,8k,HDR,-5::2D,anime,flat color::"
+name = "可爱好看"
+prompt = "masterpiece, best quality, very aesthetic, cute, delicate, soft lighting, pastel colors"
 
 
 # 提示词预设（/ad y 命令使用）
