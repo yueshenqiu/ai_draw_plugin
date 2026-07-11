@@ -126,7 +126,6 @@ class BestNAIProvider(BaseImageProvider):
                 except (TypeError, ValueError):
                     steps = 23
 
-            # 参考图参数（从模型配置读取，可覆盖硬编码默认值）
             ref_fidelity = float(model_config.get("ref_fidelity", 1.0))
             ref_strength = float(model_config.get("ref_strength", 1.0))
 
@@ -324,9 +323,6 @@ class BestNAIProvider(BaseImageProvider):
         ref_fidelity: float = 1.0, ref_strength: float = 1.0,
     ) -> Dict[str, Any]:
         """构造 NewAPI 绘图参数。"""
-        # 画师串（含质量词 masterpiece/best quality + 画风/画师标签）拼在最前，
-        # 符合 NAI 官方"质量词第1、画风第2、角色及细节在后"的提示词顺序；
-        # prompt（LLM 译文：角色→外观→服装→动作→表情→构图→背景→光线）紧随其后。
         combined_prompt = prompt.strip()
         if artist_prompt:
             combined_prompt = f"{artist_prompt.strip()}, {combined_prompt}"

@@ -252,15 +252,21 @@ class SessionStateManager:
 
     # ==================== NSFW 过滤 ====================
 
-    def is_nsfw_filter_enabled(self, platform: str, chat_id: str, get_config: Callable) -> bool:
+    def is_nsfw_filter_enabled(self, platform: str, chat_id: str, get_config: Callable,
+                                stream_id: str = "") -> bool:
         key = self._make_key(platform, chat_id)
         if key in self._nsfw_filter:
             return self._nsfw_filter[key]
+        if stream_id and stream_id in self._nsfw_filter:
+            return self._nsfw_filter[stream_id]
         return get_config("nsfw_filter.enabled", False)
 
-    def set_nsfw_filter_enabled(self, platform: str, chat_id: str, enabled: bool):
+    def set_nsfw_filter_enabled(self, platform: str, chat_id: str, enabled: bool,
+                                 stream_id: str = ""):
         key = self._make_key(platform, chat_id)
         self._nsfw_filter[key] = enabled
+        if stream_id:
+            self._nsfw_filter[stream_id] = enabled
         _logger.info(f"[ai_draw] 会话 {key} NSFW过滤已{'开启' if enabled else '关闭'}")
 
     # ==================== 发送方式 ====================

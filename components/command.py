@@ -118,17 +118,20 @@ async def handle_ad_nsfw_control(action: str, kwargs: dict) -> tuple:
     if not action:
         enabled = plugin._session_state.is_nsfw_filter_enabled(
             info["platform"], info["chat_id"], plugin._get_config_callable(),
+            stream_id=stream_id,
         )
         state_text = "开启" if enabled else "关闭"
         await plugin.ctx.send.text(f"NSFW 过滤当前状态：{state_text}", stream_id)
         return True, "已查询状态", 1
 
     if action == "on":
-        plugin._session_state.set_nsfw_filter_enabled(info["platform"], info["chat_id"], True)
+        plugin._session_state.set_nsfw_filter_enabled(info["platform"], info["chat_id"], True,
+                                                       stream_id=stream_id)
         await plugin.ctx.send.text("NSFW 过滤已开启", stream_id)
         return True, "NSFW过滤已开启", 2
     elif action == "off":
-        plugin._session_state.set_nsfw_filter_enabled(info["platform"], info["chat_id"], False)
+        plugin._session_state.set_nsfw_filter_enabled(info["platform"], info["chat_id"], False,
+                                                       stream_id=stream_id)
         await plugin.ctx.send.text("NSFW 过滤已关闭", stream_id)
         return True, "NSFW过滤已关闭", 2
     return False, "用法: /ad nsfw <on|off>", 1
@@ -548,6 +551,7 @@ async def handle_ad_style(style_name: str, kwargs: dict) -> tuple:
     info = plugin._extract_session_info(kwargs)
     if plugin._session_state.is_nsfw_filter_enabled(
         info["platform"], info["chat_id"], plugin._get_config_callable(),
+        stream_id=stream_id,
     ):
         found = _filter_nsfw_tags_from_prompt(style_prompt)
         if found:
@@ -625,6 +629,7 @@ async def handle_dr0_ref_draw(mode: str, tags: str, kwargs: dict) -> tuple:
     info = plugin._extract_session_info(kwargs)
     if plugin._session_state.is_nsfw_filter_enabled(
         info["platform"], info["chat_id"], plugin._get_config_callable(),
+        stream_id=stream_id,
     ):
         found = _filter_nsfw_tags_from_prompt(tags)
         if found:
@@ -673,6 +678,7 @@ async def handle_dr0_draw(description: str, kwargs: dict) -> tuple:
     info = plugin._extract_session_info(kwargs)
     if plugin._session_state.is_nsfw_filter_enabled(
         info["platform"], info["chat_id"], plugin._get_config_callable(),
+        stream_id=stream_id,
     ):
         found = _filter_nsfw_tags_from_prompt(description)
         if found:
@@ -826,6 +832,7 @@ async def ad_workflow(
     info = plugin._extract_session_info(kwargs)
     nsfw_enabled = plugin._session_state.is_nsfw_filter_enabled(
         info["platform"], info["chat_id"], plugin._get_config_callable(),
+        stream_id=stream_id,
     )
 
     # 自拍场景增强：从日程 + LLM 获取 action/environment/expression/lighting
@@ -896,8 +903,6 @@ async def ad_workflow(
                     "[自拍参考图] 参考图文件不存在: %s", ref_path
                 )
 
-        # 固定参考图：合并 selfie_prompt_add 文字外貌（图定义脸，文字补细节）
-        # 手动上传参考图：不合并（用户上传的图已包含完整外貌信息）
         include_selfie_add = selfie_ref_used or not bool(ref_image)
         generated_prompt = _process_selfie_prompt(generated_prompt, description, include_selfie_add, model_cfg)
 
