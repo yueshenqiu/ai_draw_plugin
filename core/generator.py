@@ -250,7 +250,9 @@ def _resolve_send_function(kwargs: dict, group_id: str, user_id: str):
 
     # NSFW 过滤关闭时强制合并转发（更隐蔽）
     if force_forward and chat_id:
-        nsfw_on = plugin._session_state.is_nsfw_filter_enabled(platform, chat_id, get_config)
+        sid = str(kwargs.get("stream_id", "") or "")
+        nsfw_on = plugin._session_state.is_nsfw_filter_enabled(platform, chat_id, get_config,
+                                                                stream_id=sid)
         if not nsfw_on:
             plugin.ctx.logger.info("[发送] NSFW 过滤关闭，强制使用合并转发")
             return send_image_forward

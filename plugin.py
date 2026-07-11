@@ -199,7 +199,18 @@ class ModelsSectionConfig(PluginConfigBase):
         ),
     )
     entries: List[ModelItem] = Field(
-        default_factory=list, description="生图模型列表",
+        default_factory=lambda: [
+            ModelItem(
+                id="model1", name="BestNAI V4.5", format="bestnai",
+                base_url="", api_key="", model="nai-diffusion-4-5-full",
+                endpoint="/v1/chat/completions", max_tokens=100000,
+                sampler="k_euler_ancestral", steps=28, scale=5, cfg=0.0,
+                noise_schedule="karras", default_size="832x1216",
+                size_preset="竖图", artist_preset="梦幻柔美2.0",
+                ref_fidelity=0.6, ref_strength=0.8,
+            ),
+        ],
+        description="生图模型列表",
         json_schema_extra=_ui("生图模型列表", order=1, hint="每个模型含 API、参数、引用的风格预设名；代码按 id 查找"),
     )
 
@@ -217,7 +228,7 @@ class AutoRecallSection(PluginConfigBase):
         json_schema_extra=_ui("启用自动撤回", order=0, hint="发图后延时自动撤回，可用 /ad 指令按会话热切换"),
     )
     delay_seconds: int = Field(
-        default=30, description="撤回延迟时间（秒）",
+        default=50, description="撤回延迟时间（秒）",
         json_schema_extra=_ui("撤回延迟（秒）", order=1, hint="发送成功后等待多少秒再撤回"),
     )
     allowed_groups: List[str] = Field(
@@ -238,7 +249,7 @@ class AdminSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "管理员权限配置"
     __ui_order__: ClassVar[int] = 1
     admin_users: List[str] = Field(
-        default_factory=list, description="管理员用户ID列表",
+        default_factory=lambda: ["123456789"], description="管理员用户ID列表",
         json_schema_extra=_ui(
             "管理员 QQ 号", order=0, placeholder="请输入 QQ 号",
             hint="管理员 QQ 号列表；管理员模式开启时仅这些用户可用生图指令",
@@ -267,8 +278,7 @@ class PromptShowSection(PluginConfigBase):
         json_schema_extra=_ui("隐藏自拍补充提示词", order=1, hint="展示提示词时，隐藏下方的自拍角色特征部分"),
     )
     selfie_prompt_add: str = Field(
-        default="girl,long brown hair with a star-shaped hair accessory, warm brown eyes, blue and white princess dress with a cutout at the midriff, gold trim, purple gem accents, white thigh-high stockings, blue heels",
-        description="自拍模式角色特征提示词（所有模型共享）",
+        default="", description="自拍模式角色特征提示词（所有模型共享）",
         json_schema_extra=_ui(
             "自拍角色特征提示词", order=2, rows=4,
             hint="自拍模式下追加的角色外貌标签，所有模型共享",
@@ -276,8 +286,7 @@ class PromptShowSection(PluginConfigBase):
         ),
     )
     negative_prompt_add: str = Field(
-        default="1::artist collaboration,multiple views,thick outline::,lowres, bad anatomy, bad hands, bad composition, worst quality, jpeg artifacts, signature, watermark, username, blurry, deformed, disfigured, extra limbs, extra fingers, fewer limbs, fewer fingers, missing limbs, missing fingers, malformed limbs, malformed fingers, text, error, ugly, tiling, cropped, poorly drawn face, poorly drawn hands, abstract, chibi, doll, stuffed toy,male,",
-        description="负面提示词（所有模型共享）",
+        default="", description="负面提示词（所有模型共享）",
         json_schema_extra=_ui(
             "全局负面提示词", order=3, rows=5,
             hint="所有模型共享的负面提示词",
@@ -437,7 +446,11 @@ class ArtistPresetsSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "风格预设（画师串）"
     __ui_order__: ClassVar[int] = 6
     presets: List[PresetItem] = Field(
-        default_factory=list, description="风格预设（画师串）列表；模型里用 artist_preset = 名称 引用",
+        default_factory=lambda: [
+            PresetItem(name="无", prompt=""),
+            PresetItem(name="可爱好看", prompt="masterpiece, best quality, very aesthetic, cute, delicate, soft lighting, pastel colors"),
+        ],
+        description="风格预设（画师串）列表；模型里用 artist_preset = 名称 引用",
         json_schema_extra=_ui("风格预设（画师串）", order=0, hint="每条含名称+画师串内容；模型用 artist_preset 引用名称"),
     )
 
@@ -451,7 +464,11 @@ class StylesSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "提示词预设"
     __ui_order__: ClassVar[int] = 7
     presets: List[PresetItem] = Field(
-        default_factory=list, description="提示词预设列表（/ad y 命令使用）",
+        default_factory=lambda: [
+            PresetItem(name="像素风", prompt="pixel art style, 16-bit color palette, blocky pixels, retro game aesthetic, sharp edges, nostalgic vibe"),
+            PresetItem(name="线描", prompt="line art style, single weight lines, no shading, white background, clean contours, vector-like precision"),
+        ],
+        description="提示词预设列表（/ad y 命令使用）",
         json_schema_extra=_ui("提示词预设", order=0, hint="每条含名称+完整提示词；/ad y <名称> 引用"),
     )
 
@@ -468,16 +485,16 @@ class AiDrawPluginConfig(PluginConfigBase):
     model_config = ConfigDict(validate_assignment=True, extra="allow")
 
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
-    models: ModelsSectionConfig = Field(default_factory=ModelsSectionConfig)
     admin: AdminSection = Field(default_factory=AdminSection)
-    auto_recall: AutoRecallSection = Field(default_factory=AutoRecallSection)
-    prompt_show: PromptShowSection = Field(default_factory=PromptShowSection)
-    nsfw_filter: NsfwFilterSection = Field(default_factory=NsfwFilterSection)
     prompt_generator: PromptGeneratorSection = Field(default_factory=PromptGeneratorSection)
+    auto_recall: AutoRecallSection = Field(default_factory=AutoRecallSection)
+    nsfw_filter: NsfwFilterSection = Field(default_factory=NsfwFilterSection)
+    prompt_show: PromptShowSection = Field(default_factory=PromptShowSection)
     artist_presets: ArtistPresetsSection = Field(default_factory=ArtistPresetsSection)
     styles: StylesSection = Field(default_factory=StylesSection)
     random_scene: RandomSceneSection = Field(default_factory=RandomSceneSection)
     custom_prompt: CustomPromptSection = Field(default_factory=CustomPromptSection)
+    models: ModelsSectionConfig = Field(default_factory=ModelsSectionConfig)
 
 
 # ================================================================
@@ -718,8 +735,10 @@ class AiDrawPlugin(MaiBotPlugin):
 
         # NSFW filter
         if info["chat_id"]:
+            stream_id = str(kwargs.get("stream_id", "") or "")
             if self._session_state.is_nsfw_filter_enabled(
                 info["platform"], info["chat_id"], self._get_config_callable(),
+                stream_id=stream_id,
             ):
                 nsfw_tags = self.config.nsfw_filter.filter_tags
                 current_neg = base.get("negative_prompt_add", "")
