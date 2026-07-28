@@ -25,6 +25,7 @@ AI_DRAW_IMAGE_DISPLAY_FALLBACK = "[AI绘图]"
 MODEL_FORMATS = {
     "bestnai": "BestNAI / NovelAI 兼容接口",
     "novelai": "NovelAI 官方接口",
+    "yesnai": "YesNovelAI 原生接口",
     "openai": "OpenAI DALL-E（预留）",
 }
 

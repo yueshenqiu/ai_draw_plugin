@@ -100,7 +100,7 @@ class PluginSectionConfig(PluginConfigBase):
         ),
     )
     config_version: str = Field(
-        default="2.0.0", description="配置版本号",
+        default="2.1.0", description="配置版本号",
         json_schema_extra=_ui("配置版本", order=99, hidden=True, disabled=True),
     )
 
@@ -127,8 +127,10 @@ class ModelItem(PluginConfigBase):
                          json_schema_extra=_ui("API 密钥", order=4, placeholder="sk-...", **{"x-widget": "password"}))
     model: str = Field(default="nai-diffusion-4-5-full", description="底层模型名",
                        json_schema_extra=_ui("底层模型名", order=5, placeholder="nai-diffusion-4-5-full"))
-    endpoint: str = Field(default="/v1/chat/completions", description="接口路径",
-                          json_schema_extra=_ui("接口路径", order=6))
+    endpoint: str = Field(default="", description="接口路径，留空则使用服务商内置默认",
+                          json_schema_extra=_ui("接口路径", order=6,
+                              placeholder="留空则自动选择（例需填时：/v1/chat/completions）",
+                              hint="留空时根据 format 自动走对应服务商的内置路径；如需自定义填入，参考例：/v1/chat/completions"))
     max_tokens: int = Field(default=100000, description="最大 token",
                             json_schema_extra=_ui("最大 token", order=7))
     sampler: str = Field(default="k_euler_ancestral", description="采样器",
@@ -161,6 +163,7 @@ class ModelItem(PluginConfigBase):
             hint="角色参考 (character) 的 strength。控制参考图对生成的整体影响力",
         ),
     )
+
 
 
 def _legacy_flat_models_to_entries(data: Any) -> Any:
@@ -203,7 +206,7 @@ class ModelsSectionConfig(PluginConfigBase):
             ModelItem(
                 id="model1", name="BestNAI V4.5", format="bestnai",
                 base_url="", api_key="", model="nai-diffusion-4-5-full",
-                endpoint="/v1/chat/completions", max_tokens=100000,
+                max_tokens=100000,
                 sampler="k_euler_ancestral", steps=28, scale=5, cfg=0.0,
                 noise_schedule="karras", default_size="832x1216",
                 size_preset="竖图", artist_preset="梦幻柔美2.0",
@@ -745,7 +748,6 @@ class AiDrawPlugin(MaiBotPlugin):
                 base["negative_prompt_add"] = f"{nsfw_tags}, {current_neg}" if current_neg else nsfw_tags
 
         # 统一 key 别名（兼容旧代码同时读取新/旧 key）
-        base.setdefault("nai_endpoint", base.get("endpoint", "/v1/chat/completions"))
         base.setdefault("nai_proxy_mode", base.get("proxy_mode", "auto"))
 
         return base

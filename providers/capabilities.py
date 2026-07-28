@@ -60,7 +60,32 @@ BESTNAI_CAPABILITIES = ProviderCapabilities(
 )
 
 
+YESNAI_CAPABILITIES = ProviderCapabilities(
+    format="yesnai",
+    display_name="YesNovelAI 原生",
+    description="通过 YesNovelAI business-api 原生 NAI 端点调用 NovelAI 图片生成",
+    features={
+        ImageFeature.TEXT2IMG,
+        ImageFeature.IMG2IMG,
+        ImageFeature.CHARACTER_REF,
+        ImageFeature.STYLE_REF,
+        ImageFeature.CHARACTER_STYLE_REF,
+        ImageFeature.ARTIST_PRESETS,
+        ImageFeature.SELFIE_MODE,
+        ImageFeature.NSFW,
+    },
+    max_steps=50,
+    supported_samplers=[
+        "k_euler", "k_euler_ancestral",
+        "k_dpmpp_2s_ancestral", "k_dpmpp_2m", "k_dpmpp_sde",
+        "ddim", "plms",
+    ],
+    supported_sizes=["832x1216", "1216x832", "1024x1024"],
+)
+
+
 PROVIDER_CAPABILITIES = {
     "bestnai": BESTNAI_CAPABILITIES,
     "novelai": BESTNAI_CAPABILITIES,  # 同 BestNAI
+    "yesnai": YESNAI_CAPABILITIES,
 }

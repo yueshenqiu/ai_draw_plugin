@@ -3,7 +3,7 @@
 
 [plugin]
 enabled = true
-config_version = "2.0.0"
+config_version = "2.1.0"
 send_mode = "direct"
 force_forward_when_nsfw_off = true
 use_http_direct = false
@@ -79,12 +79,12 @@ default_model = "model1"
 
 [[models.entries]]
 id = "model1"
-name = "BestNAI V4.5"
-format = "bestnai"
-base_url = ""
+name = "yesNAI V4.5"
+format = "yesnai"
+base_url = "https://nai.rinko.ai"
 api_key = ""
 model = "nai-diffusion-4-5-full"
-endpoint = "/v1/chat/completions"
+endpoint = "/v1/nai/generate-image"
 max_tokens = 100000
 sampler = "k_euler_ancestral"
 steps = 28

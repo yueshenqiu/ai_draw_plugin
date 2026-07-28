@@ -15,6 +15,9 @@ class BaseImageProvider(ABC):
     每个 Provider 对应一种服务商（BestNAI、NovelAI、OpenAI DALL-E 等）。
     """
 
+    # 子类覆写：config 中 endpoint 留空时，走该 Provider 的内置默认路径
+    default_endpoint: str = ""
+
     def __init__(self, logger, log_prefix: str = ""):
         self._logger = logger
         self.log_prefix = log_prefix

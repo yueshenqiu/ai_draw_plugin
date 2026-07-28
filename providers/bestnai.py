@@ -47,6 +47,8 @@ class SSLAdapter(HTTPAdapter):
 class BestNAIProvider(BaseImageProvider):
     """BestNAI 图片生成 Provider（OpenAI Chat Completions 兼容）"""
 
+    default_endpoint = "/v1/chat/completions"
+
     # 匹配中/日/韩文 + 全角符号（NewAPI 仅允许英文）
     _CJK_RE = re.compile(
         r'[一-鿿㐀-䶿＀-＇＊-Ｚ＼＾-ｚ｜～-￯　-〿'
@@ -82,7 +84,9 @@ class BestNAIProvider(BaseImageProvider):
             base_url = (model_config.get("base_url") or "").rstrip('/')
             if base_url.startswith("http://"):
                 self._logger.warning(f"{self.log_prefix} (BestNAI) base_url 为明文 HTTP，API Key 将以明文传输，建议改用 HTTPS")
-            endpoint = model_config.get("endpoint") or model_config.get("nai_endpoint") or "/v1/chat/completions"
+            endpoint = (model_config.get("endpoint") or model_config.get("nai_endpoint") or "").strip()
+            if not endpoint:
+                endpoint = self.default_endpoint
             if not endpoint.startswith('/'):
                 endpoint = f"/{endpoint}"
             url = f"{base_url}{endpoint}"

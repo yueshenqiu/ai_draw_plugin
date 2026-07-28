@@ -12,6 +12,7 @@ from .capabilities import ProviderCapabilities, PROVIDER_CAPABILITIES
 PROVIDER_REGISTRY = {
     "bestnai": (".bestnai", "BestNAIProvider"),
     "novelai": (".bestnai", "BestNAIProvider"),  # 别名，同一实现
+    "yesnai": (".yesnai", "YesNAIProvider"),     # YesNovelAI 原生 NAI 格式
 }
 
 _provider_cache: dict = {}
