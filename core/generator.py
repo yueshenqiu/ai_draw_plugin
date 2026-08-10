@@ -6,19 +6,43 @@
 
 import asyncio
 import base64
+from collections import OrderedDict
+import ipaddress
 import os
 import random
 import re
+import socket
+import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote, urljoin, urlparse, urlunparse
 
 from ..instance import get_plugin_instance
 from ..providers import get_provider_class
-from .image_utils import process_api_response
+from .image_utils import (
+    MAX_IMAGE_BYTES,
+    decode_base64_image,
+    load_image_file_as_base64,
+    normalize_base64_image,
+    process_api_response,
+    validate_image_bytes,
+)
 
 _TEMP_IMAGES_DIR = Path(__file__).resolve().parent.parent / "temp_images"
 _MAX_TEMP_FILES = 10
+
+_TRACKED_MESSAGE_TTL_SECONDS = 7 * 24 * 60 * 60
+_MAX_TRACKED_MESSAGES = 1000
+_tracked_messages: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_tracked_messages_lock = threading.RLock()
+
+_MAX_REFERENCE_REDIRECTS = 4
+_ALLOWED_REMOTE_IMAGE_CONTENT_TYPES = frozenset({
+    "image/png", "image/jpeg", "image/jpg", "image/pjpeg",
+    "image/webp", "image/x-png",
+})
 
 # 缓存 bot 真实 QQ 号和昵称（用于合并转发，避免伪造身份触发风控）
 _cached_bot_self_id: str = ""
@@ -28,12 +52,26 @@ _cached_bot_nickname: str = ""
 def _cleanup_temp_images() -> None:
     """保留最新的 _MAX_TEMP_FILES 个文件，删除多余的旧文件。"""
     try:
-        files = sorted(_TEMP_IMAGES_DIR.iterdir(), key=lambda p: p.stat().st_mtime)
-        while len(files) > _MAX_TEMP_FILES:
-            oldest = files.pop(0)
+        candidates = []
+        for path in _TEMP_IMAGES_DIR.iterdir():
+            try:
+                if (
+                    path.is_file()
+                    and path.name.startswith("ai_fwd_")
+                    and path.suffix.lower() in {".png", ".jpg", ".webp"}
+                ):
+                    candidates.append((path.stat().st_mtime, path))
+            except OSError:
+                continue
+    except OSError:
+        return
+
+    candidates.sort(key=lambda item: item[0])
+    for _, oldest in candidates[:-_MAX_TEMP_FILES]:
+        try:
             oldest.unlink(missing_ok=True)
-    except Exception:
-        pass
+        except OSError:
+            continue
 
 
 def _get_temp_image_path(suffix: str = ".jpg", prefix: str = "ai_fwd_") -> Path:
@@ -52,9 +90,15 @@ def _prepare_image_file(image_base64: str) -> str:
     本地文件路径让同机适配器直接读盘、零传输开销（远快于 base64 内联）；
     不做任何压缩/转码，保持 NAI 原始 PNG 画质。
     """
-    img_bytes = base64.b64decode(image_base64)
-    is_png = img_bytes[:8] == b'\x89PNG\r\n\x1a\n'
-    suffix = ".png" if is_png else ".jpg"
+    decoded = decode_base64_image(image_base64)
+    if decoded is None:
+        raise ValueError("invalid image data")
+    img_bytes, image_format = decoded
+    suffix = {
+        "PNG": ".png",
+        "JPEG": ".jpg",
+        "WEBP": ".webp",
+    }[image_format]
     tmp_path = _get_temp_image_path(suffix=suffix, prefix="ai_fwd_")
     tmp_path.write_bytes(img_bytes)
     return str(tmp_path).replace("\\", "/")
@@ -113,11 +157,11 @@ async def generate_and_send(
     kwargs: dict = None,
     ref_image: str = "",
     ref_mode: str = "",
-) -> None:
+) -> bool:
     """后台任务：生成图片 → 发送结果 → 触发自动撤回。"""
     plugin = get_plugin_instance()
     if not plugin:
-        return
+        return False
 
     try:
         image_size = size or model_config.get("size_preset") or model_config.get("nai_size") or model_config.get("default_size", "1024x1280")
@@ -125,7 +169,7 @@ async def generate_and_send(
 
         if not success:
             await plugin.ctx.send.text(f"生成图片失败：{result}", stream_id)
-            return
+            return False
 
         info = plugin._extract_session_info(kwargs or {})
 
@@ -136,22 +180,67 @@ async def generate_and_send(
                 group_id=info["chat_id"] if info.get("chat_type") == "group" else "",
                 user_id=info["user_id"] if info.get("chat_type") == "private" else "",
             )
-        send_ok, sent_msg_id = await send_image_result(
-            result, prompt_text or prompt, stream_id,
-            group_id=info["chat_id"] if info.get("chat_type") == "group" else "",
-            user_id=info.get("user_id", ""),
-            kwargs=kwargs or {})
+        send_task = asyncio.create_task(
+            send_image_result(
+                result, prompt_text or prompt, stream_id,
+                group_id=(
+                    info["chat_id"]
+                    if info.get("chat_type") == "group"
+                    else ""
+                ),
+                user_id=info.get("user_id", ""),
+                kwargs=kwargs or {},
+            ),
+            name="ai-draw-send-image",
+        )
+        cancelled_during_send = False
+        while True:
+            try:
+                send_ok, sent_msg_id = await asyncio.shield(send_task)
+                break
+            except asyncio.CancelledError:
+                if send_task.cancelled():
+                    raise
+                cancelled_during_send = True
+                if send_task.done():
+                    # 取消与回执在同一轮事件循环相遇时，也必须按取消路径撤回。
+                    send_ok, sent_msg_id = send_task.result()
+                    break
+                # 适配器可能已经接收发送动作。即使卸载流程再次 cancel，仍等待
+                # 真实回执进入账本，避免“取消后图片出现但无法撤回”。
+
         if send_ok:
-            send_ts = int(time.time())
-            schedule_auto_recall(kwargs=kwargs or {}, after_ts=send_ts, message_id=sent_msg_id)
+            if sent_msg_id:
+                if cancelled_during_send:
+                    deleted = await delete_tracked_message(
+                        sent_msg_id, kwargs=kwargs or {},
+                    )
+                    if not deleted:
+                        plugin.ctx.logger.warning(
+                            "[生图] 取消期间图片已发出但立即撤回失败，"
+                            "保留账本供手动撤回"
+                        )
+                else:
+                    send_ts = int(time.time())
+                    schedule_auto_recall(
+                        kwargs=kwargs or {}, after_ts=send_ts,
+                        message_id=sent_msg_id,
+                    )
+            if cancelled_during_send:
+                raise asyncio.CancelledError
+            return True
+        if cancelled_during_send:
+            raise asyncio.CancelledError
+        return False
     except asyncio.CancelledError:
-        pass
+        raise
     except Exception as e:
         plugin.ctx.logger.error(f"[生图] 后台异常: {e}", exc_info=True)
         try:
             await plugin.ctx.send.text(f"图片生成遇到问题: {str(e)[:100]}", stream_id)
         except Exception:
             pass
+        return False
 
 
 async def generate_image(
@@ -213,22 +302,43 @@ async def send_image_result(
     send_fn = _resolve_send_function(kwargs or {}, group_id, user_id)
 
     try:
-        msg_id = None
-        if image_data.startswith(("iVBORw", "/9j/", "UklGR", "R0lGOD")):
+        msg_id: Optional[str] = None
+        if image_data.startswith(("iVBORw", "/9j/", "UklGR")):
             msg_id = await send_fn(image_data, stream_id, group_id, user_id)
         elif image_data.startswith(("http://", "https://")):
-            await plugin.ctx.send.text(f"图片链接: {image_data}", stream_id)
+            downloaded = await _download_image_as_base64(image_data, plugin)
+            if not downloaded:
+                await plugin.ctx.send.text("生成图片链接无法安全下载", stream_id)
+                return False, None
+            msg_id = await send_fn(downloaded, stream_id, group_id, user_id)
         elif image_data.startswith("file://"):
             path = image_data[len("file://"):]
             if Path(path).exists():
-                with open(path, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode("utf-8")
+                b64 = load_image_file_as_base64(path)
+                if not b64:
+                    await plugin.ctx.send.text("图片文件无效或超过大小/像素限制", stream_id)
+                    return False, None
                 msg_id = await send_fn(b64, stream_id, group_id, user_id)
             else:
                 await plugin.ctx.send.text("图片文件不存在", stream_id)
+                return False, None
         else:
             msg_id = await send_fn(image_data, stream_id, group_id, user_id)
-        return True, msg_id
+
+        normalized_msg_id = _normalize_message_id(msg_id)
+        if not normalized_msg_id:
+            plugin.ctx.logger.error("[发送] 图片发送未返回 message_id，不能确认发送成功")
+            await plugin.ctx.send.text("图片已处理完成，但未收到发送成功回执", stream_id)
+            return False, None
+
+        track_sent_message_id(
+            normalized_msg_id,
+            kwargs=kwargs or {},
+            stream_id=stream_id,
+            group_id=group_id,
+            user_id=user_id,
+        )
+        return True, normalized_msg_id
     except Exception as e:
         plugin.ctx.logger.error(f"[发送] 图片发送失败: {e}")
         await plugin.ctx.send.text("图片已处理完成，但发送失败了", stream_id)
@@ -357,16 +467,89 @@ def _normalize_action_response(payload: Optional[dict]) -> Optional[dict]:
     """把适配器/HTTP 的原始 OneBot 响应归一化为 {status,retcode,message_id,data}。"""
     if not isinstance(payload, dict):
         return None
-    status = str(payload.get("status") or "").lower()
-    retcode = payload.get("retcode")
-    if (status and status != "ok") or (isinstance(retcode, int) and retcode not in (0, 1)):
+
+    def _normalized_retcode(value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+            return int(value.strip())
+        raise ValueError("invalid retcode")
+
+    current = payload
+    # MaiBot SDK 会把适配器结果包装为 success/result；有些版本还会嵌套多层。
+    # 每一层都先检查失败信号，避免外层 success=True 掩盖内层 OneBot 失败。
+    for _ in range(6):
+        success = current.get("success")
+        if success is False or (
+            isinstance(success, str)
+            and success.strip().lower() in {"false", "failed", "error", "0"}
+        ) or (
+            isinstance(success, (int, float))
+            and not isinstance(success, bool)
+            and success == 0
+        ):
+            return None
+
+        status = str(current.get("status") or "").strip().lower()
+        if status and status not in {"ok", "success"}:
+            return None
+        try:
+            layer_retcode = _normalized_retcode(current.get("retcode"))
+        except ValueError:
+            return None
+        if layer_retcode is not None and layer_retcode not in (0, 1):
+            return None
+
+        result = current.get("result")
+        looks_wrapped = isinstance(result, dict) and (
+            "success" in current
+            or not any(
+                key in current
+                for key in ("status", "retcode", "data", "message_id", "msg_id")
+            )
+        )
+        if looks_wrapped:
+            current = result
+            continue
+
+        nested_data = current.get("data")
+        looks_data_wrapped = (
+            isinstance(nested_data, dict)
+            and not (current.get("message_id") or current.get("msg_id"))
+            and (
+                "retcode" in nested_data
+                or "success" in nested_data
+                or "result" in nested_data
+                or ("status" in nested_data and "data" in nested_data)
+            )
+        )
+        if looks_data_wrapped:
+            current = nested_data
+            continue
+        break
+    else:
         return None
-    data = payload.get("data")
-    msg_id = str(payload.get("message_id") or "")
+
+    status = str(current.get("status") or "ok").strip().lower() or "ok"
+    try:
+        retcode = _normalized_retcode(current.get("retcode"))
+    except ValueError:
+        return None
+    if status not in {"ok", "success"} or (
+        retcode is not None and retcode not in (0, 1)
+    ):
+        return None
+
+    data = current.get("data")
+    msg_id = str(current.get("message_id") or current.get("msg_id") or "")
     if not msg_id and isinstance(data, dict):
         msg_id = str(data.get("message_id") or data.get("msg_id") or "")
     return {
-        "status": payload.get("status", "ok"),
+        "status": status,
         "retcode": retcode if retcode is not None else 0,
         "message_id": msg_id,
         "data": data,
@@ -380,15 +563,20 @@ async def _napcat_http_call(action: str, params: dict, timeout: int = 60) -> Opt
     慢环境下 HTTP 直连超时预算更长（默认 60s），避免回执超时丢失 message_id。
     """
     import aiohttp
-    from urllib.parse import urlparse
+    from .http_client import build_ssl_context
 
     plugin = get_plugin_instance()
     if not plugin:
         return None
     base_url = str(getattr(plugin.config.plugin, "napcat_http_url", "") or "").strip()
     token = str(getattr(plugin.config.plugin, "napcat_http_token", "") or "").strip()
-    host = (urlparse(base_url).hostname or "").lower()
-    if host not in _LOCAL_HOSTS:
+    try:
+        parsed_base_url = urlparse(base_url)
+        host = (parsed_base_url.hostname or "").lower()
+    except ValueError:
+        plugin.ctx.logger.error("[HTTP直连] NapCat 地址格式无效")
+        return None
+    if parsed_base_url.scheme.lower() not in ("http", "https") or host not in _LOCAL_HOSTS:
         plugin.ctx.logger.error(f"[HTTP直连] 拒绝非本机地址（仅允许本机回环）: host={host or '?'}")
         return None
 
@@ -397,10 +585,23 @@ async def _napcat_http_call(action: str, params: dict, timeout: int = 60) -> Opt
     if token:
         headers["Authorization"] = f"Bearer {token}"
     try:
-        async with aiohttp.ClientSession() as session:
+        allowed_addresses = (
+            ("127.0.0.1", "::1") if host == "localhost" else (_canonical_ip(host) or host,)
+        )
+        connector = aiohttp.TCPConnector(
+            resolver=_PinnedResolver(host, allowed_addresses),
+            use_dns_cache=False,
+            force_close=True,
+            ssl=build_ssl_context(),
+        )
+        async with aiohttp.ClientSession(
+            connector=connector,
+            trust_env=False,
+        ) as session:
             async with session.post(
                 url, json=params, headers=headers,
                 timeout=aiohttp.ClientTimeout(total=timeout),
+                allow_redirects=False,
             ) as resp:
                 if resp.status != 200:
                     plugin.ctx.logger.warning(f"[HTTP直连] {action} HTTP {resp.status}")
@@ -501,12 +702,16 @@ async def _napcat_action(action: str, params: dict) -> Optional[dict]:
                 continue
             plugin.ctx.logger.warning(f"[passthrough] {api_name} 调用失败: {error_text}")
             return None
-        # 命中：缓存该完整 API 名，后续直接命中、不再试错
+        normalized = _normalize_action_response(result)
+        if normalized is None:
+            plugin.ctx.logger.warning(f"[passthrough] {api_name} 返回失败回执")
+            return None
+        # 仅缓存已经通过响应校验的 API，避免把异常包装误记为可用候选。
         if _resolved_action_api.get(action) != api_name:
             _resolved_action_api[action] = api_name
             if index > 0:
                 plugin.ctx.logger.info(f"[passthrough] {action} 解析到 {api_name}（已缓存）")
-        return _normalize_action_response(result)
+        return normalized
 
     plugin.ctx.logger.error(f"[passthrough] 调用 {action} 失败，所有候选 API 均不可用: {last_error}")
     return None
@@ -794,7 +999,7 @@ async def fetch_recent_messages(
 
 
 async def fetch_ref_image(kwargs: dict, stream_id: str = "") -> Optional[str]:
-    """自动获取参考图：当前消息附件 → 引用消息 → NapCat 最近消息。"""
+    """自动获取参考图：当前消息附件 → 引用消息 → 可选的最近消息回退。"""
     plugin = get_plugin_instance()
     if not plugin:
         return None
@@ -812,20 +1017,16 @@ async def fetch_ref_image(kwargs: dict, stream_id: str = "") -> Optional[str]:
     plugin.ctx.logger.debug(f"[参考图] message keys={list(message.keys())}, seg_types={seg_types}")
 
     # 1. 当前消息中直接附带的图片
-    for seg in raw_msg:
-        if isinstance(seg, dict) and seg.get("type") == "image":
-            data = seg.get("data", "")
-            if isinstance(data, dict):
-                data = data.get("file") or data.get("url") or data.get("base64") or ""
-            if data:
-                plugin.ctx.logger.info("[参考图] 从当前消息获取")
-                return str(data)
+    current_image = await _resolve_image_from_sdk_message(message, plugin)
+    if current_image:
+        plugin.ctx.logger.info("[参考图] 从当前消息获取")
+        return current_image
 
     # 2. 引用消息中的图片（多种来源尝试）
     # 2a. message["reply"] 字段（部分 SDK 版本提供）
     reply = message.get("reply")
     if isinstance(reply, dict):
-        img = extract_image_from_message(reply)
+        img = await _resolve_image_from_sdk_message(reply, plugin)
         if img:
             plugin.ctx.logger.info("[参考图] 从 message.reply 获取")
             return img
@@ -852,21 +1053,14 @@ async def fetch_ref_image(kwargs: dict, stream_id: str = "") -> Optional[str]:
         try:
             sdk_result = await plugin.ctx.message.get_by_id(message_id=target_id, include_binary_data=True)
             if isinstance(sdk_result, dict):
-                inner = sdk_result.get("result", sdk_result)
-                if isinstance(inner, dict):
-                    target_msg_data = inner.get("message", inner)
-                    if isinstance(target_msg_data, dict):
-                        img = _extract_image_from_sdk_message(target_msg_data)
-                        if img:
-                            # 可能是 base64（binary_data_base64）或 URL；URL 需下载转 base64
-                            if img.startswith(("http://", "https://")):
-                                downloaded = await _download_image_as_base64(img, plugin)
-                                if downloaded:
-                                    plugin.ctx.logger.info("[参考图] 从 SDK get_by_id 获取引用图片(URL 下载)")
-                                    return downloaded
-                            else:
-                                plugin.ctx.logger.info("[参考图] 从 SDK get_by_id 获取引用图片")
-                                return img
+                target_msg_data = _extract_napcat_msg(sdk_result)
+                if isinstance(target_msg_data, dict):
+                    img = await _resolve_image_from_sdk_message(
+                        target_msg_data, plugin,
+                    )
+                    if img:
+                        plugin.ctx.logger.info("[参考图] 从 SDK get_by_id 获取引用图片")
+                        return img
         except Exception as e:
             plugin.ctx.logger.debug(f"[参考图] SDK get_by_id 失败: {e}")
 
@@ -885,7 +1079,14 @@ async def fetch_ref_image(kwargs: dict, stream_id: str = "") -> Optional[str]:
         except Exception as e:
             plugin.ctx.logger.debug(f"[参考图] NapCat get_msg 失败: {e}")
 
-    # 3. NapCat 最近消息回退
+    # 3. 最近消息回退默认关闭，避免未明确引用时拿到群里其他人的图片。
+    allow_recent_fallback = bool(
+        getattr(plugin.config.plugin, "allow_recent_image_fallback", False)
+    )
+    if not allow_recent_fallback:
+        plugin.ctx.logger.debug("[参考图] 未启用最近消息图片回退")
+        return None
+
     try:
         info = get_session_info_from_kwargs(kwargs)
         messages = await fetch_recent_messages(
@@ -896,39 +1097,10 @@ async def fetch_ref_image(kwargs: dict, stream_id: str = "") -> Optional[str]:
         for msg in reversed(messages or []):
             if not isinstance(msg, dict):
                 continue
-            # NapCat 格式（raw_message/message 字段）
-            segs = msg.get("message", msg.get("raw_message", []))
-            for seg in (segs or []):
-                if isinstance(seg, dict) and seg.get("type") == "image":
-                    data = seg.get("data", "")
-                    if isinstance(data, dict):
-                        file_data = str(data.get("file") or "")
-                        if file_data.startswith("base64://"):
-                            plugin.ctx.logger.info("[参考图] NapCat 历史 base64")
-                            return file_data[len("base64://"):]
-                        if file_data:
-                            resolved = await _resolve_napcat_file_image(file_data, plugin)
-                            if resolved:
-                                return resolved
-                        url = str(data.get("url") or "")
-                        if url:
-                            downloaded = await _download_image_as_base64(url, plugin)
-                            if downloaded:
-                                return downloaded
-                    if isinstance(data, str) and data:
-                        continue  # SnowLuma 将图片替换为文字描述且不缓存二进制，跳过
-                        return data
-            # SDK 格式（SnowLuma 等非 NapCat 适配器），跳过文字描述
-            img = _extract_image_from_sdk_message(msg)
-            if img and not img.startswith("[图"):
-                if img.startswith(("http://", "https://")):
-                    downloaded = await _download_image_as_base64(img, plugin)
-                    if downloaded:
-                        plugin.ctx.logger.info("[参考图] SDK 历史 URL 下载")
-                        return downloaded
-                else:
-                    plugin.ctx.logger.info("[参考图] SDK 历史图片")
-                    return img
+            img = await _resolve_image_from_sdk_message(msg, plugin)
+            if img:
+                plugin.ctx.logger.info("[参考图] 从历史消息获取图片")
+                return img
     except Exception as e:
         plugin.ctx.logger.warning(f"[参考图] NapCat 历史获取失败: {e}")
 
@@ -949,90 +1121,407 @@ def _extract_napcat_msg(result: Any) -> Optional[dict]:
 
 
 async def _resolve_image_from_napcat_msg(msg: dict, plugin) -> Optional[str]:
-    """从 NapCat 格式的消息字典中提取图片，优先转为 base64。"""
-    segs = msg.get("message", msg.get("raw_message", []))
-    if not isinstance(segs, list):
+    """从 NapCat 消息中提取并安全规范化图片。"""
+    return await _resolve_image_from_sdk_message(msg, plugin)
+
+
+async def _resolve_image_candidate(
+    value: Any,
+    plugin,
+    *,
+    allow_napcat_file: bool = False,
+) -> Optional[str]:
+    """把任意图片候选统一解析为经过校验的 base64。"""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        if validate_image_bytes(raw):
+            return base64.b64encode(raw).decode("ascii")
         return None
-    for seg in segs:
-        if not isinstance(seg, dict) or seg.get("type") != "image":
-            continue
-        data = seg.get("data", "")
-        if isinstance(data, dict):
-            file_data = str(data.get("file") or "")
-            if file_data.startswith("base64://"):
-                return file_data[len("base64://"):]
-            # 优先通过 NapCat get_image 获取本地文件并转 base64
-            if file_data:
-                resolved = await _resolve_napcat_file_image(file_data, plugin)
+    if not isinstance(value, str):
+        return None
+
+    candidate = value.strip()
+    if not candidate or candidate.startswith("[图"):
+        return None
+
+    normalized = normalize_base64_image(candidate)
+    if normalized:
+        return normalized
+    if candidate.lower().startswith(("http://", "https://")):
+        return await _download_image_as_base64(candidate, plugin)
+    if allow_napcat_file:
+        return await _resolve_napcat_file_image(candidate, plugin)
+    return None
+
+
+async def _resolve_image_payload(
+    data: Any,
+    plugin,
+    *,
+    allow_napcat_file: bool = True,
+) -> Optional[str]:
+    """解析消息段 data/content，保留 file 失败后的 URL 回退。"""
+    if not isinstance(data, dict):
+        return await _resolve_image_candidate(
+            data, plugin, allow_napcat_file=allow_napcat_file,
+        )
+
+    for key in ("binary_data_base64", "base64"):
+        resolved = await _resolve_image_candidate(data.get(key), plugin)
+        if resolved:
+            return resolved
+
+    file_data = data.get("file")
+    if file_data:
+        resolved = await _resolve_image_candidate(
+            file_data, plugin, allow_napcat_file=allow_napcat_file,
+        )
+        if resolved:
+            return resolved
+
+    for key in ("url", "content"):
+        resolved = await _resolve_image_candidate(data.get(key), plugin)
+        if resolved:
+            return resolved
+    return None
+
+
+async def _resolve_image_segment(
+    segment: dict,
+    plugin,
+    *,
+    allow_napcat_file: bool = True,
+) -> Optional[str]:
+    if not isinstance(segment, dict):
+        return None
+    binary = segment.get("binary_data_base64")
+    if binary:
+        resolved = await _resolve_image_candidate(binary, plugin)
+        if resolved:
+            return resolved
+    resolved = await _resolve_image_payload(
+        segment.get("data", ""),
+        plugin,
+        allow_napcat_file=allow_napcat_file,
+    )
+    if resolved:
+        return resolved
+    return await _resolve_image_payload(
+        segment.get("content", ""),
+        plugin,
+        allow_napcat_file=allow_napcat_file,
+    )
+
+
+async def _resolve_image_from_sdk_message(msg: dict, plugin) -> Optional[str]:
+    """从 SDK/NapCat 的各种消息结构中提取并规范化图片。"""
+    if not isinstance(msg, dict):
+        return None
+
+    if msg.get("type") in ("image", "imageurl", "emoji"):
+        resolved = await _resolve_image_segment(msg, plugin)
+        if resolved:
+            return resolved
+
+    segment = msg.get("message_segment")
+    if isinstance(segment, dict):
+        if segment.get("type") in ("image", "imageurl", "emoji"):
+            resolved = await _resolve_image_segment(segment, plugin)
+            if resolved:
+                return resolved
+        if segment.get("type") == "seglist":
+            for child in segment.get("data", []) or []:
+                if isinstance(child, dict) and child.get("type") in (
+                    "image", "imageurl", "emoji",
+                ):
+                    resolved = await _resolve_image_segment(child, plugin)
+                    if resolved:
+                        return resolved
+
+    raw = msg.get("raw_message", msg.get("message", []))
+    if isinstance(raw, dict):
+        return await _resolve_image_from_sdk_message(raw, plugin)
+    if isinstance(raw, list):
+        for child in raw:
+            if isinstance(child, dict) and child.get("type") in (
+                "image", "imageurl", "emoji",
+            ):
+                resolved = await _resolve_image_segment(child, plugin)
                 if resolved:
                     return resolved
-            # 回退：URL 下载转 base64（QQ 私链需鉴权，外部 API 无法直接访问）
-            url = data.get("url") or ""
-            if url:
-                downloaded = await _download_image_as_base64(str(url), plugin)
-                if downloaded:
-                    return downloaded
-                # 下载失败时不回传裸 URL——外部生图 API 无法读取鉴权私链
-                return None
-        elif isinstance(data, str) and data:
-            return data
     return None
 
 
-def _extract_image_from_sdk_message(msg: dict) -> Optional[str]:
-    """从 SDK 格式的消息字典中提取图片。"""
-    # message_segment 格式
-    seg = msg.get("message_segment")
-    if isinstance(seg, dict):
-        if seg.get("type") in ("image", "imageurl"):
-            content = seg.get("content") or (seg.get("data", {}) or {}).get("content", "")
-            if content:
-                return str(content)
-        if seg.get("type") == "seglist":
-            for child in seg.get("data", []) or []:
-                if isinstance(child, dict) and child.get("type") in ("image", "imageurl"):
-                    content = child.get("content") or (child.get("data", {}) or {}).get("content", "")
-                    if content:
-                        return str(content)
+def _safe_url_for_log(url: str) -> str:
+    """移除查询串、凭据和片段，避免把签名参数写入日志。"""
+    try:
+        parsed = urlparse(str(url or ""))
+        host = parsed.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        port = f":{parsed.port}" if parsed.port else ""
+        return urlunparse((parsed.scheme, f"{host}{port}", "", "", "", ""))
+    except (TypeError, ValueError):
+        return "<invalid-url>"
 
-    # raw_message 格式
-    raw = msg.get("raw_message", msg.get("message", []))
-    if isinstance(raw, list):
-        for s in raw:
-            if isinstance(s, dict) and s.get("type") in ("image", "emoji"):
-                # SnowLuma adapter 存储的原始二进制（include_binary_data=True 时返回）
-                b64 = str(s.get("binary_data_base64") or "")
-                if b64:
-                    return b64
-                data = s.get("data", "")
-                if isinstance(data, dict):
-                    url = data.get("url") or data.get("file") or data.get("base64") or ""
-                    if url:
-                        return str(url)
-                elif isinstance(data, str) and data and not data.startswith("[图"):
-                    return data
-    return None
+
+def _is_public_ip(value: str) -> bool:
+    from .http_client import is_public_ip
+
+    return is_public_ip(value)
+
+
+def _canonical_ip(value: Any) -> Optional[str]:
+    try:
+        address = ipaddress.ip_address(str(value).split("%", 1)[0])
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+            address = address.ipv4_mapped
+        return address.compressed
+    except ValueError:
+        return None
+
+
+class _PinnedResolver:
+    """只把指定主机解析到预检得到的 IP，避免连接阶段再次查询 DNS。"""
+
+    def __init__(self, hostname: str, addresses: Tuple[str, ...]):
+        self._hostname = hostname.rstrip(".").lower()
+        self._addresses = addresses
+
+    async def resolve(
+        self,
+        host: str,
+        port: int = 0,
+        family: int = socket.AF_INET,
+    ) -> List[dict]:
+        if host.rstrip(".").lower() != self._hostname:
+            raise OSError("resolver hostname mismatch")
+        resolved = []
+        for value in self._addresses:
+            address = ipaddress.ip_address(value)
+            address_family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+            if family not in (socket.AF_UNSPEC, address_family):
+                continue
+            resolved.append({
+                "hostname": host,
+                "host": address.compressed,
+                "port": port,
+                "family": address_family,
+                "proto": socket.IPPROTO_TCP,
+                "flags": 0,
+            })
+        if not resolved:
+            raise OSError("no pinned address for requested family")
+        return resolved
+
+    async def close(self) -> None:
+        return None
+
+
+async def _resolve_public_image_url(
+    url: str,
+    plugin,
+) -> Optional[Tuple[str, Tuple[str, ...]]]:
+    """校验 URL 并返回固定的公网 DNS 结果。"""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in ("http", "https"):
+            return None
+        if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+            return None
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    except (TypeError, ValueError):
+        return None
+
+    hostname = parsed.hostname
+    literal = _canonical_ip(hostname)
+    if literal:
+        addresses = {literal}
+    else:
+        try:
+            loop = asyncio.get_running_loop()
+            resolved = await asyncio.wait_for(
+                loop.getaddrinfo(
+                    hostname,
+                    port,
+                    family=socket.AF_UNSPEC,
+                    type=socket.SOCK_STREAM,
+                    proto=socket.IPPROTO_TCP,
+                ),
+                timeout=5,
+            )
+            addresses = {
+                canonical
+                for item in resolved
+                if item and len(item) > 4 and item[4]
+                for canonical in [_canonical_ip(item[4][0])]
+                if canonical
+            }
+        except (asyncio.TimeoutError, OSError, socket.gaierror) as exc:
+            plugin.ctx.logger.warning(
+                f"[参考图] URL DNS 解析失败: {_safe_url_for_log(url)} "
+                f"({type(exc).__name__})"
+            )
+            return None
+
+    if not addresses or any(not _is_public_ip(address) for address in addresses):
+        plugin.ctx.logger.warning(
+            f"[参考图] 拒绝非公网图片地址: {_safe_url_for_log(url)}"
+        )
+        return None
+    return hostname, tuple(sorted(addresses))
+
+
+async def _validate_public_image_url(url: str, plugin) -> bool:
+    """验证 URL 语法和 DNS 解析结果，拒绝本机、内网及保留地址。"""
+    return await _resolve_public_image_url(url, plugin) is not None
+
+
+def _response_peer_is_public(response) -> bool:
+    """复验实际连接的对端 IP；无法取得时严格拒绝。"""
+    from .http_client import response_peer_is_public
+
+    return response_peer_is_public(response)
 
 
 async def _download_image_as_base64(url: str, plugin) -> Optional[str]:
-    """下载图片 URL 并转为 base64 字符串。"""
-    if not url or not url.startswith(("http://", "https://")):
+    """安全下载公网图片并转为 base64，逐跳复验重定向和响应内容。"""
+    if not url or not isinstance(url, str):
         return None
+
     try:
         import aiohttp
-        from .http_client import get_session
-        session = await get_session(30)
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            if resp.status != 200:
-                plugin.ctx.logger.warning(f"[参考图] 下载图片失败 HTTP {resp.status} url={url[:200]}")
+        from .http_client import build_ssl_context, response_peer_matches
+
+        request_timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
+        current_url = url.strip()
+
+        for redirect_count in range(_MAX_REFERENCE_REDIRECTS + 1):
+            resolved_target = await _resolve_public_image_url(current_url, plugin)
+            if resolved_target is None:
                 return None
-            data = await resp.read()
-            if not data:
-                return None
-            return base64.b64encode(data).decode("utf-8")
+            hostname, allowed_addresses = resolved_target
+            connector = aiohttp.TCPConnector(
+                resolver=_PinnedResolver(hostname, allowed_addresses),
+                use_dns_cache=False,
+                force_close=True,
+                ssl=build_ssl_context(),
+            )
+            async with aiohttp.ClientSession(
+                connector=connector,
+                timeout=request_timeout,
+                trust_env=False,
+            ) as session:
+                async with session.get(
+                    current_url,
+                    allow_redirects=False,
+                    headers={"Accept": "image/png,image/jpeg,image/webp"},
+                ) as resp:
+                    if not response_peer_matches(resp, allowed_addresses):
+                        plugin.ctx.logger.warning(
+                            f"[参考图] 实际连接地址与 DNS 预检不一致: "
+                            f"{_safe_url_for_log(current_url)}"
+                        )
+                        return None
+
+                    if resp.status in (301, 302, 303, 307, 308):
+                        if redirect_count >= _MAX_REFERENCE_REDIRECTS:
+                            plugin.ctx.logger.warning("[参考图] 图片重定向次数过多")
+                            return None
+                        location = str(resp.headers.get("Location") or "").strip()
+                        if not location:
+                            return None
+                        current_url = urljoin(current_url, location)
+                        continue
+
+                    if resp.status != 200:
+                        plugin.ctx.logger.warning(
+                            f"[参考图] 下载图片失败 HTTP {resp.status} "
+                            f"url={_safe_url_for_log(current_url)}"
+                        )
+                        return None
+
+                    content_type = str(resp.headers.get("Content-Type") or "")
+                    media_type = content_type.split(";", 1)[0].strip().lower()
+                    if media_type not in _ALLOWED_REMOTE_IMAGE_CONTENT_TYPES:
+                        plugin.ctx.logger.warning(
+                            f"[参考图] 拒绝非图片 Content-Type: "
+                            f"{media_type or '(missing)'}"
+                        )
+                        return None
+
+                    content_length = resp.headers.get("Content-Length")
+                    if content_length:
+                        try:
+                            if int(content_length) > MAX_IMAGE_BYTES:
+                                plugin.ctx.logger.warning("[参考图] 图片响应超过大小限制")
+                                return None
+                        except (TypeError, ValueError):
+                            plugin.ctx.logger.warning("[参考图] 图片 Content-Length 无效")
+                            return None
+
+                    chunks = bytearray()
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        if not chunk:
+                            continue
+                        chunks.extend(chunk)
+                        if len(chunks) > MAX_IMAGE_BYTES:
+                            plugin.ctx.logger.warning("[参考图] 图片下载过程中超过大小限制")
+                            return None
+
+                    image_bytes = bytes(chunks)
+                    if not validate_image_bytes(image_bytes):
+                        plugin.ctx.logger.warning("[参考图] 下载内容不是有效图片或像素数超限")
+                        return None
+                    return base64.b64encode(image_bytes).decode("ascii")
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        plugin.ctx.logger.warning(f"[参考图] 下载图片异常: {e}")
+        plugin.ctx.logger.warning(f"[参考图] 下载图片异常: {type(e).__name__}")
         return None
+
+    return None
+
+
+def _trusted_local_image_path(value: str) -> Optional[Path]:
+    """只接受插件临时目录或系统临时目录中的普通本地文件。"""
+    raw_path = str(value or "").strip()
+    if not raw_path or "\x00" in raw_path:
+        return None
+
+    if raw_path.lower().startswith("file://"):
+        try:
+            parsed = urlparse(raw_path)
+        except ValueError:
+            return None
+        if parsed.scheme.lower() != "file" or parsed.netloc.lower() not in ("", "localhost"):
+            return None
+        raw_path = unquote(parsed.path)
+        if os.name == "nt" and re.match(r"^/[A-Za-z]:/", raw_path):
+            raw_path = raw_path[1:]
+
+    windows_form = raw_path.replace("/", "\\")
+    if windows_form.startswith("\\\\"):
+        return None
+
+    path = Path(raw_path)
+    if not path.is_absolute():
+        return None
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not resolved.is_file():
+        return None
+
+    trusted_roots = (_TEMP_IMAGES_DIR, Path(tempfile.gettempdir()))
+    for root in trusted_roots:
+        try:
+            resolved.relative_to(root.resolve(strict=False))
+            return resolved
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return None
 
 
 async def _resolve_napcat_file_image(file_data: str, plugin) -> Optional[str]:
@@ -1044,35 +1533,56 @@ async def _resolve_napcat_file_image(file_data: str, plugin) -> Optional[str]:
         )
         if not isinstance(img_result, dict):
             return None
-        napcat_resp = img_result.get("result", img_result)
-        if not isinstance(napcat_resp, dict):
-            napcat_resp = img_result
-        inner = napcat_resp.get("data", {})
+        if _normalize_action_response(img_result) is None:
+            return None
+
+        napcat_resp = img_result
+        for _ in range(6):
+            result = napcat_resp.get("result") if isinstance(napcat_resp, dict) else None
+            if not isinstance(result, dict):
+                break
+            napcat_resp = result
+        inner = napcat_resp.get("data", napcat_resp) if isinstance(napcat_resp, dict) else napcat_resp
         if isinstance(inner, dict):
-            file_or_url = str(inner.get("file") or inner.get("url") or "")
+            candidates = [
+                inner.get("binary_data_base64"),
+                inner.get("base64"),
+                inner.get("file"),
+                inner.get("url"),
+            ]
         elif isinstance(inner, str):
-            file_or_url = inner
+            candidates = [inner]
         else:
             return None
-        if file_or_url.startswith("base64://"):
-            plugin.ctx.logger.info("[参考图] get_image base64")
-            return file_or_url[len("base64://"):]
-        if file_or_url and not file_or_url.startswith(("http://", "https://")):
-            img_path = Path(file_or_url)
-            if img_path.exists():
-                plugin.ctx.logger.info(f"[参考图] 本地文件: {file_or_url}")
-                return base64.b64encode(img_path.read_bytes()).decode("utf-8")
-        if file_or_url.startswith(("http://", "https://")):
-            # get_image 返回的 URL 由本体刷新过 rkey，下载转 base64 供生图 API 使用；
-            # 直接回传 URL 会让外部生图 API 拿到不可读图片（鉴权私链）。
-            downloaded = await _download_image_as_base64(file_or_url, plugin)
-            if downloaded:
-                plugin.ctx.logger.info(f"[参考图] get_image URL 下载成功: {file_or_url[:60]}")
-                return downloaded
-            plugin.ctx.logger.warning(f"[参考图] get_image URL 下载失败: {file_or_url[:100]}")
-            return None
+
+        for candidate in candidates:
+            if not isinstance(candidate, str) or not candidate.strip():
+                continue
+            candidate = candidate.strip()
+            normalized = normalize_base64_image(candidate)
+            if normalized:
+                plugin.ctx.logger.info("[参考图] get_image base64")
+                return normalized
+            if candidate.lower().startswith(("http://", "https://")):
+                downloaded = await _download_image_as_base64(candidate, plugin)
+                if downloaded:
+                    plugin.ctx.logger.info(
+                        f"[参考图] get_image URL 下载成功: {_safe_url_for_log(candidate)}"
+                    )
+                    return downloaded
+                continue
+
+            image_path = _trusted_local_image_path(candidate)
+            if image_path is None:
+                plugin.ctx.logger.warning("[参考图] 拒绝不受信任的 get_image 本地路径")
+                continue
+            image_base64 = load_image_file_as_base64(image_path)
+            if image_base64:
+                plugin.ctx.logger.info("[参考图] 已读取受信任的 get_image 本地文件")
+                return image_base64
+            plugin.ctx.logger.warning("[参考图] 本地图片无效或超过大小/像素限制")
     except Exception as e:
-        plugin.ctx.logger.warning(f"[参考图] get_image 失败: {e}")
+        plugin.ctx.logger.warning(f"[参考图] get_image 失败: {type(e).__name__}")
     return None
 
 
@@ -1120,6 +1630,193 @@ def get_session_info_from_kwargs(kwargs: dict) -> dict:
 
 
 # ================================================================
+# 本插件发送消息 ID 追踪（自动/手动撤回的唯一可信来源）
+# ================================================================
+
+def _normalize_message_id(message_id: Any) -> str:
+    normalized = str(message_id or "").strip()
+    return "" if normalized in ("", "0", "None") else normalized
+
+
+def _tracking_context(
+    kwargs: Optional[dict] = None,
+    *,
+    stream_id: str = "",
+    group_id: str = "",
+    user_id: str = "",
+) -> Dict[str, str]:
+    raw_kwargs = kwargs or {}
+    info = get_session_info_from_kwargs(raw_kwargs)
+    platform = str(info.get("platform", "") or "")
+    resolved_stream_id = str(stream_id or raw_kwargs.get("stream_id", "") or "")
+    resolved_group_id = str(group_id or "")
+    resolved_user_id = str(user_id or "")
+    if not resolved_group_id and info.get("chat_type") == "group":
+        resolved_group_id = str(info.get("chat_id", "") or "")
+    if not resolved_user_id:
+        resolved_user_id = str(info.get("user_id", "") or "")
+
+    if resolved_group_id:
+        chat_type = "group"
+        chat_id = resolved_group_id
+    elif resolved_user_id:
+        chat_type = "private"
+        chat_id = resolved_user_id
+    else:
+        chat_type = str(info.get("chat_type", "") or "")
+        chat_id = str(info.get("chat_id", "") or resolved_stream_id)
+
+    if chat_id:
+        session_key = f"{platform}:{chat_type}:{chat_id}"
+    elif resolved_stream_id:
+        session_key = f"stream:{resolved_stream_id}"
+    else:
+        session_key = ""
+    return {
+        "platform": platform,
+        "chat_type": chat_type,
+        "chat_id": chat_id,
+        "group_id": resolved_group_id,
+        "user_id": resolved_user_id,
+        "stream_id": resolved_stream_id,
+        "session_key": session_key,
+    }
+
+
+def _cleanup_tracked_messages(now: Optional[float] = None) -> None:
+    current = time.time() if now is None else now
+    expired = [
+        message_id
+        for message_id, record in _tracked_messages.items()
+        if current - float(record.get("tracked_at", 0) or 0) > _TRACKED_MESSAGE_TTL_SECONDS
+    ]
+    for message_id in expired:
+        _tracked_messages.pop(message_id, None)
+    while len(_tracked_messages) > _MAX_TRACKED_MESSAGES:
+        _tracked_messages.popitem(last=False)
+
+
+def track_sent_message_id(
+    message_id: Any,
+    kwargs: Optional[dict] = None,
+    *,
+    stream_id: str = "",
+    group_id: str = "",
+    user_id: str = "",
+) -> bool:
+    """记录由本插件发送且已取得成功回执的 message_id。"""
+    normalized = _normalize_message_id(message_id)
+    context = _tracking_context(
+        kwargs, stream_id=stream_id, group_id=group_id, user_id=user_id,
+    )
+    if not normalized or not context["session_key"]:
+        return False
+    with _tracked_messages_lock:
+        _cleanup_tracked_messages()
+        _tracked_messages.pop(normalized, None)
+        _tracked_messages[normalized] = {**context, "tracked_at": time.time()}
+        _cleanup_tracked_messages()
+    return True
+
+
+def _tracked_record_matches(record: Dict[str, Any], context: Dict[str, str]) -> bool:
+    if record.get("session_key") == context.get("session_key"):
+        return True
+    if context.get("platform") and record.get("platform") and (
+        context["platform"] != record["platform"]
+    ):
+        return False
+    if context.get("group_id"):
+        return context["group_id"] == record.get("group_id")
+    if context.get("user_id"):
+        return context["user_id"] == record.get("user_id")
+    return bool(
+        context.get("stream_id")
+        and context["stream_id"] == record.get("stream_id")
+    )
+
+
+def get_tracked_message_ids(
+    kwargs: Optional[dict] = None,
+    *,
+    stream_id: str = "",
+    group_id: str = "",
+    user_id: str = "",
+    limit: int = 20,
+) -> List[str]:
+    """返回当前会话内本插件实际发送的消息 ID（新到旧），供手动撤回使用。"""
+    context = _tracking_context(
+        kwargs, stream_id=stream_id, group_id=group_id, user_id=user_id,
+    )
+    if not context["session_key"]:
+        return []
+    try:
+        safe_limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        safe_limit = 20
+    with _tracked_messages_lock:
+        _cleanup_tracked_messages()
+        matched = [
+            message_id
+            for message_id, record in reversed(_tracked_messages.items())
+            if _tracked_record_matches(record, context)
+        ]
+    return matched[:safe_limit] if safe_limit else []
+
+
+def is_tracked_message_id(message_id: Any, *, tracking_key: str = "") -> bool:
+    """检查 ID 是否仍在本插件追踪表中；可选限制为指定会话 key。"""
+    normalized = _normalize_message_id(message_id)
+    if not normalized:
+        return False
+    with _tracked_messages_lock:
+        _cleanup_tracked_messages()
+        record = _tracked_messages.get(normalized)
+        return bool(
+            record and (not tracking_key or record.get("session_key") == tracking_key)
+        )
+
+
+def untrack_message_id(message_id: Any) -> bool:
+    """在撤回成功后移除消息 ID；撤回失败时不应调用，以便稍后重试。"""
+    normalized = _normalize_message_id(message_id)
+    if not normalized:
+        return False
+    with _tracked_messages_lock:
+        return _tracked_messages.pop(normalized, None) is not None
+
+
+async def _delete_tracked_message_for_key(message_id: Any, tracking_key: str) -> bool:
+    normalized = _normalize_message_id(message_id)
+    if not normalized or not tracking_key or not is_tracked_message_id(
+        normalized, tracking_key=tracking_key,
+    ):
+        return False
+    try:
+        try:
+            api_message_id: Any = int(normalized)
+        except ValueError:
+            api_message_id = normalized
+        response = await _napcat_action("delete_msg", {"message_id": api_message_id})
+    except Exception:
+        return False
+    if not response or response.get("retcode") not in (0, 1, None) or (
+        response.get("status") == "failed"
+    ):
+        return False
+    untrack_message_id(normalized)
+    return True
+
+
+async def delete_tracked_message(message_id: Any, kwargs: Optional[dict] = None) -> bool:
+    """精确撤回当前会话账本中的一条图片消息，成功后自动移除追踪记录。"""
+    context = _tracking_context(kwargs or {})
+    if not context["session_key"]:
+        return False
+    return await _delete_tracked_message_for_key(message_id, context["session_key"])
+
+
+# ================================================================
 # 自动撤回
 # ================================================================
 
@@ -1128,8 +1825,8 @@ def schedule_auto_recall(kwargs: dict = None, after_ts: int = 0, message_id: Opt
 
     Args:
         kwargs: 命令 kwargs
-        after_ts: 发送时间戳（Unix 秒），仅在 message_id 不可用时作为回退匹配。
-        message_id: 发送 API 返回的精确 message_id（优先使用，无需匹配）。
+        after_ts: 发送时间戳（为旧调用方保留，不再用于扫描历史消息）。
+        message_id: 发送 API 返回且已由本插件记录的精确 message_id。
     """
     plugin = get_plugin_instance()
     if not plugin:
@@ -1139,6 +1836,20 @@ def schedule_auto_recall(kwargs: dict = None, after_ts: int = 0, message_id: Opt
     info = get_session_info_from_kwargs(kwargs)
     stream_id = str(kwargs.get("stream_id", "") or "")
 
+    normalized_msg_id = _normalize_message_id(message_id)
+    if not normalized_msg_id:
+        plugin.ctx.logger.warning("[自动撤回] 未取得 message_id，跳过调度")
+        return
+
+    allowed_groups = getattr(plugin.config.auto_recall, "allowed_groups", []) or []
+    allowed_keys = {str(item).strip() for item in allowed_groups if str(item).strip()}
+    session_allow_key = f"{info['platform']}:{info['chat_id']}"
+    if allowed_keys and session_allow_key not in allowed_keys:
+        plugin.ctx.logger.info(
+            f"[自动撤回] 当前会话不在 allowed_groups，跳过: {session_allow_key}"
+        )
+        return
+
     if not plugin._session_state.is_recall_enabled(
         info["platform"], info["chat_id"], plugin._get_config_callable(),
     ):
@@ -1146,89 +1857,52 @@ def schedule_auto_recall(kwargs: dict = None, after_ts: int = 0, message_id: Opt
 
     group_id = info["chat_id"] if info["chat_type"] == "group" else ""
     user_id = info["user_id"] if info["chat_type"] == "private" else ""
+    tracking_context = _tracking_context(
+        kwargs, stream_id=stream_id, group_id=group_id, user_id=user_id,
+    )
+    tracking_key = tracking_context["session_key"]
+    if not is_tracked_message_id(normalized_msg_id, tracking_key=tracking_key):
+        plugin.ctx.logger.warning(
+            f"[自动撤回] message_id 未由本插件在当前会话记录，跳过: {normalized_msg_id}"
+        )
+        return
 
     task = asyncio.create_task(auto_recall_task(
         stream_id=stream_id, group_id=group_id, user_id=user_id,
-        after_ts=after_ts, message_id=message_id,
+        after_ts=after_ts, message_id=normalized_msg_id,
+        tracking_key=tracking_key,
     ))
-    plugin._pending_tasks.append(task)
+    plugin._track_task(task)
 
 
 async def auto_recall_task(stream_id: str = "", group_id: str = "", user_id: str = "",
-                         after_ts: int = 0, message_id: Optional[str] = None):
+                         after_ts: int = 0, message_id: Optional[str] = None,
+                         tracking_key: str = ""):
     """延时后撤回本图消息。
 
-    优先使用 message_id 精确撤回（发送 API 返回的 ID）。
-    仅在 message_id 不可用时回退到时间距离匹配。
+    只使用本插件发送成功后记录的精确 message_id；不会扫描历史消息猜测目标。
     """
     plugin = get_plugin_instance()
     if not plugin:
         return
 
     try:
-        delay = plugin.config.auto_recall.delay_seconds
+        delay = max(0, float(plugin.config.auto_recall.delay_seconds))
         jitter = delay * 0.25 * (random.random() * 2 - 1)
-        await asyncio.sleep(delay + jitter)
+        await asyncio.sleep(max(0, delay + jitter))
 
-        # 优先路径：直接用 message_id 撤回
-        if message_id:
-            try:
-                resp = await _napcat_action("delete_msg", {"message_id": int(message_id)})
-                if resp and resp.get("retcode") in (0, 1, None) and resp.get("status") != "failed":
-                    plugin.ctx.logger.info(
-                        f"[自动撤回] 精确撤回成功: message_id={message_id}"
-                    )
-                    return
-                plugin.ctx.logger.warning(
-                    f"[自动撤回] 精确撤回返回异常 (message_id={message_id}): {resp}"
-                )
-            except Exception as e:
-                plugin.ctx.logger.warning(
-                    f"[自动撤回] 精确撤回失败 (message_id={message_id}): {e}，回退时间匹配"
-                )
-
-        # 回退路径：时间距离匹配（message_id 不可用或撤回失败时）
-        messages = await fetch_recent_messages(stream_id, limit=10, group_id=group_id, user_id=user_id)
-        if not messages:
-            plugin.ctx.logger.info(f"[自动撤回] 未获取到消息 stream={stream_id}")
+        normalized_msg_id = _normalize_message_id(message_id)
+        if not normalized_msg_id or not is_tracked_message_id(
+            normalized_msg_id, tracking_key=tracking_key,
+        ):
+            plugin.ctx.logger.info("[自动撤回] 消息已撤回或不再受本插件追踪，跳过")
             return
 
-        candidates = []
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            msg_id = str(msg.get("message_id", "") or "")
-            if not msg_id:
-                continue
-            msg_time = int(msg.get("time", 0) or 0)
-            if after_ts and msg_time > 0 and msg_time < after_ts - 2:
-                continue
-            if is_ai_draw_bot_message(msg):
-                candidates.append((msg_time, msg_id))
-
-        if not candidates:
-            plugin.ctx.logger.info(f"[自动撤回] 未找到匹配消息 (after_ts={after_ts})")
-            return
-
-        has_time = any(c[0] > 0 for c in candidates)
-        if has_time:
-            candidates.sort(key=lambda x: (
-                abs(x[0] - after_ts),
-                0 if x[0] >= after_ts else 1,
-            ))
-
-        target_time, target_id = candidates[0]
-
-        try:
-            resp = await _napcat_action("delete_msg", {"message_id": int(target_id)})
-            if resp and resp.get("retcode") in (0, 1, None) and resp.get("status") != "failed":
-                plugin.ctx.logger.info(
-                    f"[自动撤回] 回退撤回成功: {target_id} (after_ts={after_ts}, msg_time={target_time})"
-                )
-            else:
-                plugin.ctx.logger.error(f"[自动撤回] 撤回 {target_id} 返回异常: {resp}")
-        except Exception as e:
-            plugin.ctx.logger.error(f"[自动撤回] 撤回 {target_id} 失败: {e}")
+        deleted = await _delete_tracked_message_for_key(normalized_msg_id, tracking_key)
+        if deleted:
+            plugin.ctx.logger.info(f"[自动撤回] 精确撤回成功: {normalized_msg_id}")
+        else:
+            plugin.ctx.logger.error(f"[自动撤回] 精确撤回失败: {normalized_msg_id}")
     except asyncio.CancelledError:
         pass
     except Exception as e:

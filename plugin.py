@@ -16,6 +16,8 @@ from pydantic import ConfigDict, field_validator, model_validator
 from .constants.constants import MODEL_MAPPINGS, SIZE_MAPPINGS, BESTNAI_MODEL_IDS
 from .instance import set_plugin_instance, clear_plugin_instance
 from .core.generator import load_models_config
+from .core.image_utils import cleanup_queue_image_spool
+from .core.job_manager import JobManager
 from .core.session_state import session_state
 
 
@@ -99,8 +101,16 @@ class PluginSectionConfig(PluginConfigBase):
             hint="开启后 /ad y 会在提示词预设之上再叠加当前选中的风格预设（画师串）；默认关闭，只用提示词预设本身",
         ),
     )
+    allow_recent_image_fallback: bool = Field(
+        default=False,
+        description="未明确附图或回复图片时，是否允许从最近聊天记录自动寻找参考图",
+        json_schema_extra=_ui(
+            "允许自动寻找最近参考图", order=7,
+            hint="默认关闭，避免误用群内其他人的图片；建议要求用户明确附图或回复图片",
+        ),
+    )
     config_version: str = Field(
-        default="2.1.0", description="配置版本号",
+        default="2.4.0", description="配置版本号",
         json_schema_extra=_ui("配置版本", order=99, hidden=True, disabled=True),
     )
 
@@ -131,15 +141,15 @@ class ModelItem(PluginConfigBase):
                           json_schema_extra=_ui("接口路径", order=6,
                               placeholder="留空则自动选择（例需填时：/v1/chat/completions）",
                               hint="留空时根据 format 自动走对应服务商的内置路径；如需自定义填入，参考例：/v1/chat/completions"))
-    max_tokens: int = Field(default=100000, description="最大 token",
+    max_tokens: int = Field(default=100000, ge=1, le=500000, description="最大 token",
                             json_schema_extra=_ui("最大 token", order=7))
     sampler: str = Field(default="k_euler_ancestral", description="采样器",
                          json_schema_extra=_ui("采样器", order=8))
-    steps: int = Field(default=28, description="步数",
+    steps: int = Field(default=28, ge=1, le=100, description="步数",
                        json_schema_extra=_ui("步数", order=9))
-    scale: float = Field(default=6.0, description="引导强度 scale",
+    scale: float = Field(default=6.0, ge=0.0, le=30.0, description="引导强度 scale",
                          json_schema_extra=_ui("引导强度", order=10, step=0.1))
-    cfg: float = Field(default=0.0, description="cfg_rescale (0~1)",
+    cfg: float = Field(default=0.0, ge=0.0, le=1.0, description="cfg_rescale (0~1)",
                        json_schema_extra=_ui("cfg_rescale", order=11, step=0.1))
     noise_schedule: str = Field(default="karras", description="噪声调度",
                                 json_schema_extra=_ui("噪声调度", order=12))
@@ -150,14 +160,14 @@ class ModelItem(PluginConfigBase):
     artist_preset: str = Field(default="无", description="引用的风格预设（画师串）名",
                                json_schema_extra=_ui("风格预设名", order=15, placeholder="无"))
     ref_fidelity: float = Field(
-        default=1.0, description="角色参考保真度 (0~1)。越高越忠实复制参考图一切（含衣服），越低越只抓面部特征",
+        default=1.0, ge=0.0, le=1.0, description="角色参考保真度 (0~1)。越高越忠实复制参考图一切（含衣服），越低越只抓面部特征",
         json_schema_extra=_ui(
             "角色参考保真度", order=16, step=0.05,
             hint="角色参考 (character) 的 fidelity。1.0=完全复制含衣服；0.5=只参考五官脸型，衣服自由发挥",
         ),
     )
     ref_strength: float = Field(
-        default=1.0, description="角色参考整体强度 (0~1)",
+        default=1.0, ge=0.0, le=1.0, description="角色参考整体强度 (0~1)",
         json_schema_extra=_ui(
             "角色参考强度", order=17, step=0.05,
             hint="角色参考 (character) 的 strength。控制参考图对生成的整体影响力",
@@ -193,7 +203,7 @@ class ModelsSectionConfig(PluginConfigBase):
     # extra="allow"：兜底保留未声明字段
     model_config = ConfigDict(validate_assignment=True, extra="allow")
     __ui_label__: ClassVar[str] = "多模型配置"
-    __ui_order__: ClassVar[int] = 10
+    __ui_order__: ClassVar[int] = 11
     default_model: str = Field(
         default="model1", description="默认使用的模型 ID",
         json_schema_extra=_ui(
@@ -231,7 +241,7 @@ class AutoRecallSection(PluginConfigBase):
         json_schema_extra=_ui("启用自动撤回", order=0, hint="发图后延时自动撤回，可用 /ad 指令按会话热切换"),
     )
     delay_seconds: int = Field(
-        default=50, description="撤回延迟时间（秒）",
+        default=50, ge=1, le=86400, description="撤回延迟时间（秒）",
         json_schema_extra=_ui("撤回延迟（秒）", order=1, hint="发送成功后等待多少秒再撤回"),
     )
     allowed_groups: List[str] = Field(
@@ -252,7 +262,7 @@ class AdminSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "管理员权限配置"
     __ui_order__: ClassVar[int] = 1
     admin_users: List[str] = Field(
-        default_factory=lambda: ["123456789"], description="管理员用户ID列表",
+        default_factory=list, description="管理员用户ID列表",
         json_schema_extra=_ui(
             "管理员 QQ 号", order=0, placeholder="请输入 QQ 号",
             hint="管理员 QQ 号列表；管理员模式开启时仅这些用户可用生图指令",
@@ -300,7 +310,7 @@ class PromptShowSection(PluginConfigBase):
         default="", description="自拍参考图文件名（存放在 selfie_refs/ 目录下），留空则使用文字提示词模式",
         json_schema_extra=_ui(
             "自拍参考图文件名", order=4, placeholder="留空则用文字提示词",
-            hint="存放在 selfie_refs/ 目录下的文件名；留空则使用上方文字提示词模式",
+            hint="存放在 selfie_refs/ 目录下的 PNG/JPEG/WebP 文件名；留空则使用上方文字提示词模式",
         ),
     )
 
@@ -354,11 +364,11 @@ class PromptGeneratorSection(PluginConfigBase):
         json_schema_extra=_ui("自拍场景 LLM 增强", order=6, hint="启用后用本配置的模型增强自拍场景描述"),
     )
     temperature: float = Field(
-        default=0.2, description="LLM温度",
+        default=0.2, ge=0.0, le=2.0, description="LLM温度",
         json_schema_extra=_ui("LLM 温度", order=7, step=0.1, hint="越低越稳定，越高越发散"),
     )
     max_tokens: int = Field(
-        default=4000, description="LLM最大输出token",
+        default=4000, ge=1, le=32000, description="LLM最大输出token",
         json_schema_extra=_ui("最大输出 token", order=8),
     )
     prompt_template: str = Field(
@@ -370,7 +380,7 @@ class PromptGeneratorSection(PluginConfigBase):
         ),
     )
     inherit_ttl: int = Field(
-        default=3600, description="提示词继承有效时间（秒）",
+        default=3600, ge=0, le=2592000, description="提示词继承有效时间（秒）",
         json_schema_extra=_ui("提示词继承有效期（秒）", order=10, hint="上一轮提示词可被继承的有效时间"),
     )
 
@@ -391,18 +401,54 @@ class RandomSceneSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "随机场景生成配置"
     __ui_order__: ClassVar[int] = 8
     temperature: float = Field(
-        default=1.0, description="LLM温度",
+        default=1.0, ge=0.0, le=2.0, description="LLM温度",
         json_schema_extra=_ui("LLM 温度", order=0, step=0.1, hint="随机场景生成温度，越高越多样"),
     )
     max_tokens: int = Field(
-        default=200, description="LLM最大输出token",
+        default=200, ge=1, le=4000, description="LLM最大输出token",
         json_schema_extra=_ui("最大输出 token", order=1),
+    )
+
+
+class QueueSection(PluginConfigBase):
+    __ui_label__: ClassVar[str] = "任务队列"
+    __ui_order__: ClassVar[int] = 9
+
+    enabled: bool = Field(
+        default=True, description="是否启用任务排队与并发管理",
+        json_schema_extra=_ui(
+            "启用任务队列", order=0,
+            hint="关闭后生图任务直接启动，不再提供排队、并发限制和 /ad cancel 管理",
+        ),
+    )
+    max_concurrent: int = Field(
+        default=2, ge=1, le=10, description="全局同时生成的最大任务数",
+        json_schema_extra=_ui("全局并发数", order=1, hint="建议 1-3；过高可能触发 API 限流或重复计费"),
+    )
+    max_concurrent_per_session: int = Field(
+        default=1, ge=1, le=5, description="单个会话同时生成的最大任务数",
+        json_schema_extra=_ui(
+            "单会话并发数", order=2,
+            hint="建议保持 1，确保连续绘图按提交顺序继承上一张上下文",
+        ),
+    )
+    max_queued: int = Field(
+        default=20, ge=0, le=200, description="全局允许排队的最大任务数",
+        json_schema_extra=_ui("最大排队数", order=3, hint="设为 0 时只接受能立即开始的任务"),
+    )
+    per_session_limit: int = Field(
+        default=3, ge=1, le=20, description="单个会话允许排队/运行的最大任务数",
+        json_schema_extra=_ui("单会话任务上限", order=4, hint="防止单个群或用户占满整个队列"),
+    )
+    history_ttl: int = Field(
+        default=300, ge=30, le=86400, description="已完成任务状态保留时间（秒）",
+        json_schema_extra=_ui("任务记录保留时间", order=5),
     )
 
 
 class CustomPromptSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "自定义系统提示词"
-    __ui_order__: ClassVar[int] = 9
+    __ui_order__: ClassVar[int] = 10
     system_prompt: str = Field(
         default="", description="自定义系统提示词",
         json_schema_extra=_ui(
@@ -496,6 +542,7 @@ class AiDrawPluginConfig(PluginConfigBase):
     artist_presets: ArtistPresetsSection = Field(default_factory=ArtistPresetsSection)
     styles: StylesSection = Field(default_factory=StylesSection)
     random_scene: RandomSceneSection = Field(default_factory=RandomSceneSection)
+    queue: QueueSection = Field(default_factory=QueueSection)
     custom_prompt: CustomPromptSection = Field(default_factory=CustomPromptSection)
     models: ModelsSectionConfig = Field(default_factory=ModelsSectionConfig)
 
@@ -517,25 +564,38 @@ class AiDrawPlugin(MaiBotPlugin):
     SIZE_MAPPINGS: ClassVar[dict] = SIZE_MAPPINGS
     BESTNAI_MODEL_IDS: ClassVar[list] = BESTNAI_MODEL_IDS
 
-    # ---- 随机场景跟踪 ----
-    _recent_random_scenes: ClassVar[list] = []
-    _MAX_RECENT_SCENES: ClassVar[int] = 5
-
     # ================================================================
     # Lifecycle
     # ================================================================
 
     async def on_load(self) -> None:
-        from .core.session_state import session_state as ss_mod
+        import importlib
+
+        # 新队列尚未接单，此时残留文件只可能来自上次异常退出。
+        removed_spool_files = cleanup_queue_image_spool(remove_all=True)
+        if removed_spool_files:
+            self.ctx.logger.info(
+                "[任务队列] 已清理 %s 个陈旧参考图临时文件", removed_spool_files
+            )
 
         # 注入 logger
-        for mod in (ss_mod,):
+        for module_name in (".core.session_state", ".core.prompt_engine"):
+            mod = importlib.import_module(module_name, package=__package__)
             if hasattr(mod, "inject_logger"):
                 mod.inject_logger(self.ctx.logger)
 
         self._session_state = session_state
         self._last_structured_prompt_payload: Optional[Dict[str, Any]] = None
         self._pending_tasks: list = []
+        queue_config = self.config.queue
+        self._job_manager = JobManager(
+            max_concurrent=queue_config.max_concurrent,
+            max_concurrent_per_session=queue_config.max_concurrent_per_session,
+            max_queued=queue_config.max_queued,
+            per_session_limit=queue_config.per_session_limit,
+            history_ttl=queue_config.history_ttl,
+            history_limit=max(100, queue_config.max_queued * 4),
+        )
 
         # 清预设缓存，确保加载读的是当前 config.toml（防跨重载残留空缓存）
         self._clear_preset_caches()
@@ -549,14 +609,28 @@ class AiDrawPlugin(MaiBotPlugin):
         set_plugin_instance(self)
 
         self.ctx.logger.info(
-            f"ai_draw_plugin v2 已加载，共 {len(self._loaded_models)} 个模型配置"
+            f"ai_draw_plugin v2.4.0 已加载，共 {len(self._loaded_models)} 个模型配置"
         )
 
     async def on_unload(self) -> None:
-        for task in list(self._pending_tasks):
+        job_manager = getattr(self, "_job_manager", None)
+        if job_manager is not None:
+            await job_manager.shutdown()
+
+        pending_tasks = list(self._pending_tasks)
+        for task in pending_tasks:
             if not task.done():
                 task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
         self._pending_tasks.clear()
+
+        try:
+            from .core.http_client import close_session
+            await close_session()
+        except Exception as exc:
+            self.ctx.logger.warning("[ai_draw] 关闭 HTTP Session 失败: %s", exc)
+
         clear_plugin_instance()
         self.ctx.logger.info("ai_draw_plugin 已卸载")
 
@@ -668,6 +742,17 @@ class AiDrawPlugin(MaiBotPlugin):
         chat_type = "group" if group_id else "private"
         return {"platform": "", "chat_id": chat_id, "user_id": user_id, "chat_type": chat_type}
 
+    def _get_job_session_key(self, kwargs: dict) -> str:
+        """返回队列使用的稳定会话键，避免不同平台或会话互相串任务。"""
+        info = self._extract_session_info(kwargs)
+        platform = info["platform"] or ""
+        if info["chat_id"]:
+            return f"{platform}:{info['chat_type']}:{info['chat_id']}"
+        stream_id = str(kwargs.get("stream_id", "") or "")
+        if stream_id:
+            return f"stream:{stream_id}"
+        return f"{platform}:unknown:{info['user_id'] or 'unknown'}"
+
     # ================================================================
     # Permission
     # ================================================================
@@ -765,9 +850,23 @@ class AiDrawPlugin(MaiBotPlugin):
 
     def _track_task(self, task: asyncio.Task) -> None:
         self._pending_tasks.append(task)
-        task.add_done_callback(
-            lambda t: None if t not in self._pending_tasks else self._pending_tasks.remove(t)
-        )
+
+        def _done(completed: asyncio.Task) -> None:
+            if completed in self._pending_tasks:
+                self._pending_tasks.remove(completed)
+            if completed.cancelled():
+                return
+            try:
+                exc = completed.exception()
+            except Exception:
+                return
+            if exc:
+                self.ctx.logger.error(
+                    "[ai_draw] 后台任务异常: %s", exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+        task.add_done_callback(_done)
 
     # @Tool — LLM 触发生图
     @Tool(
@@ -835,6 +934,25 @@ class AiDrawPlugin(MaiBotPlugin):
         from .components.command import handle_ad_help
         return await handle_ad_help(kwargs.get("stream_id", ""))
 
+    @Command("ad_status", pattern=r"^/ad\s+(?:status|状态)$")
+    async def handle_ad_status(self, **kwargs) -> tuple:
+        from .components.command import handle_ad_status
+        return await handle_ad_status(kwargs)
+
+    @Command(
+        "ad_cancel",
+        pattern=r"^/ad\s+(?:cancel|取消)(?:\s+(?P<job_id>[0-9A-Za-z_-]+|全部))?$",
+    )
+    async def handle_ad_cancel(self, **kwargs) -> tuple:
+        from .components.command import handle_ad_cancel
+        matched = kwargs.get("matched_groups", {})
+        return await handle_ad_cancel((matched.get("job_id") or "").strip(), kwargs)
+
+    @Command("ad_context_reset", pattern=r"^/ad\s+(?:reset|重置上下文)$")
+    async def handle_ad_context_reset(self, **kwargs) -> tuple:
+        from .components.command import handle_ad_context_reset
+        return await handle_ad_context_reset(kwargs)
+
     @Command("ad_switch_model", pattern=r"^/ad\s+(?P<action>w|m)(?:\s+(?P<param>.+))?$")
     async def handle_ad_switch_model(self, **kwargs) -> tuple:
         from .components.command import handle_ad_switch_model
@@ -901,7 +1019,7 @@ class AiDrawPlugin(MaiBotPlugin):
         "ad_draw",
         pattern=(
             r"(?:[\s\S]*，说：\s*)?/ad\s+"
-            r"(?!on$|off$|st$|sp$|pt\s|nsfw\b|send\b|help$|c\s|w\b|m\b|s\b|art\b|y\s|撤回"
+            r"(?!on$|off$|st$|sp$|pt\s|nsfw\b|send\b|help$|status$|状态$|cancel\b|取消(?:\s|$)|reset$|重置上下文$|c\s|w\b|m\b|s\b|art\b|y\s|撤回"
             r"|rh\s|hr\s|r\s|h\s|t\s)"
             r"(?P<description>[\s\S]+)$"
         ),

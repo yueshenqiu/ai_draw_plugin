@@ -3,7 +3,7 @@
 
 [plugin]
 enabled = true
-config_version = "2.1.0"
+config_version = "2.4.0"
 send_mode = "direct"
 force_forward_when_nsfw_off = true
 use_http_direct = false
@@ -12,7 +12,7 @@ napcat_http_token = ""
 y_apply_artist_preset = false
 
 [admin]
-admin_users = ["123456789"]
+admin_users = []
 default_admin_mode = false
 
 [prompt_generator]
@@ -46,27 +46,36 @@ negative_prompt_add = ""
 selfie_ref_image = ""
 
 # 全局风格预设（画师串）；模型里用 artist_preset = "名称" 引用
+
 [artist_presets]
 [[artist_presets.presets]]
 name = "无"
 prompt = ""
+
 [[artist_presets.presets]]
-name = "可爱好看"
-prompt = "masterpiece, best quality, very aesthetic, cute, delicate, soft lighting, pastel colors"
+name = "梦幻柔美3.0"
+prompt = "1.25::artist:ATEOYH::, 0.95::artist:nekoume::, 0.90::artist:fuumi (radial_engine)::, 0.80::artist:aya_shobon::, 0.75::artist:lino_chang::, 0.70::artist:bae.c::, 0.40::artist:num_s1x::, 0.30::artist:nababa::, "
 
+[[artist_presets.presets]]
+name = "本子风格"
+prompt = "artist:kedama milk,artist:satou kuuki,artist:kz oji,artist:croriin,masterpiece,best quality,"
 
-# 提示词预设（/ad y 命令使用）
 [styles]
 [[styles.presets]]
-name = "像素风"
-prompt = "pixel art style, 16-bit color palette, blocky pixels, retro game aesthetic, sharp edges, nostalgic vibe"
-[[styles.presets]]
-name = "线描"
-prompt = "line art style, single weight lines, no shading, white background, clean contours, vector-like precision"
+name = "BGD质感"
+prompt = "BJD texture, top-down shot, delicate skin texture, added blue noise, dark background, natural soft light highlights, 8K ultra HD, cinematic lighting, detail sharpening, transparent texture"
 
 [random_scene]
 temperature = 1.0
 max_tokens = 200
+
+[queue]
+enabled = false
+max_concurrent = 2
+max_concurrent_per_session = 1
+max_queued = 20
+per_session_limit = 3
+history_ttl = 300
 
 [custom_prompt]
 system_prompt = ""
@@ -74,48 +83,49 @@ system_prompt = ""
 # ======================================================================
 # 多模型配置
 # ======================================================================
+
 [models]
-default_model = "model1"
+default_model = "model2"
 
 [[models.entries]]
 id = "model1"
-name = "yesNAI V4.5"
+name = "YesNovelAI V4.5"
 format = "yesnai"
 base_url = "https://nai.rinko.ai"
 api_key = ""
 model = "nai-diffusion-4-5-full"
-endpoint = "/v1/nai/generate-image"
+endpoint = ""
 max_tokens = 100000
 sampler = "k_euler_ancestral"
 steps = 28
-scale = 5
+scale = 5.0
 cfg = 0.0
 noise_schedule = "karras"
 default_size = "832x1216"
 size_preset = "竖图"
-artist_preset = "梦幻柔美2.0"
-ref_fidelity = 0.6
-ref_strength = 0.8
+artist_preset = "梦幻柔美3.0"
+ref_fidelity = 0.7
+ref_strength = 0.9
 
 [[models.entries]]
 id = "model2"
-name = "BestNAI V4.5"
+name = "BestNAI V4.5（高参考）"
 format = "bestnai"
-base_url = ""
+base_url = "https://api.tuercha.com"
 api_key = ""
 model = "nai-diffusion-4-5-full"
 endpoint = "/v1/chat/completions"
 max_tokens = 100000
 sampler = "k_euler_ancestral"
-steps = 28
-scale = 6
-cfg = 0.1
+steps = 25
+scale = 5
+cfg = 0.0
 noise_schedule = "karras"
 default_size = "832x1216"
 size_preset = "竖图"
-artist_preset = "无"
-ref_fidelity = 0.6
-ref_strength = 0.8
+artist_preset = "梦幻柔美3.0"
+ref_fidelity = 0.9
+ref_strength = 1.0
 
 [[models.entries]]
 id = "model3"
@@ -124,12 +134,12 @@ format = "bestnai"
 base_url = ""
 api_key = ""
 model = "nai-diffusion-4-full"
-endpoint = "/v1/chat/completions"
+endpoint = ""
 max_tokens = 100000
 sampler = "k_euler_ancestral"
 steps = 23
-scale = 5
-cfg = 0
+scale = 5.0
+cfg = 0.0
 noise_schedule = "karras"
 default_size = "832x1216"
 size_preset = "竖图"

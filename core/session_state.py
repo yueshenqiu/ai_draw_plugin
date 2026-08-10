@@ -26,6 +26,8 @@ class SessionStateManager:
     """单例模式的会话状态管理器"""
 
     _instance = None
+    _MAX_SESSION_ENTRIES = 1000
+    _MAX_CONTEXT_ENTRIES = 500
 
     def __new__(cls):
         if cls._instance is None:
@@ -45,7 +47,20 @@ class SessionStateManager:
         self._send_mode: Dict[str, str] = {}  # /ad send direct|forward 会话级发送方式
         self._last_draw_context: Dict[str, Tuple[str, str, float]] = {}
         self._last_selfie_context: Dict[str, Tuple[str, str, str, Dict[str, List[str]], float]] = {}
+        self._recent_random_scenes: Dict[str, List[str]] = {}
         self._loaded_models: Dict[str, dict] = {}  # 由 plugin.on_load 注入
+
+    @staticmethod
+    def _trim_oldest(mapping: Dict, limit: int) -> None:
+        """限制纯内存状态规模，避免长时间运行后会话字典无限增长。"""
+        overflow = len(mapping) - max(1, int(limit))
+        if overflow <= 0:
+            return
+        for key in list(mapping.keys())[:overflow]:
+            mapping.pop(key, None)
+
+    def _trim_session_mapping(self, mapping: Dict) -> None:
+        self._trim_oldest(mapping, self._MAX_SESSION_ENTRIES)
 
     def set_loaded_models(self, models: Dict[str, dict]) -> None:
         """注入已加载的模型配置（由 plugin 在 on_load / on_config_update 时调用）。"""
@@ -66,6 +81,7 @@ class SessionStateManager:
     def set_admin_mode(self, platform: str, chat_id: str, enabled: bool):
         key = self._make_key(platform, chat_id)
         self._admin_mode[key] = enabled
+        self._trim_session_mapping(self._admin_mode)
         _logger.info(f"[ai_draw] 会话 {key} 管理员模式已{'开启' if enabled else '关闭'}")
 
     def check_user_permission(self, platform: str, chat_id: str, user_id: str, get_config: Callable) -> bool:
@@ -94,6 +110,7 @@ class SessionStateManager:
     def set_plugin_enabled(self, platform: str, chat_id: str, enabled: bool):
         key = self._make_key(platform, chat_id)
         self._plugin_enabled[key] = enabled
+        self._trim_session_mapping(self._plugin_enabled)
         _logger.info(f"[ai_draw] 会话 {key} 插件已{'开启' if enabled else '关闭'}")
 
     # ==================== 模型选择 ====================
@@ -105,6 +122,7 @@ class SessionStateManager:
     def set_selected_model(self, platform: str, chat_id: str, model: str):
         key = self._make_key(platform, chat_id)
         self._selected_models[key] = model
+        self._trim_session_mapping(self._selected_models)
         _logger.info(f"[ai_draw] 会话 {key} 已切换模型: {model}")
 
     # ==================== 画师串选择（适配新 [models.modelX] 结构）====================
@@ -167,6 +185,7 @@ class SessionStateManager:
     def set_selected_artist_index(self, platform: str, chat_id: str, index: int):
         key = self._make_key(platform, chat_id)
         self._selected_artists[key] = index
+        self._trim_session_mapping(self._selected_artists)
         _logger.info(f"[ai_draw] 会话 {key} 已切换画师串: #{index}")
 
     def get_selected_artist_preset_config(
@@ -235,6 +254,7 @@ class SessionStateManager:
     def set_selected_size(self, platform: str, chat_id: str, size: str):
         key = self._make_key(platform, chat_id)
         self._selected_sizes[key] = size
+        self._trim_session_mapping(self._selected_sizes)
         _logger.info(f"[ai_draw] 会话 {key} 已切换尺寸: {size}")
 
     # ==================== 自动撤回 ====================
@@ -248,6 +268,7 @@ class SessionStateManager:
     def set_recall_enabled(self, platform: str, chat_id: str, enabled: bool):
         key = self._make_key(platform, chat_id)
         self._recall_enabled[key] = enabled
+        self._trim_session_mapping(self._recall_enabled)
         _logger.info(f"[ai_draw] 会话 {key} 自动撤回已{'开启' if enabled else '关闭'}")
 
     # ==================== NSFW 过滤 ====================
@@ -267,6 +288,7 @@ class SessionStateManager:
         self._nsfw_filter[key] = enabled
         if stream_id:
             self._nsfw_filter[stream_id] = enabled
+        self._trim_session_mapping(self._nsfw_filter)
         _logger.info(f"[ai_draw] 会话 {key} NSFW过滤已{'开启' if enabled else '关闭'}")
 
     # ==================== 发送方式 ====================
@@ -281,6 +303,7 @@ class SessionStateManager:
     def set_send_mode(self, platform: str, chat_id: str, mode: str):
         key = self._make_key(platform, chat_id)
         self._send_mode[key] = mode
+        self._trim_session_mapping(self._send_mode)
         _logger.info(f"[ai_draw] 会话 {key} 发送方式已设为 {mode}")
 
     # ==================== 提示词显示 ====================
@@ -297,6 +320,7 @@ class SessionStateManager:
     def set_prompt_show_enabled(self, platform: str, chat_id: str, enabled: bool):
         key = self._make_key(platform, chat_id)
         self._prompt_show[key] = enabled
+        self._trim_session_mapping(self._prompt_show)
         _logger.info(f"[ai_draw] 会话 {key} 提示词显示已{'开启' if enabled else '关闭'}")
 
     # ==================== 调试/管理 ====================
@@ -312,12 +336,15 @@ class SessionStateManager:
             "recall": self._recall_enabled.get(key),
             "nsfw_filter": self._nsfw_filter.get(key),
             "prompt_show": self._prompt_show.get(key),
+            "plugin_enabled": self._plugin_enabled.get(key),
+            "send_mode": self._send_mode.get(key),
         }
 
     def clear_session_state(self, platform: str, chat_id: str):
         key = self._make_key(platform, chat_id)
-        for d in (self._admin_mode, self._selected_models, self._selected_artists,
-                  self._selected_sizes, self._recall_enabled, self._nsfw_filter, self._prompt_show):
+        for d in (self._plugin_enabled, self._admin_mode, self._selected_models,
+                  self._selected_artists, self._selected_sizes, self._recall_enabled,
+                  self._nsfw_filter, self._prompt_show, self._send_mode):
             d.pop(key, None)
         _logger.info(f"[ai_draw] 会话 {key} 状态已清除")
 
@@ -339,6 +366,7 @@ class SessionStateManager:
         if not chat_stream_id or not isinstance(prompt, str) or not prompt.strip():
             return
         self._last_draw_context[chat_stream_id] = (prompt.strip(), (request or "").strip(), time.time())
+        self._trim_oldest(self._last_draw_context, self._MAX_CONTEXT_ENTRIES)
 
     def get_last_draw_prompt(self, chat_stream_id: str) -> Optional[str]:
         prompt, _ = self.get_last_draw_context(chat_stream_id)
@@ -378,6 +406,33 @@ class SessionStateManager:
             prompt_text, (request or "").strip(), scene_text,
             normalized_anchor, time.time(),
         )
+        self._trim_oldest(self._last_selfie_context, self._MAX_CONTEXT_ENTRIES)
+
+    def clear_draw_context(self, chat_stream_id: str) -> bool:
+        """清除连续绘图上下文。返回是否确实删除了内容。"""
+        if not chat_stream_id:
+            return False
+        removed = False
+        for mapping in (self._last_draw_context, self._last_selfie_context):
+            if mapping.pop(chat_stream_id, None) is not None:
+                removed = True
+        return removed
+
+    def get_recent_random_scenes(self, chat_stream_id: str) -> List[str]:
+        if not chat_stream_id:
+            return []
+        return list(self._recent_random_scenes.get(chat_stream_id, []))
+
+    def add_recent_random_scene(self, chat_stream_id: str, scene: str, limit: int = 5) -> None:
+        if not chat_stream_id or not scene or not scene.strip():
+            return
+        scenes = self._recent_random_scenes.setdefault(chat_stream_id, [])
+        normalized = scene.strip()
+        if normalized in scenes:
+            scenes.remove(normalized)
+        scenes.append(normalized)
+        del scenes[:-max(1, int(limit))]
+        self._trim_oldest(self._recent_random_scenes, self._MAX_CONTEXT_ENTRIES)
 
 
 def _normalize_artist_presets(presets) -> List[Dict]:

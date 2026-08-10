@@ -4,6 +4,9 @@
 from ..instance import get_plugin_instance, is_plugin_ready
 from .command import (
     handle_ad_help,
+    handle_ad_status,
+    handle_ad_cancel,
+    handle_ad_context_reset,
     handle_ad_plugin_toggle,
     handle_ad_recall_control,
     handle_ad_nsfw_control,
@@ -27,6 +30,9 @@ __all__ = [
     "get_plugin_instance",
     "is_plugin_ready",
     "handle_ad_help",
+    "handle_ad_status",
+    "handle_ad_cancel",
+    "handle_ad_context_reset",
     "handle_ad_plugin_toggle",
     "handle_ad_recall_control",
     "handle_ad_nsfw_control",

@@ -6,20 +6,37 @@
 """
 
 import asyncio
-import base64
+import json
+import math
 import re
-import time
+import ssl
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlsplit
 
 import aiohttp
+import certifi
 
-from .base import BaseImageProvider
+from .base import BaseImageProvider, ResponseLimitError
+from .capabilities import YESNAI_CAPABILITIES
 
 
 class YesNAIProvider(BaseImageProvider):
     """YesNovelAI 图片生成 Provider（NAI 原生格式）"""
 
     default_endpoint = "/v1/nai/generate-image"
+
+    _RESERVED_EXTRA_PARAMS = {
+        "model", "action", "input", "prompt", "parameters", "size",
+        "width", "height", "steps", "num_inference_steps", "n_samples",
+        "negative_prompt", "sampler", "scale", "guidance_scale", "cfg",
+        "cfg_rescale", "seed", "noise_schedule", "nocache", "image",
+        "images", "img2img", "strength", "noise", "reference_image",
+        "reference_images", "reference_image_multiple",
+        "reference_strength_multiple", "reference_information_extracted_multiple",
+        "director_reference_images", "director_reference_strength_values",
+        "director_reference_secondary_strength_values", "ref_image", "ref_mode",
+        "ref_strength", "ref_fidelity",
+    }
 
     # 匹配中/日/韩文 + 全角符号（NewAPI 仅允许英文，YesNovelAI 原生 NAI 同样要求英文 tag）
     _CJK_RE = re.compile(
@@ -85,12 +102,22 @@ class YesNAIProvider(BaseImageProvider):
             negative_prompt = model_config.get("negative_prompt_add", "")
 
             # ── 读取生成参数 ──
-            sampler = model_config.get("sampler", "k_euler_ancestral")
-            steps = model_config.get("steps") or model_config.get("num_inference_steps") or 28
-            scale = model_config.get("scale") or model_config.get("guidance_scale") or 5.0
-            cfg_value = model_config.get("cfg") or model_config.get("nai_cfg")
+            sampler = model_config.get("sampler")
+            if sampler is None or sampler == "":
+                sampler = "k_euler_ancestral"
+            steps = model_config.get("steps")
+            if steps is None or steps == "":
+                steps = model_config.get("num_inference_steps")
+            scale = model_config.get("scale")
+            if scale is None or scale == "":
+                scale = model_config.get("guidance_scale")
+            cfg_value = model_config.get("cfg")
+            if cfg_value is None or cfg_value == "":
+                cfg_value = model_config.get("nai_cfg")
             noise_schedule = model_config.get("noise_schedule") or model_config.get("nai_noise_schedule") or "karras"
-            nocache = model_config.get("nocache") or model_config.get("nai_nocache")
+            nocache = model_config.get("nocache")
+            if nocache is None:
+                nocache = model_config.get("nai_nocache")
             extra_params = (
                 model_config.get("extra_params")
                 or model_config.get("nai_extra_params")
@@ -109,21 +136,67 @@ class YesNAIProvider(BaseImageProvider):
                 or model_config.get("nai_size")
             )
             final_size = size or size_override or model_config.get("default_size", "832x1216")
-            width, height = self._resolve_size(final_size)
+            resolved_size = self._parse_size(final_size)
+            if resolved_size is None:
+                return False, f"无效的图片尺寸: {str(final_size)[:50]}"
+            width, height = resolved_size
+            self.validate_dimensions(width, height, YESNAI_CAPABILITIES)
+            try:
+                sampler = self.validate_sampler(sampler, YESNAI_CAPABILITIES)
+            except ValueError as exc:
+                return False, str(exc)
 
             # ── 安全清理 CJK 字符 ──
             full_prompt = self._sanitize_prompt(full_prompt)
             negative_prompt = self._sanitize_prompt(negative_prompt)
 
-            # ── 限制 steps ──
-            try:
-                steps = min(int(steps), 50)
-            except (TypeError, ValueError):
-                steps = 28
+            steps = self.bounded_int(
+                steps,
+                default=28,
+                minimum=YESNAI_CAPABILITIES.min_steps,
+                maximum=YESNAI_CAPABILITIES.max_steps,
+                name="steps",
+            )
+            scale = self.bounded_float(
+                scale,
+                default=5.0,
+                minimum=YESNAI_CAPABILITIES.min_scale,
+                maximum=YESNAI_CAPABILITIES.max_scale,
+                name="scale",
+            )
+            cfg_value = self.bounded_float(
+                cfg_value,
+                default=None,
+                minimum=YESNAI_CAPABILITIES.min_cfg_rescale,
+                maximum=YESNAI_CAPABILITIES.max_cfg_rescale,
+                name="cfg_rescale",
+            )
 
             # ── 参考图参数 ──
-            ref_fidelity = float(model_config.get("ref_fidelity", 0.5))
-            ref_strength = float(model_config.get("ref_strength", 1.0))
+            ref_fidelity = self.bounded_float(
+                model_config.get("ref_fidelity", 0.5),
+                default=0.5,
+                minimum=YESNAI_CAPABILITIES.min_reference_strength,
+                maximum=YESNAI_CAPABILITIES.max_reference_strength,
+                name="ref_fidelity",
+            )
+            ref_strength = self.bounded_float(
+                model_config.get("ref_strength", 1.0),
+                default=1.0,
+                minimum=YESNAI_CAPABILITIES.min_reference_strength,
+                maximum=YESNAI_CAPABILITIES.max_reference_strength,
+                name="ref_strength",
+            )
+
+            if ref_image and ref_mode:
+                valid, normalized_ref, _ = self.normalize_and_validate_base64_image(
+                    ref_image,
+                    capabilities=YESNAI_CAPABILITIES,
+                    field_name="参考图",
+                )
+                if not valid:
+                    return False, normalized_ref
+                ref_image = normalized_ref
 
             action, ref_extra = self._build_ref_params(
                 ref_image=ref_image,
@@ -139,27 +212,35 @@ class YesNAIProvider(BaseImageProvider):
                 "steps": steps,
                 "n_samples": 1,
                 "sampler": sampler,
-                "scale": float(scale),
+                "scale": scale,
                 "negative_prompt": negative_prompt or "",
             }
 
-            if seed is not None and int(seed) >= 0:
-                parameters["seed"] = int(seed)
+            seed = self.bounded_int(
+                seed,
+                default=-1,
+                minimum=-1,
+                maximum=4_294_967_295,
+                name="seed",
+            )
+            if seed >= 0:
+                parameters["seed"] = seed
 
             if noise_schedule:
                 parameters["noise_schedule"] = str(noise_schedule)
 
-            if isinstance(cfg_value, (int, float)) and 0 <= float(cfg_value) <= 1:
-                parameters["cfg_rescale"] = float(cfg_value)
+            if cfg_value is not None:
+                parameters["cfg_rescale"] = cfg_value
 
             if nocache is not None:
                 parameters["nocache"] = bool(nocache)
 
-            # 合并 extra_params 和 ref_extra
-            if isinstance(extra_params, dict):
-                for k, v in extra_params.items():
-                    if v not in (None, ""):
-                        parameters[k] = v
+            # 扩展参数不能覆盖已验证的核心字段或参考图字段。
+            parameters.update(self.filter_extra_params(
+                extra_params,
+                self._RESERVED_EXTRA_PARAMS,
+                "YesNAI",
+            ))
             if ref_extra:
                 parameters.update(ref_extra)
 
@@ -183,20 +264,54 @@ class YesNAIProvider(BaseImageProvider):
             )
 
             # ── 发送请求 ──
-            timeout_seconds = float(model_config.get("timeout_seconds", 120))
-            proxy = (model_config.get("proxy") or "").strip() or None
+            timeout_seconds = self.bounded_float(
+                model_config.get("timeout_seconds"),
+                default=120.0,
+                minimum=1.0,
+                maximum=600.0,
+                name="timeout_seconds",
+            )
+            proxy_value = model_config.get("proxy")
+            if proxy_value is not None and not isinstance(proxy_value, str):
+                return False, "代理地址必须是字符串"
+            proxy = (proxy_value or "").strip() or None
+            if proxy:
+                try:
+                    parsed_proxy = urlsplit(proxy)
+                    proxy_hostname = parsed_proxy.hostname
+                except ValueError:
+                    return False, "代理地址必须是有效的 HTTP(S) URL"
+                if parsed_proxy.scheme.lower() not in {"http", "https"} or not proxy_hostname:
+                    return False, "代理地址必须是有效的 HTTP(S) URL"
 
             try:
+                ssl_context = ssl.create_default_context(cafile=certifi.where())
+                connector = aiohttp.TCPConnector(ssl=ssl_context)
                 async with aiohttp.ClientSession(
                     timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+                    trust_env=False,
+                    connector=connector,
                 ) as session:
                     async with session.post(
                         url,
                         headers=headers,
                         json=body,
                         proxy=proxy,
+                        allow_redirects=False,
                     ) as response:
-                        text = await response.text()
+                        raw_response = await self._read_limited_response(
+                            response,
+                            YESNAI_CAPABILITIES.max_response_bytes,
+                        )
+                        text = raw_response.decode("utf-8-sig", errors="replace")
+
+                        if 300 <= response.status < 400:
+                            location = response.headers.get("location", "")
+                            self._logger.error(
+                                f"{self.log_prefix} (YesNAI) 拒绝重定向: "
+                                f"status={response.status}, location={location[:200]}"
+                            )
+                            return False, f"HTTP {response.status}: 接口发生重定向，请检查 base_url"
 
                         if response.status < 200 or response.status >= 300:
                             detail = text[:500]
@@ -210,13 +325,11 @@ class YesNAIProvider(BaseImageProvider):
                             return False, f"HTTP {response.status}: {detail[:200]}"
 
                         try:
-                            data = await response.json(content_type=None)
-                        except Exception:
-                            import json
-                            try:
-                                data = json.loads(text)
-                            except Exception:
-                                return False, "API 返回非 JSON 数据"
+                            data = json.loads(text)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            return False, "API 返回非 JSON 数据"
+            except ResponseLimitError as exc:
+                return False, str(exc)
             except (asyncio.TimeoutError, TimeoutError):
                 return False, f"请求超时 ({timeout_seconds}s)"
             except aiohttp.ClientError as exc:
@@ -231,6 +344,26 @@ class YesNAIProvider(BaseImageProvider):
         except Exception as e:
             self._logger.error(f"{self.log_prefix} (YesNAI) 未知异常: {e!r}", exc_info=True)
             return False, f"YesNAI 接口请求失败: {str(e)[:100]}"
+
+    @staticmethod
+    async def _read_limited_response(
+        response: aiohttp.ClientResponse,
+        max_bytes: int,
+    ) -> bytes:
+        """流式读取 aiohttp 响应，并限制解压后的实际响应大小。"""
+        if response.content_length is not None and response.content_length > max_bytes:
+            raise ResponseLimitError(
+                f"API 响应超过 {max_bytes // (1024 * 1024)} MiB 限制"
+            )
+
+        content = bytearray()
+        async for chunk in response.content.iter_chunked(64 * 1024):
+            content.extend(chunk)
+            if len(content) > max_bytes:
+                raise ResponseLimitError(
+                    f"API 响应超过 {max_bytes // (1024 * 1024)} MiB 限制"
+                )
+        return bytes(content)
 
     # ================================================================
     # 参考图参数构建
@@ -325,22 +458,18 @@ class YesNAIProvider(BaseImageProvider):
         if not isinstance(first_image, str):
             return False, "图片字段类型错误"
 
-        # 剥离 data URI 前缀，拿到纯 base64
-        b64 = self._strip_data_uri(first_image)
-
-        # 验证图片签名（PNG 或 JPEG）
-        try:
-            raw = base64.b64decode(b64)
-        except Exception:
-            return False, "图片 base64 解码失败"
-
-        if not (raw.startswith(b"\x89PNG") or raw[:3] == b"\xff\xd8\xff"):
-            return False, "图片不是有效 PNG/JPEG 格式"
+        valid, normalized_image, image_size = self.normalize_and_validate_base64_image(
+            first_image,
+            capabilities=YESNAI_CAPABILITIES,
+            field_name="生成图片",
+        )
+        if not valid:
+            return False, normalized_image
 
         self._logger.info(
-            f"{self.log_prefix} (YesNAI) 图片生成成功，大小 {len(raw)} bytes"
+            f"{self.log_prefix} (YesNAI) 图片生成成功，大小 {image_size} bytes"
         )
-        return True, b64
+        return True, normalized_image
 
     # ================================================================
     # 工具方法
@@ -359,7 +488,7 @@ class YesNAIProvider(BaseImageProvider):
         return image
 
     @staticmethod
-    def _resolve_size(size: Optional[str]) -> Tuple[int, int]:
+    def _parse_size(size: Optional[str]) -> Optional[Tuple[int, int]]:
         """解析尺寸字符串为 (width, height)。
 
         支持: "832x1216", "竖图", "v", "1024x1024" 等。
@@ -369,11 +498,16 @@ class YesNAIProvider(BaseImageProvider):
 
         if isinstance(size, (list, tuple)) and len(size) == 2:
             try:
-                return int(size[0]), int(size[1])
-            except (TypeError, ValueError):
-                return 1024, 1024
+                dimensions = (float(size[0]), float(size[1]))
+                if not all(value.is_integer() and math.isfinite(value) for value in dimensions):
+                    return None
+                return int(dimensions[0]), int(dimensions[1])
+            except (TypeError, ValueError, OverflowError):
+                return None
 
         size_text = str(size).strip().lower().replace("×", "x")
+        if len(size_text) > 32:
+            return None
 
         # 别名映射
         aliases = {
@@ -388,8 +522,12 @@ class YesNAIProvider(BaseImageProvider):
         if match:
             return int(match.group(1)), int(match.group(2))
 
-        # 回退默认
-        return 1024, 1024
+        return None
+
+    @staticmethod
+    def _resolve_size(size: Optional[str]) -> Tuple[int, int]:
+        """兼容旧调用：无效尺寸仍回退到 1024x1024。"""
+        return YesNAIProvider._parse_size(size) or (1024, 1024)
 
     def _sanitize_prompt(self, text: str) -> str:
         """清理提示词中的中/日/韩文和全角符号。"""

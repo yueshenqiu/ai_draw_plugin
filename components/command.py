@@ -6,17 +6,27 @@ plugin.py 中只保留 @Command/@Tool 装饰器的薄包装方法。
 """
 
 import asyncio
-import base64
 import re
-import traceback
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from ..instance import get_plugin_instance
 from ..constants.help_texts import HELP_TEXT
 from ..constants.constants import MODEL_MAPPINGS, SIZE_MAPPINGS
 from ..providers.capabilities import ImageFeature
 from ..providers import get_capabilities
+from ..core.image_utils import (
+    load_image_file_as_base64,
+    load_queue_image_spool,
+    remove_queue_image_spool,
+    save_queue_image_spool,
+)
+from ..core.job_manager import (
+    JobManagerClosedError,
+    QueueFullError,
+    SessionLimitError,
+)
 
 
 # 段守卫用：/ad 前允许的"同段正常前缀"——媒体占位符与 @某人（如私聊"引用图片 + /ad r"）
@@ -24,6 +34,192 @@ _LEADING_NOISE_RE = re.compile(
     r'^(?:\s*(?:\[image\]|\[图片\]|\[emoji\]|\[表情\]|\[voice\]|\[语音\]|\[file\]|\[文件\]|@[^\s]+)\s*)+',
     re.IGNORECASE,
 )
+
+
+def _short_job_label(prefix: str, description: str, limit: int = 60) -> str:
+    text = re.sub(r"\s+", " ", str(description or "")).strip()
+    if len(text) > limit:
+        text = f"{text[:limit - 1]}…"
+    return f"{prefix}：{text}" if text else prefix
+
+
+def _compact_job_kwargs(kwargs: dict) -> dict:
+    """只保留后台任务所需的会话元数据，避免把整段图片二进制留在队列中。"""
+    compact = {
+        key: kwargs.get(key)
+        for key in ("stream_id", "user_id", "group_id")
+        if kwargs.get(key) not in (None, "")
+    }
+    message = kwargs.get("message")
+    if not isinstance(message, dict):
+        return compact
+
+    message_info = message.get("message_info") or {}
+    group_info = message_info.get("group_info") or {}
+    user_info = message_info.get("user_info") or {}
+    compact["message"] = {
+        "platform": message.get("platform", ""),
+        "message_info": {
+            "group_info": {"group_id": group_info.get("group_id", "")},
+            "user_info": {"user_id": user_info.get("user_id", "")},
+        },
+    }
+    return compact
+
+
+def _dispose_job_cleanup(
+    cleanup: Optional[Callable[[], Any]], plugin: Any = None,
+) -> None:
+    if not callable(cleanup):
+        return
+    try:
+        cleanup()
+    except BaseException as exc:
+        if plugin is not None:
+            plugin.ctx.logger.warning("[生图任务] 清理任务资源失败: %s", exc)
+
+
+def _is_queue_enabled(plugin: Any) -> bool:
+    queue_config = getattr(getattr(plugin, "config", None), "queue", None)
+    return bool(getattr(queue_config, "enabled", True))
+
+
+async def _enqueue_draw_job(
+    kwargs: dict,
+    label: str,
+    factory: Callable[[dict], Awaitable[Any]],
+    cleanup: Optional[Callable[[], Any]] = None,
+) -> tuple:
+    """提交生图协程工厂，并把队列异常转换成安全的用户提示。"""
+    plugin = get_plugin_instance()
+    if plugin is None:
+        _dispose_job_cleanup(cleanup, plugin)
+        return None, "插件尚未就绪，请稍后再试"
+
+    job_kwargs = _compact_job_kwargs(kwargs)
+
+    async def _run_and_require_success() -> Any:
+        result = await factory(job_kwargs)
+        if result is False:
+            raise RuntimeError("生图流程未成功完成")
+        return result
+
+    if not _is_queue_enabled(plugin):
+        pending_cleanup = cleanup
+
+        def _release_direct_resources(_task: Optional[asyncio.Task] = None) -> None:
+            nonlocal pending_cleanup
+            owned_cleanup = pending_cleanup
+            pending_cleanup = None
+            _dispose_job_cleanup(owned_cleanup, plugin)
+
+        task: Optional[asyncio.Task] = None
+        try:
+            task = asyncio.create_task(
+                _run_and_require_success(),
+                name="ai-draw-direct",
+            )
+            task.add_done_callback(_release_direct_resources)
+            plugin._track_task(task)
+        except Exception as exc:
+            if task is not None:
+                task.cancel()
+            else:
+                _release_direct_resources()
+            plugin.ctx.logger.error("[生图任务] 直接启动失败: %s", exc, exc_info=True)
+            return None, "启动生图任务失败，请稍后再试"
+        return {
+            "job_id": None,
+            "status": "running",
+            "queue_position": None,
+        }, "生图任务已直接启动（任务队列未启用）"
+
+    manager = getattr(plugin, "_job_manager", None)
+    if manager is None:
+        _dispose_job_cleanup(cleanup, plugin)
+        return None, "任务队列尚未就绪，请稍后再试"
+
+    session_key = plugin._get_job_session_key(kwargs)
+    submitted = False
+    try:
+        job_id = await manager.submit(
+            _run_and_require_success,
+            session_key,
+            label=label,
+            cleanup=cleanup,
+        )
+        submitted = True
+    except SessionLimitError:
+        return None, "当前会话的生图任务已达上限，请稍后再试，或用 /ad status、/ad cancel 管理任务"
+    except QueueFullError:
+        return None, "全局生图队列已满，请稍后再试"
+    except JobManagerClosedError:
+        return None, "插件正在重载，暂时无法提交生图任务"
+    except Exception as exc:
+        plugin.ctx.logger.error("[任务队列] 提交失败: %s", exc, exc_info=True)
+        return None, "提交生图任务失败，请稍后再试"
+    finally:
+        if not submitted:
+            _dispose_job_cleanup(cleanup, plugin)
+
+    snapshots = await manager.status(session_key)
+    snapshot = next((item for item in snapshots if item.job_id == job_id), None)
+    status = snapshot.status if snapshot is not None else "queued"
+    queue_position = snapshot.queue_position if snapshot is not None else None
+    if status == "running":
+        message = f"生图任务已开始，任务 ID：{job_id}"
+    elif status == "queued":
+        position_text = f"（全局队列第 {queue_position} 位）" if queue_position else ""
+        message = f"生图任务已排队{position_text}，任务 ID：{job_id}"
+    elif status == "completed":
+        message = f"生图任务已完成，任务 ID：{job_id}"
+    else:
+        message = f"生图任务已提交，任务 ID：{job_id}"
+    return {
+        "job_id": job_id,
+        "status": status,
+        "queue_position": queue_position,
+    }, message
+
+
+async def _enqueue_ref_draw_job(
+    kwargs: dict,
+    label: str,
+    ref_image: str,
+    factory: Callable[[dict, str], Awaitable[Any]],
+) -> tuple:
+    """把参考图暂存到磁盘，避免后台任务长期持有大块 Base64。"""
+    spool_path = save_queue_image_spool(ref_image)
+    if not spool_path:
+        return None, "参考图暂存失败，请重新引用图片后再试"
+
+    async def _run_with_spooled_ref(job_kwargs: dict) -> Any:
+        queued_ref_image = load_queue_image_spool(spool_path)
+        if not queued_ref_image:
+            plugin = get_plugin_instance()
+            stream_id = str(job_kwargs.get("stream_id", "") or "")
+            if plugin is not None and stream_id:
+                await plugin.ctx.send.text("任务参考图已失效，请重新引用图片后再试", stream_id)
+            return False
+        return await factory(job_kwargs, queued_ref_image)
+
+    return await _enqueue_draw_job(
+        kwargs,
+        label,
+        _run_with_spooled_ref,
+        cleanup=lambda: remove_queue_image_spool(spool_path),
+    )
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total} 秒"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes} 分 {secs} 秒"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} 小时 {minutes} 分"
 
 
 # ================================================================
@@ -34,6 +230,132 @@ async def handle_ad_help(stream_id: str) -> tuple:
     plugin = get_plugin_instance()
     await plugin.ctx.send.text(HELP_TEXT, stream_id)
     return True, "帮助已显示", 2
+
+
+async def handle_ad_status(kwargs: dict) -> tuple:
+    """显示当前会话的活动任务与少量最近历史。"""
+    plugin = get_plugin_instance()
+    stream_id = str(kwargs.get("stream_id", "") or "")
+    if not plugin._check_user_permission_from_kwargs(kwargs):
+        await plugin.ctx.send.text("没有权限", stream_id)
+        return False, "没有权限", 1
+    if not _is_queue_enabled(plugin):
+        message = "任务队列未启用；生图任务会直接启动，不提供队列状态查询"
+        await plugin.ctx.send.text(message, stream_id)
+        return True, message, 2
+
+    manager = getattr(plugin, "_job_manager", None)
+    if manager is None:
+        await plugin.ctx.send.text("任务队列尚未就绪", stream_id)
+        return False, "任务队列尚未就绪", 1
+
+    jobs = await manager.status(plugin._get_job_session_key(kwargs))
+    active = [item for item in jobs if item.status in ("queued", "running")]
+    recent = [item for item in jobs if item.status not in ("queued", "running")][-3:]
+    if not active and not recent:
+        message = "当前会话没有生图任务"
+        await plugin.ctx.send.text(message, stream_id)
+        return True, message, 2
+
+    now = time.time()
+    lines = ["🎨 当前会话生图任务"]
+    if active:
+        for item in active:
+            label = item.label or "生图任务"
+            if item.cancel_requested:
+                state = "取消中"
+                elapsed = now - (item.started_at or item.created_at)
+            elif item.status == "queued":
+                state = f"排队中 · 全局第 {item.queue_position or '?'} 位"
+                elapsed = now - item.created_at
+            else:
+                state = "生成中"
+                elapsed = now - (item.started_at or item.created_at)
+            lines.append(
+                f"• {item.job_id} · {state} · {_format_duration(elapsed)}\n  {label}"
+            )
+    else:
+        lines.append("• 当前没有排队或运行中的任务")
+
+    if recent:
+        state_names = {
+            "completed": "已完成",
+            "failed": "失败",
+            "cancelled": "已取消",
+        }
+        lines.append("最近记录：")
+        for item in reversed(recent):
+            lines.append(
+                f"• {item.job_id} · {state_names.get(item.status, item.status)} · "
+                f"{item.label or '生图任务'}"
+            )
+
+    message = "\n".join(lines)
+    await plugin.ctx.send.text(message, stream_id)
+    return True, "任务状态已显示", 2
+
+
+async def handle_ad_cancel(job_id: str, kwargs: dict) -> tuple:
+    """取消指定任务；未给 ID 时只取消当前会话最近提交的活动任务。"""
+    plugin = get_plugin_instance()
+    stream_id = str(kwargs.get("stream_id", "") or "")
+    if not plugin._check_user_permission_from_kwargs(kwargs):
+        await plugin.ctx.send.text("没有权限", stream_id)
+        return False, "没有权限", 1
+    if not _is_queue_enabled(plugin):
+        message = "任务队列未启用；直接启动的任务不支持 /ad cancel"
+        await plugin.ctx.send.text(message, stream_id)
+        return False, message, 1
+
+    manager = getattr(plugin, "_job_manager", None)
+    if manager is None:
+        await plugin.ctx.send.text("任务队列尚未就绪", stream_id)
+        return False, "任务队列尚未就绪", 1
+
+    session_key = plugin._get_job_session_key(kwargs)
+    requested = str(job_id or "").strip()
+    cancel_all = requested.lower() == "all" or requested == "全部"
+    if cancel_all:
+        cancelled = await manager.cancel(session_key, None)
+        if cancelled:
+            message = f"已请求取消当前会话的 {len(cancelled)} 个生图任务"
+        else:
+            message = "当前会话没有可取消的生图任务"
+    else:
+        target_id = requested.lower()
+        if not target_id:
+            jobs = await manager.status(session_key)
+            candidates = [
+                item for item in jobs
+                if item.status in ("queued", "running") and not item.cancel_requested
+            ]
+            if not candidates:
+                message = "当前会话没有可取消的生图任务"
+                await plugin.ctx.send.text(message, stream_id)
+                return False, message, 1
+            target_id = max(candidates, key=lambda item: item.created_at).job_id
+
+        cancelled = await manager.cancel(session_key, target_id)
+        if cancelled:
+            message = f"已请求取消生图任务：{target_id}"
+        else:
+            message = f"未找到可取消的任务 {target_id}；它可能已完成或正在取消"
+
+    await plugin.ctx.send.text(message, stream_id)
+    return bool(cancelled), message, 2 if cancelled else 1
+
+
+async def handle_ad_context_reset(kwargs: dict) -> tuple:
+    """清除当前会话的连续绘图上下文。"""
+    plugin = get_plugin_instance()
+    stream_id = str(kwargs.get("stream_id", "") or "")
+    if not plugin._check_user_permission_from_kwargs(kwargs):
+        await plugin.ctx.send.text("没有权限", stream_id)
+        return False, "没有权限", 1
+    removed = plugin._session_state.clear_draw_context(stream_id)
+    message = "已清除连续绘图上下文" if removed else "当前没有可清除的连续绘图上下文"
+    await plugin.ctx.send.text(message, stream_id)
+    return True, message, 2
 
 
 # ================================================================
@@ -55,8 +377,12 @@ async def handle_ad_plugin_toggle(action: str, kwargs: dict) -> tuple:
 
     if action == "on":
         plugin._session_state.set_plugin_enabled(info["platform"], info["chat_id"], True)
-        await plugin.ctx.send.text("插件已开启，可以正常使用生图命令", stream_id)
-        return True, "插件已开启", 2
+        if plugin.config.plugin.enabled:
+            message = "插件已开启，可以正常使用生图命令"
+        else:
+            message = "当前会话已开启，但插件仍被全局配置关闭"
+        await plugin.ctx.send.text(message, stream_id)
+        return True, message, 2
     elif action == "off":
         plugin._session_state.set_plugin_enabled(info["platform"], info["chat_id"], False)
         await plugin.ctx.send.text("插件已关闭，所有生图命令将不可用", stream_id)
@@ -379,60 +705,20 @@ async def handle_ad_switch_artist(param: str, kwargs: dict) -> tuple:
 async def handle_ad_manual_recall(kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
     stream_id = kwargs.get("stream_id", "")
-    info = plugin._extract_session_info(kwargs)
-
-    from ..core.generator import fetch_recent_messages, is_ai_draw_bot_message
+    from ..core.generator import delete_tracked_message, get_tracked_message_ids
     plugin.ctx.logger.info("[手动撤回] 执行撤回")
 
     try:
-        messages = await fetch_recent_messages(
-            stream_id=stream_id, limit=20,
-            group_id=info["chat_id"] if info["chat_type"] == "group" else "",
-            user_id=info["user_id"] if info["chat_type"] == "private" else "",
-        )
-        if not messages:
-            await plugin.ctx.send.text("未找到最近消息", stream_id)
-            return False, "无消息", 1
-
-        bot_sender_ids = set()
-        ids_to_recall = []
-
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            msg_id = str(msg.get("message_id", "") or "")
-            if not msg_id:
-                continue
-            if is_ai_draw_bot_message(msg):
-                ids_to_recall.append(msg_id)
-                sender = msg.get("sender", {}) or {}
-                sid = str(sender.get("user_id", ""))
-                if sid:
-                    bot_sender_ids.add(sid)
-
-        if bot_sender_ids:
-            for msg in messages:
-                if not isinstance(msg, dict):
-                    continue
-                msg_id = str(msg.get("message_id", "") or "")
-                if not msg_id or msg_id in ids_to_recall:
-                    continue
-                sender = msg.get("sender", {}) or {}
-                sid = str(sender.get("user_id", ""))
-                if sid not in bot_sender_ids:
-                    continue
-                segments = msg.get("message", msg.get("raw_message", []))
-                if any(isinstance(s, dict) and s.get("type") == "image" for s in (segments or [])):
-                    ids_to_recall.append(msg_id)
+        ids_to_recall = get_tracked_message_ids(kwargs, limit=20)
+        if not ids_to_recall:
+            await plugin.ctx.send.text("当前会话没有可撤回的 AI绘图消息", stream_id)
+            return False, "无可撤回消息", 1
 
         recalled = 0
         for msg_id in ids_to_recall:
-            try:
-                await plugin.ctx.api.call("adapter.napcat.message.delete_msg", message_id=msg_id)
+            if await delete_tracked_message(msg_id, kwargs):
                 recalled += 1
-            except Exception:
-                pass
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.2)
 
         if recalled:
             await plugin.ctx.send.text(f"已撤回 {recalled} 条 AI绘图消息", stream_id)
@@ -522,13 +808,6 @@ async def handle_ad_style(style_name: str, kwargs: dict) -> tuple:
         await plugin.ctx.send.text(f"未找到提示词预设 '{style_name}'。可用：{names}...", stream_id)
         return False, f"未找到提示词预设: {style_name}", 1
 
-    # 获取参考图
-    from ..core.generator import fetch_ref_image
-    ref_image = await fetch_ref_image(kwargs, stream_id)
-    if not ref_image:
-        await plugin.ctx.send.text("请引用一张图片后使用 /ad y 命令", stream_id)
-        return False, "未找到参考图", 1
-
     if not plugin._check_user_permission_from_kwargs(kwargs):
         await plugin.ctx.send.text("没有权限", stream_id)
         return False, "没有权限", 1
@@ -539,13 +818,24 @@ async def handle_ad_style(style_name: str, kwargs: dict) -> tuple:
             await plugin.ctx.send.text(err, stream_id)
         return False, err or "已忽略", 1
 
+    # 通过权限与开关校验后再读取参考图，避免无权限请求触发历史/网络读取。
+    from ..core.generator import fetch_ref_image
+    ref_image = await fetch_ref_image(kwargs, stream_id)
+    if not ref_image:
+        await plugin.ctx.send.text("请引用一张图片后使用 /ad y 命令", stream_id)
+        return False, "未找到参考图", 1
+
     model_config = plugin._get_model_config_from_kwargs(
         kwargs,
         apply_artist_preset=getattr(plugin.config.plugin, "y_apply_artist_preset", False),
     )
     if not model_config or not model_config.get("base_url"):
-        await plugin.ctx.send.text("模型配置错误，请检查配置文件", stream_id)
+        await plugin.ctx.send.text("当前生图模型配置错误，请检查配置文件", stream_id)
         return False, "配置错误", 1
+    supported, reason = _check_ref_mode_capability(model_config, "i2i")
+    if not supported:
+        await plugin.ctx.send.text(reason or "当前模型不支持图生图", stream_id)
+        return False, reason or "不支持图生图", 1
 
     # NSFW 过滤
     info = plugin._extract_session_info(kwargs)
@@ -564,12 +854,20 @@ async def handle_ad_style(style_name: str, kwargs: dict) -> tuple:
 
     plugin.ctx.logger.info("[提示词预设生图] 预设=%s", style_name[:30])
     from ..core.generator import generate_and_send
-    plugin._track_task(asyncio.create_task(
-        generate_and_send(style_prompt, model_config, stream_id,
-                          prompt_text=f"[{style_name}] {style_prompt[:80]}",
-                          kwargs=kwargs, ref_image=ref_image, ref_mode="i2i")
-    ))
-    return True, f"正在图生图（{style_name}）...", 2
+    job, message = await _enqueue_ref_draw_job(
+        kwargs,
+        _short_job_label("提示词预设图生图", style_name),
+        ref_image,
+        lambda job_kwargs, queued_ref_image: generate_and_send(
+            style_prompt, model_config, stream_id,
+            prompt_text=f"[{style_name}] {style_prompt[:80]}",
+            kwargs=job_kwargs, ref_image=queued_ref_image, ref_mode="i2i",
+        ),
+    )
+    if not job:
+        await plugin.ctx.send.text(message, stream_id)
+        return False, message, 1
+    return True, message, 2
 
 
 # ================================================================
@@ -622,8 +920,12 @@ async def handle_dr0_ref_draw(mode: str, tags: str, kwargs: dict) -> tuple:
 
     model_config = plugin._get_model_config_from_kwargs(kwargs)
     if not model_config or not model_config.get("base_url"):
-        await plugin.ctx.send.text("BestNAI 配置错误，请检查配置文件", stream_id)
+        await plugin.ctx.send.text("当前生图模型配置错误，请检查配置文件", stream_id)
         return False, "配置错误", 1
+    supported, reason = _check_ref_mode_capability(model_config, ref_mode)
+    if not supported:
+        await plugin.ctx.send.text(reason or "当前模型不支持该参考模式", stream_id)
+        return False, reason or "不支持参考模式", 1
 
     # NSFW 过滤：扫描直接标签中是否包含违规 tag
     info = plugin._extract_session_info(kwargs)
@@ -642,12 +944,20 @@ async def handle_dr0_ref_draw(mode: str, tags: str, kwargs: dict) -> tuple:
             return False, f"NSFW过滤拦截: {found}", 1
 
     from ..core.generator import generate_and_send
-    plugin._track_task(asyncio.create_task(
-        generate_and_send(tags, model_config, stream_id,
-                          prompt_text=tags, kwargs=kwargs,
-                          ref_image=ref_image, ref_mode=ref_mode)
-    ))
-    return True, f"正在生成图片（{mode_names[mode]}·直传）...", 2
+    job, message = await _enqueue_ref_draw_job(
+        kwargs,
+        _short_job_label(f"{mode_names[mode]}·直传", tags),
+        ref_image,
+        lambda job_kwargs, queued_ref_image: generate_and_send(
+            tags, model_config, stream_id,
+            prompt_text=tags, kwargs=job_kwargs,
+            ref_image=queued_ref_image, ref_mode=ref_mode,
+        ),
+    )
+    if not job:
+        await plugin.ctx.send.text(message, stream_id)
+        return False, message, 1
+    return True, message, 2
 
 
 async def handle_dr0_draw(description: str, kwargs: dict) -> tuple:
@@ -671,7 +981,7 @@ async def handle_dr0_draw(description: str, kwargs: dict) -> tuple:
     plugin.ctx.logger.info("[直接生图] 标签: %s", description)
     model_config = plugin._get_model_config_from_kwargs(kwargs)
     if not model_config or not model_config.get("base_url"):
-        await plugin.ctx.send.text("BestNAI 配置错误，请检查配置文件", stream_id)
+        await plugin.ctx.send.text("当前生图模型配置错误，请检查配置文件", stream_id)
         return False, "配置错误", 1
 
     # NSFW 过滤：扫描直接标签中是否包含违规 tag
@@ -691,10 +1001,18 @@ async def handle_dr0_draw(description: str, kwargs: dict) -> tuple:
             return False, f"NSFW过滤拦截: {found}", 1
 
     from ..core.generator import generate_and_send
-    plugin._track_task(asyncio.create_task(
-        generate_and_send(description, model_config, stream_id, prompt_text=description, kwargs=kwargs)
-    ))
-    return True, "正在生成图片...", 2
+    job, message = await _enqueue_draw_job(
+        kwargs,
+        _short_job_label("直接标签生图", description),
+        lambda job_kwargs: generate_and_send(
+            description, model_config, stream_id,
+            prompt_text=description, kwargs=job_kwargs,
+        ),
+    )
+    if not job:
+        await plugin.ctx.send.text(message, stream_id)
+        return False, message, 1
+    return True, message, 2
 
 
 # ================================================================
@@ -740,10 +1058,19 @@ async def handle_ad_ref_draw(mode: str, description: str, kwargs: dict) -> tuple
     ref_mode = mode_map[mode]
 
     plugin.ctx.logger.info("[参考生图] 模式=%s 描述=%s", mode_names[mode], description[:80])
-    plugin._track_task(asyncio.create_task(
-        ad_workflow(description, kwargs, is_action=False, ref_image=ref_image, ref_mode=ref_mode)
-    ))
-    return True, f"正在生成图片（{mode_names[mode]}）...", 2
+    job, message = await _enqueue_ref_draw_job(
+        kwargs,
+        _short_job_label(mode_names[mode], description),
+        ref_image,
+        lambda job_kwargs, queued_ref_image: ad_workflow(
+            description, job_kwargs, is_action=False,
+            ref_image=queued_ref_image, ref_mode=ref_mode,
+        ),
+    )
+    if not job:
+        await plugin.ctx.send.text(message, stream_id)
+        return False, message, 1
+    return True, message, 2
 
 
 # ================================================================
@@ -769,8 +1096,15 @@ async def handle_ad_draw(description: str, kwargs: dict) -> tuple:
         return False, err or "已忽略", 1
 
     plugin.ctx.logger.info("[LLM生图] 收到请求: %s", description[:80])
-    plugin._track_task(asyncio.create_task(ad_workflow(description, kwargs, is_action=False)))
-    return True, "正在生成图片...", 2
+    job, message = await _enqueue_draw_job(
+        kwargs,
+        _short_job_label("自然语言生图", description),
+        lambda job_kwargs: ad_workflow(description, job_kwargs, is_action=False),
+    )
+    if not job:
+        await plugin.ctx.send.text(message, stream_id)
+        return False, message, 1
+    return True, message, 2
 
 
 # ================================================================
@@ -784,14 +1118,32 @@ async def handle_ad_web_draw(description: str, size: str, kwargs: dict) -> dict:
     if not plugin._check_user_permission_from_kwargs(kwargs):
         return {"success": False, "message": "没有权限"}
 
+    info = plugin._extract_session_info(kwargs)
+    if not plugin.config.plugin.enabled:
+        return {"success": False, "message": "插件已被全局关闭"}
+    if not plugin._session_state.is_plugin_enabled(info["platform"], info["chat_id"]):
+        return {"success": False, "message": "当前会话已关闭生图功能"}
+
     raw_description = description.strip()
     if not raw_description:
         return {"success": False, "message": "图片描述为空"}
 
-    plugin._track_task(asyncio.create_task(
-        ad_workflow(raw_description, kwargs, is_action=True, size=size)
-    ))
-    return {"success": True, "message": "图片生成请求已提交，请稍候"}
+    job, message = await _enqueue_draw_job(
+        kwargs,
+        _short_job_label("Tool 生图", raw_description),
+        lambda job_kwargs: ad_workflow(
+            raw_description, job_kwargs, is_action=True, size=size,
+        ),
+    )
+    if not job:
+        return {"success": False, "message": message}
+    return {
+        "success": True,
+        "message": message,
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "queue_position": job["queue_position"],
+    }
 
 
 # ================================================================
@@ -805,7 +1157,7 @@ async def ad_workflow(
     size: str = "",
     ref_image: str = "",
     ref_mode: str = "",
-) -> None:
+) -> bool:
     plugin = get_plugin_instance()
     stream_id = kwargs.get("stream_id", "")
 
@@ -818,22 +1170,35 @@ async def ad_workflow(
     else:
         is_selfie = detect_selfie_prefix(description)
 
-    # 随机模式
-    is_random_selfie = description in ("随机自拍", "random selfie")
-    if description in ("随机", "random", "rand") or is_random_selfie:
-        rand_desc = await _generate_random_description(selfie=is_random_selfie)
-        if not rand_desc:
-            await plugin.ctx.send.text("随机场景生成失败，请稍后再试~", stream_id)
-            return
-        description = rand_desc
-        plugin.ctx.logger.info("[随机场景] %s", description)
-
-    # LLM 提示词生成
     info = plugin._extract_session_info(kwargs)
     nsfw_enabled = plugin._session_state.is_nsfw_filter_enabled(
         info["platform"], info["chat_id"], plugin._get_config_callable(),
         stream_id=stream_id,
     )
+
+    # 随机模式
+    is_random_selfie = description in ("随机自拍", "random selfie")
+    is_selfie = is_selfie or is_random_selfie
+    if description in ("随机", "random", "rand") or is_random_selfie:
+        rand_desc = await _generate_random_description(
+            selfie=is_random_selfie,
+            nsfw_enabled=nsfw_enabled,
+            stream_id=stream_id,
+        )
+        if not rand_desc:
+            await plugin.ctx.send.text("随机场景生成失败，请稍后再试~", stream_id)
+            return False
+        description = rand_desc
+        plugin.ctx.logger.info("[随机场景] %s", description)
+
+    # Provider 能力预检查，避免在不支持参考模式的模型上浪费一次 LLM/API 调用。
+    if ref_mode:
+        supported, reason = _check_ref_mode_capability(
+            plugin._get_model_config_from_kwargs(kwargs), ref_mode,
+        )
+        if not supported:
+            await plugin.ctx.send.text(reason or "当前模型不支持该参考模式", stream_id)
+            return False
 
     # 自拍场景增强：从日程 + LLM 获取 action/environment/expression/lighting
     selfie_scene_context = ""
@@ -861,46 +1226,59 @@ async def ad_workflow(
     generated_prompt = await _generate_prompt_with_llm(
         description, stream_id, is_action, nsfw_enabled,
         selfie_scene_context=selfie_scene_context,
+        ref_mode=ref_mode,
     )
     if not generated_prompt:
         await plugin.ctx.send.text("提示词生成失败，请稍后再试~", stream_id)
-        return
+        return False
 
     plugin.ctx.logger.debug("[LLM生图] 原始提示词: %s", generated_prompt)
 
     # 自拍处理（is_selfie 已在随机模式前以原始用户输入判定）
     from ..core.prompt_engine import normalize_prompt_order
+    from ..core.selfie_engine import detect_selfie_from_output
+
+    # LLM 已明确输出自拍标签时，纠正仅靠关键词前缀可能漏掉的自拍意图。
+    if not is_selfie and detect_selfie_from_output(generated_prompt):
+        is_selfie = True
 
     selfie_base_prompt = generated_prompt
     if is_selfie:
-        model_cfg = plugin._get_model_config_from_kwargs(kwargs)
+        model_cfg = plugin._get_model_config_from_kwargs(
+            kwargs,
+            apply_artist_preset=ref_mode not in ("style", "character&style"),
+        )
 
         # 尝试使用自拍参考图（仅在没有手动上传参考图时生效）
         selfie_ref_filename = (plugin.config.prompt_show.selfie_ref_image or "").strip()
         selfie_ref_used = False
         if selfie_ref_filename and not ref_image:
-            ref_dir = Path(__file__).parent.parent / "selfie_refs"
-            ref_path = ref_dir / selfie_ref_filename
-            if ref_path.exists():
+            ref_path = _resolve_safe_selfie_ref(selfie_ref_filename)
+            if ref_path is not None:
                 provider_fmt = model_cfg.get("format", "bestnai")
                 caps = get_capabilities(provider_fmt)
                 if caps and ImageFeature.CHARACTER_REF in caps.features:
-                    try:
-                        ref_image = base64.b64encode(ref_path.read_bytes()).decode("utf-8")
+                    loaded_ref = load_image_file_as_base64(ref_path)
+                    if loaded_ref:
+                        ref_image = loaded_ref
                         ref_mode = "character"
                         selfie_ref_used = True
                         plugin.ctx.logger.info(
                             "[自拍参考图] 使用固定角色参考图: %s", selfie_ref_filename
                         )
-                    except Exception as e:
-                        plugin.ctx.logger.warning("[自拍参考图] 读取图片失败: %s", e)
+                    else:
+                        plugin.ctx.logger.warning(
+                            "[自拍参考图] 图片无效或超过统一大小/像素限制: %s",
+                            selfie_ref_filename,
+                        )
                 else:
                     plugin.ctx.logger.info(
                         "[自拍参考图] 当前 provider(%s) 不支持角色参考，回退文字提示词", provider_fmt
                     )
             else:
                 plugin.ctx.logger.warning(
-                    "[自拍参考图] 参考图文件不存在: %s", ref_path
+                    "[自拍参考图] 参考图路径无效、不存在或扩展名不受支持: %s",
+                    selfie_ref_filename,
                 )
 
         include_selfie_add = selfie_ref_used or not bool(ref_image)
@@ -921,26 +1299,78 @@ async def ad_workflow(
         if is_selfie and plugin.config.prompt_show.hide_selfie_prompt_add:
             show_prompt = _process_selfie_prompt(
                 selfie_base_prompt, description, False,
-                plugin._get_model_config_from_kwargs(kwargs),
+                plugin._get_model_config_from_kwargs(
+                    kwargs,
+                    apply_artist_preset=ref_mode not in ("style", "character&style"),
+                ),
             )
             header = "\U0001f4dd 提示词(已隐藏自拍补充):"
         await plugin.ctx.send.text(f"{header}\n{show_prompt}", stream_id)
 
     # 生成并发送图片
-    model_config = plugin._get_model_config_from_kwargs(kwargs)
+    apply_artist_preset = ref_mode not in ("style", "character&style")
+    model_config = plugin._get_model_config_from_kwargs(
+        kwargs, apply_artist_preset=apply_artist_preset,
+    )
     if not model_config or not model_config.get("base_url"):
-        await plugin.ctx.send.text("BestNAI 配置错误，请检查配置文件", stream_id)
-        return
+        await plugin.ctx.send.text("当前生图模型配置错误，请检查配置文件", stream_id)
+        return False
 
     from ..core.generator import generate_and_send
-    await generate_and_send(generated_prompt, model_config, stream_id,
-                            prompt_text=generated_prompt, size=size, kwargs=kwargs,
-                            ref_image=ref_image, ref_mode=ref_mode)
+    sent = await generate_and_send(generated_prompt, model_config, stream_id,
+                                   prompt_text=generated_prompt, size=size, kwargs=kwargs,
+                                   ref_image=ref_image, ref_mode=ref_mode)
+    if sent:
+        plugin._session_state.set_last_draw_context(stream_id, generated_prompt, description)
+        if is_selfie:
+            plugin._session_state.set_last_selfie_context(
+                stream_id, generated_prompt, description,
+                scene_summary=selfie_scene_context,
+            )
+    return bool(sent)
 
 
 # ================================================================
 # 内部辅助函数
 # ================================================================
+
+def _check_ref_mode_capability(model_config: dict, ref_mode: str) -> tuple:
+    """在调用 LLM/生图 API 前确认当前 Provider 声明支持对应参考能力。"""
+    if not ref_mode:
+        return True, None
+    fmt = str((model_config or {}).get("format", "bestnai") or "bestnai").strip().lower()
+    caps = get_capabilities(fmt)
+    if caps is None:
+        return False, f"当前服务商 {fmt} 未声明参考图能力"
+    required = {
+        "i2i": ImageFeature.IMG2IMG,
+        "character": ImageFeature.CHARACTER_REF,
+        "style": ImageFeature.STYLE_REF,
+        "character&style": ImageFeature.CHARACTER_STYLE_REF,
+    }.get(ref_mode)
+    if required is None:
+        return False, f"未知参考模式: {ref_mode}"
+    if required not in caps.features:
+        return False, f"当前服务商 {caps.display_name} 不支持该参考模式"
+    return True, None
+
+
+def _resolve_safe_selfie_ref(filename: str) -> Optional[Path]:
+    """只解析 selfie_refs 目录内的候选图片；内容校验由共享读取器负责。"""
+    if not filename or Path(filename).name != filename:
+        return None
+    root = (Path(__file__).resolve().parent.parent / "selfie_refs").resolve()
+    candidate = (root / filename).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    if candidate.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate
+
 
 def _check_chat_permission(platform: str, chat_id: str) -> tuple:
     plugin = get_plugin_instance()
@@ -977,7 +1407,7 @@ _NSFW_BLACKLIST = [
 
 
 def _filter_nsfw_tags_from_prompt(prompt: str) -> tuple:
-    """检查 prompt 中是否包含 NSFW 标签。返回 (过滤后prompt, 被过滤的标签列表)。"""
+    """检查 prompt 中是否包含 NSFW 标签，返回命中的标签列表。"""
     prompt_lower = prompt.lower()
     found = []
     for tag in _NSFW_BLACKLIST:
@@ -1064,6 +1494,8 @@ def _check_plugin_enabled(kwargs: dict) -> tuple:
     # ② bot 自己发的含 /ad 文案回流
     if not _is_real_ad_command(kwargs) or _is_bot_self_message(kwargs):
         return False, None
+    if not plugin.config.plugin.enabled:
+        return False, "插件已被全局关闭，请在配置中启用"
     info = plugin._extract_session_info(kwargs)
     if not plugin._session_state.is_plugin_enabled(info["platform"], info["chat_id"]):
         return False, "插件已关闭，请使用 /ad on 开启"
@@ -1103,6 +1535,7 @@ async def _generate_prompt_with_llm(
     request_text: str, stream_id: str = "",
     is_action: bool = False, nsfw_enabled: bool = False,
     selfie_scene_context: str = "",
+    ref_mode: str = "",
 ) -> Optional[str]:
     plugin = get_plugin_instance()
     gen_cfg = plugin.config.prompt_generator
@@ -1123,8 +1556,20 @@ async def _generate_prompt_with_llm(
         default_tpl = PROMPT_GENERATOR_JSON_TEMPLATE if output_format == "json" else PROMPT_GENERATOR_TEMPLATE
 
     template = gen_cfg.prompt_template or default_tpl
-    prompt = _render_generator_prompt(template, request_text, is_action=is_action,
-                                      selfie_scene_context=selfie_scene_context)
+    previous_prompt = ""
+    previous_request = ""
+    if stream_id:
+        previous_prompt, previous_request = plugin._session_state.get_last_draw_context(
+            stream_id, ttl=gen_cfg.inherit_ttl,
+        )
+
+    prompt = _render_generator_prompt(
+        template, request_text, is_action=is_action,
+        selfie_scene_context=selfie_scene_context,
+        previous_prompt=previous_prompt or "",
+        previous_request=previous_request or "",
+        ref_mode=ref_mode,
+    )
 
     # LLM 调用
     from ..core.prompt_engine import call_custom_llm_api, has_custom_api_config, cleanup_llm_prompt
@@ -1157,8 +1602,15 @@ async def _generate_prompt_with_llm(
     return cleanup_llm_prompt(response)
 
 
-def _render_generator_prompt(template: str, request: str, is_action: bool = False,
-                             selfie_scene_context: str = "") -> str:
+def _render_generator_prompt(
+    template: str,
+    request: str,
+    is_action: bool = False,
+    selfie_scene_context: str = "",
+    previous_prompt: str = "",
+    previous_request: str = "",
+    ref_mode: str = "",
+) -> str:
     plugin = get_plugin_instance()
     from ..core.selfie_engine import get_selfie_hint
     from ..core.prompt_engine import build_current_time_context
@@ -1171,10 +1623,18 @@ def _render_generator_prompt(template: str, request: str, is_action: bool = Fals
     current_time = build_current_time_context()
 
     prompt = template.replace("<<CUSTOM_SYSTEM_PROMPT>>", custom_sys)
-    if not is_action:
-        prompt = prompt.replace("<<PREVIOUS_PROMPT>>", "")
+    previous_context = ""
+    if previous_prompt:
+        previous_context = (
+            "<previous_draw_context>\n"
+            f"上一轮用户请求：{previous_request or '(未记录)'}\n"
+            f"上一轮最终提示词：{previous_prompt}\n"
+            "仅当本轮是继续、修改、重画或保持上一张设定时继承；若是全新主题则忽略。\n"
+            "</previous_draw_context>"
+        )
+    prompt = prompt.replace("<<PREVIOUS_PROMPT>>", previous_context)
     prompt = prompt.replace("<<SELFIE_SCENE_CONTEXT>>", selfie_scene_context or "")
-    prompt = prompt.replace("<<CHARACTER_REF_CONTEXT>>", "")
+    prompt = prompt.replace("<<CHARACTER_REF_CONTEXT>>", _build_ref_context(ref_mode))
     prompt = prompt.replace("<<USER_REQUEST>>", request.strip() or "N/A")
     prompt = prompt.replace("<<CURRENT_TIME_CONTEXT>>", current_time)
     prompt = prompt.replace("<<SELFIE_HINT>>", selfie_hint)
@@ -1182,59 +1642,110 @@ def _render_generator_prompt(template: str, request: str, is_action: bool = Fals
     return prompt.strip()
 
 
-async def _generate_random_description(selfie: bool = False) -> Optional[str]:
+def _build_ref_context(ref_mode: str) -> str:
+    mode = (ref_mode or "").strip().lower()
+    if mode == "character":
+        return (
+            "<reference_image_rules>提供了角色参考图。不要自行编造或覆盖角色的固定外貌，"
+            "尤其是发色、发型、瞳色、脸型和固有身份；服装、动作和场景仍按用户要求生成。"
+            "</reference_image_rules>"
+        )
+    if mode == "style":
+        return (
+            "<reference_image_rules>提供了画风参考图。不要添加画师名、作品风格或额外画风标签；"
+            "画风完全交给参考图，内容、人物、动作和场景按用户要求生成。"
+            "</reference_image_rules>"
+        )
+    if mode == "character&style":
+        return (
+            "<reference_image_rules>参考图同时负责角色固定外貌与画风。不要编造固定外貌，"
+            "也不要添加画师名或额外风格标签；只描述服装、动作、构图、场景和光线。"
+            "</reference_image_rules>"
+        )
+    if mode == "i2i":
+        return (
+            "<reference_image_rules>提供了图生图参考。保留用户未要求修改的主体与构图，"
+            "仅按本轮描述调整指定内容。"
+            "</reference_image_rules>"
+        )
+    return ""
+
+
+async def _generate_random_description(
+    selfie: bool = False,
+    nsfw_enabled: bool = True,
+    stream_id: str = "",
+) -> Optional[str]:
     plugin = get_plugin_instance()
     rand_cfg = plugin.config.random_scene
-    from ..core.random_scene import normalize_random_scene_description
+    from ..core.random_scene import (
+        normalize_random_scene_description,
+        is_random_scene_too_similar,
+    )
 
     selfie_extra = ""
     if selfie:
-        selfie_extra = "\n\n额外要求（自拍模式）：\n- 必须明确是自拍\n- 自拍内容同样要明确偏成人向"
+        selfie_extra = "\n\n额外要求（自拍模式）：\n- 必须明确是自拍\n- 场景适合由同一角色本人出镜"
 
+    recent_scenes = plugin._session_state.get_recent_random_scenes(stream_id)
     history = ""
-    if plugin._recent_random_scenes:
-        history = "\n".join(plugin._recent_random_scenes)
+    if recent_scenes:
+        history = "\n".join(recent_scenes)
         history = f"\n\n以下是最近已生成过的内容，禁止与它们重复或相似：\n{history}"
 
+    content_level = (
+        "全年龄、安全、穿着完整，不包含露骨或性暗示内容"
+        if nsfw_enabled else
+        "可包含成人向内容，但仍需避免违法、未成年人或非自愿题材"
+    )
     prompt = (
-        "随机生成一个二次元 NSFW 场景，并用空格分隔的中文短标签描述它。\n"
-        "要求：\n- 题材不限，强度不限\n"
+        "随机生成一个二次元插画场景，并用空格分隔的中文短标签描述它。\n"
+        f"内容级别：{content_level}\n"
+        "要求：\n- 题材尽量多样\n"
         "- 结果必须具体、可视化、适合转成 Danbooru 风格标签\n"
         "- 只输出 1 行，包含 6-10 个中文短标签\n"
         f"- 标签尽量简短，使用明确视觉概念{selfie_extra}"
         f"{history}"
     )
 
-    try:
-        from ..core.prompt_engine import call_custom_llm_api, has_custom_api_config
-        api_cfg = {
-            "api_base": plugin.config.prompt_generator.api_base or "",
-            "api_key": plugin.config.prompt_generator.api_key or "",
-            "model_name": plugin.config.prompt_generator.model_name or "",
-        }
-        if has_custom_api_config(api_cfg):
-            success, response, _, _ = await call_custom_llm_api(
-                prompt=prompt,
-                api_base=api_cfg["api_base"],
-                api_key=api_cfg["api_key"],
-                model=api_cfg["model_name"],
-                temperature=rand_cfg.temperature,
-                max_tokens=rand_cfg.max_tokens,
-            )
-            if not success:
-                plugin.ctx.logger.error("[随机场景] 自定义 API 失败: %s", response)
-                return None
-        else:
-            result = await plugin.ctx.llm.generate(
-                prompt=prompt, temperature=rand_cfg.temperature, max_tokens=rand_cfg.max_tokens,
-            )
-            response = result.get("content", "") if isinstance(result, dict) else str(result)
-    except Exception as e:
-        plugin.ctx.logger.error("[随机场景] LLM调用失败: %s", e)
-        return None
+    from ..core.prompt_engine import call_custom_llm_api, has_custom_api_config
+    api_cfg = {
+        "api_base": plugin.config.prompt_generator.api_base or "",
+        "api_key": plugin.config.prompt_generator.api_key or "",
+        "model_name": plugin.config.prompt_generator.model_name or "",
+    }
 
-    if not response:
-        return None
-    lines = [l.strip() for l in response.strip().split("\n") if l.strip()]
-    return normalize_random_scene_description(lines[0]) if lines else None
+    for attempt in range(3):
+        try:
+            if has_custom_api_config(api_cfg):
+                success, response, _, _ = await call_custom_llm_api(
+                    prompt=prompt,
+                    api_base=api_cfg["api_base"],
+                    api_key=api_cfg["api_key"],
+                    model=api_cfg["model_name"],
+                    temperature=rand_cfg.temperature,
+                    max_tokens=rand_cfg.max_tokens,
+                )
+                if not success:
+                    plugin.ctx.logger.error("[随机场景] 自定义 API 失败: %s", response)
+                    return None
+            else:
+                result = await plugin.ctx.llm.generate(
+                    prompt=prompt, temperature=rand_cfg.temperature, max_tokens=rand_cfg.max_tokens,
+                )
+                response = result.get("content", "") if isinstance(result, dict) else str(result)
+        except Exception as e:
+            plugin.ctx.logger.error("[随机场景] LLM调用失败: %s", e)
+            return None
+
+        lines = [line.strip() for line in (response or "").strip().split("\n") if line.strip()]
+        candidate = normalize_random_scene_description(lines[0]) if lines else ""
+        if not candidate:
+            continue
+        if recent_scenes and is_random_scene_too_similar(candidate, recent_scenes, threshold=0.6):
+            plugin.ctx.logger.info("[随机场景] 第 %s 次结果与近期场景过于相似，重新生成", attempt + 1)
+            continue
+        plugin._session_state.add_recent_random_scene(stream_id, candidate, limit=5)
+        return candidate
+    return None
 

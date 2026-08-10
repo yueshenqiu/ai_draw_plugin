@@ -9,23 +9,20 @@ import asyncio
 import base64
 import io
 import json
+import math
 import re
 import ssl
 from typing import Dict, Any, Tuple, Optional, List
 
 import requests
 import certifi
+from PIL import Image
 from requests.adapters import HTTPAdapter
 from requests.exceptions import ProxyError
 from urllib3.util.ssl_ import create_urllib3_context
 
-from .base import BaseImageProvider
-
-try:
-    from PIL import Image
-    _HAS_PIL = True
-except ImportError:
-    _HAS_PIL = False
+from .base import BaseImageProvider, ResponseLimitError
+from .capabilities import BESTNAI_CAPABILITIES
 
 
 class SSLAdapter(HTTPAdapter):
@@ -49,6 +46,19 @@ class BestNAIProvider(BaseImageProvider):
 
     default_endpoint = "/v1/chat/completions"
 
+    _RESERVED_EXTRA_PARAMS = {
+        "model", "prompt", "size", "width", "height", "steps",
+        "num_inference_steps", "n_samples", "negative_prompt", "sampler",
+        "scale", "guidance_scale", "cfg", "cfg_rescale", "seed",
+        "noise_schedule", "nocache", "i2i", "image", "images", "strength",
+        "noise", "controlnet", "character_references", "reference_image",
+        "reference_images", "reference_image_multiple",
+        "reference_strength_multiple", "reference_information_extracted_multiple",
+        "director_reference_images", "director_reference_strength_values",
+        "director_reference_secondary_strength_values", "ref_image", "ref_mode",
+        "ref_strength", "ref_fidelity", "max_tokens", "stream",
+    }
+
     # 匹配中/日/韩文 + 全角符号（NewAPI 仅允许英文）
     _CJK_RE = re.compile(
         r'[一-鿿㐀-䶿＀-＇＊-Ｚ＼＾-ｚ｜～-￯　-〿'
@@ -60,8 +70,10 @@ class BestNAIProvider(BaseImageProvider):
 
     def __init__(self, logger, log_prefix: str = ""):
         super().__init__(logger, log_prefix)
-        self.session = self._create_session(trust_env=True)
-        self.direct_session = self._create_session(trust_env=False)
+        # Provider 当前由生成器按请求创建。连接池也按请求创建并在读取完响应后关闭，
+        # 避免临时 Provider 被回收前遗留两个 Session/连接池。
+        self.session: Optional[requests.Session] = None
+        self.direct_session: Optional[requests.Session] = None
         self._auto_proxy_direct_only = False
 
     # ================================================================
@@ -106,16 +118,26 @@ class BestNAIProvider(BaseImageProvider):
             # 读取生成参数
             negative_prompt = model_config.get("negative_prompt_add", "")
             sampler = model_config.get("sampler", "")
-            steps = model_config.get("steps") or model_config.get("num_inference_steps")
-            guidance_scale = model_config.get("scale") or model_config.get("guidance_scale")
-            cfg_value = model_config.get("cfg") or model_config.get("nai_cfg")
+            steps = model_config.get("steps")
+            if steps is None or steps == "":
+                steps = model_config.get("num_inference_steps")
+            guidance_scale = model_config.get("scale")
+            if guidance_scale is None or guidance_scale == "":
+                guidance_scale = model_config.get("guidance_scale")
+            cfg_value = model_config.get("cfg")
+            if cfg_value is None or cfg_value == "":
+                cfg_value = model_config.get("nai_cfg")
             noise_schedule = model_config.get("noise_schedule") or model_config.get("nai_noise_schedule")
-            nocache = model_config.get("nocache") or model_config.get("nai_nocache")
+            nocache = model_config.get("nocache")
+            if nocache is None:
+                nocache = model_config.get("nai_nocache")
             size_override = model_config.get("size_preset") or model_config.get("nai_size")
             extra_params = model_config.get("extra_params") or model_config.get("nai_extra_params") or {}
             model_name = model_config.get("model") or model_config.get("default_model") or "nai-diffusion-4-5-full"
+            seed = model_config.get("seed", -1)
 
-            final_size = size_override or size
+            # 调用方显式传入的尺寸优先于模型配置中的默认/预设尺寸。
+            final_size = size or size_override or model_config.get("default_size")
 
             # 安全清理：NewAPI 不允许非英文内容
             full_prompt = self._sanitize_prompt(full_prompt)
@@ -123,15 +145,79 @@ class BestNAIProvider(BaseImageProvider):
             if artist_prompt:
                 artist_prompt = self._sanitize_prompt(artist_prompt)
 
-            # 限制 steps 不超过 NewAPI 最大值 28
-            if steps is not None:
-                try:
-                    steps = min(int(steps), 28)
-                except (TypeError, ValueError):
-                    steps = 23
+            normalized_size = self._normalize_size(final_size)
+            if final_size and normalized_size is None:
+                return False, f"无效的图片尺寸: {str(final_size)[:50]}"
+            if normalized_size:
+                self.validate_dimensions(
+                    normalized_size[0], normalized_size[1], BESTNAI_CAPABILITIES
+                )
+            final_size = normalized_size
 
-            ref_fidelity = float(model_config.get("ref_fidelity", 1.0))
-            ref_strength = float(model_config.get("ref_strength", 1.0))
+            if sampler not in (None, ""):
+                try:
+                    sampler = self.validate_sampler(sampler, BESTNAI_CAPABILITIES)
+                except ValueError as exc:
+                    return False, str(exc)
+            else:
+                sampler = ""
+
+            steps = self.bounded_int(
+                steps,
+                default=23,
+                minimum=BESTNAI_CAPABILITIES.min_steps,
+                maximum=BESTNAI_CAPABILITIES.max_steps,
+                name="steps",
+            )
+            guidance_scale = self.bounded_float(
+                guidance_scale,
+                default=None,
+                minimum=BESTNAI_CAPABILITIES.min_scale,
+                maximum=BESTNAI_CAPABILITIES.max_scale,
+                name="scale",
+            )
+            cfg_value = self.bounded_float(
+                cfg_value,
+                default=None,
+                minimum=BESTNAI_CAPABILITIES.min_cfg_rescale,
+                maximum=BESTNAI_CAPABILITIES.max_cfg_rescale,
+                name="cfg_rescale",
+            )
+            ref_fidelity = self.bounded_float(
+                model_config.get("ref_fidelity", 1.0),
+                default=1.0,
+                minimum=BESTNAI_CAPABILITIES.min_reference_strength,
+                maximum=BESTNAI_CAPABILITIES.max_reference_strength,
+                name="ref_fidelity",
+            )
+            ref_strength = self.bounded_float(
+                model_config.get("ref_strength", 1.0),
+                default=1.0,
+                minimum=BESTNAI_CAPABILITIES.min_reference_strength,
+                maximum=BESTNAI_CAPABILITIES.max_reference_strength,
+                name="ref_strength",
+            )
+            seed = self.bounded_int(
+                seed,
+                default=-1,
+                minimum=-1,
+                maximum=4_294_967_295,
+                name="seed",
+            )
+
+            if ref_image and ref_mode:
+                if ref_image.startswith(("http://", "https://")):
+                    if not self.validate_http_url(ref_image):
+                        return False, "参考图 URL 格式无效"
+                else:
+                    valid, normalized_ref, _ = self.normalize_and_validate_base64_image(
+                        ref_image,
+                        capabilities=BESTNAI_CAPABILITIES,
+                        field_name="参考图",
+                    )
+                    if not valid:
+                        return False, normalized_ref
+                    ref_image = normalized_ref
 
             # 构建生成参数
             generation_params = self._build_generation_params(
@@ -151,19 +237,33 @@ class BestNAIProvider(BaseImageProvider):
                 ref_mode=ref_mode,
                 ref_fidelity=ref_fidelity,
                 ref_strength=ref_strength,
+                seed=seed,
             )
 
             # max_tokens 预算
-            max_tokens = model_config.get("max_tokens") or 100000
-            try:
-                max_tokens = int(max_tokens)
-            except (TypeError, ValueError):
-                max_tokens = 100000
+            max_tokens = self.bounded_int(
+                model_config.get("max_tokens"),
+                default=100000,
+                minimum=1024,
+                maximum=BESTNAI_CAPABILITIES.max_tokens,
+                name="max_tokens",
+            )
             if ref_image and ref_mode and max_tokens < 50000:
-                max_tokens = 100000
+                self._logger.warning(
+                    f"{self.log_prefix} (BestNAI) 参考图模式 max_tokens 过低，已调整为 50000"
+                )
+                max_tokens = 50000
 
             self._logger.info(
                 f"{self.log_prefix} (BestNAI) max_tokens={max_tokens} ref_mode={ref_mode}"
+            )
+
+            timeout_seconds = self.bounded_float(
+                model_config.get("timeout_seconds"),
+                default=120.0,
+                minimum=1.0,
+                maximum=600.0,
+                name="timeout_seconds",
             )
 
             payload = {
@@ -173,7 +273,11 @@ class BestNAIProvider(BaseImageProvider):
                 "messages": [
                     {
                         "role": "user",
-                        "content": json.dumps(generation_params, ensure_ascii=False),
+                        "content": json.dumps(
+                            generation_params,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        ),
                     }
                 ],
             }
@@ -184,50 +288,56 @@ class BestNAIProvider(BaseImageProvider):
             # api_key 仅放入 Authorization 头，不写入日志/异常；下方仅记录 url（不含 key）
             self._logger.info(f"{self.log_prefix} (BestNAI) 请求URL: {url}")
 
-            # 异步执行 HTTP 请求
+            # 异步执行同步 requests 请求。取消外层 asyncio Task 无法强制终止已启动的
+            # 工作线程，因此取消后仍等待线程在请求超时/完成时收尾，再释放并发槽位；
+            # 这仍不保证远端任务停止或不计费。
             proxy_mode = self.resolve_proxy_mode(model_config)
-            response = await asyncio.to_thread(
-                self._send_request, url, headers, payload, proxy_mode
-            )
+            worker_task = asyncio.create_task(asyncio.to_thread(
+                self._send_request,
+                url,
+                headers,
+                payload,
+                proxy_mode,
+                timeout_seconds,
+            ))
+            try:
+                response = await asyncio.shield(worker_task)
+            except asyncio.CancelledError:
+                response = None
+                while not worker_task.done():
+                    try:
+                        response = await asyncio.shield(worker_task)
+                    except asyncio.CancelledError:
+                        # Repeated cancellation must not release the provider slot
+                        # while the synchronous requests worker is still running.
+                        continue
+                    except BaseException:
+                        # Retrieve the worker result below so its exception is consumed.
+                        break
 
-            # 处理响应
-            if 300 <= response.status_code < 400:
-                location = response.headers.get("location", "")
-                self._logger.error(
-                    f"{self.log_prefix} (BestNAI) 重定向: status={response.status_code}, location={location}"
-                )
-                return False, f"HTTP {response.status_code}: 接口发生重定向，请检查 base_url"
+                if response is None:
+                    try:
+                        response = worker_task.result()
+                    except BaseException:
+                        # The caller already cancelled this operation; consume any
+                        # worker failure and preserve cancellation as the outcome.
+                        response = None
+                if response is not None:
+                    try:
+                        response.close()
+                    except Exception as exc:
+                        self._logger.warning(
+                            f"{self.log_prefix} (BestNAI) 取消后关闭响应失败: {exc}"
+                        )
+                raise
+            try:
+                return self._handle_response(response)
+            finally:
+                response.close()
 
-            if response.status_code != 200:
-                error_message = self._extract_error_message(response)
-                self._logger.error(
-                    f"{self.log_prefix} (BestNAI) HTTP错误 {response.status_code}: {error_message[:200]}"
-                )
-                return False, f"HTTP {response.status_code}: {error_message[:100]}"
-
-            # 解析返回内容
-            content_type = response.headers.get("content-type", "")
-            if "application/json" in content_type or response.text.strip().startswith("{"):
-                try:
-                    data = response.json()
-                except Exception:
-                    data = {}
-
-                image_value = self._extract_first_image(data)
-                if image_value:
-                    self._logger.info(f"{self.log_prefix} (BestNAI) 图片生成成功")
-                    return True, image_value
-
-                message = self._extract_error_message_from_payload(data) or "未返回图片数据"
-                self._logger.error(f"{self.log_prefix} (BestNAI) JSON响应无图片: {message}")
-                return False, message
-
-            image_base64 = base64.b64encode(response.content).decode('utf-8')
-            self._logger.info(
-                f"{self.log_prefix} (BestNAI) 图片生成成功，大小 {len(response.content)} bytes"
-            )
-            return True, image_base64
-
+        except ResponseLimitError as e:
+            self._logger.error(f"{self.log_prefix} (BestNAI) 响应过大: {e}")
+            return False, str(e)
         except requests.RequestException as e:
             self._logger.error(f"{self.log_prefix} (BestNAI) 网络异常: {e}")
             return False, f"网络请求失败: {str(e)}"
@@ -254,32 +364,98 @@ class BestNAIProvider(BaseImageProvider):
             setattr(self, attr_name, session)
         return session
 
-    def _send_request(self, url: str, headers: dict, payload: dict, proxy_mode: str = "auto"):
+    def _send_request(
+        self,
+        url: str,
+        headers: dict,
+        payload: dict,
+        proxy_mode: str = "auto",
+        timeout_seconds: float = 120.0,
+    ):
         """发送 HTTP 请求（同步，由 asyncio.to_thread 调用）。"""
         if proxy_mode == "direct":
-            return self._request_with_session(False, url, headers, payload)
+            return self._request_with_session(
+                False, url, headers, payload, timeout_seconds,
+            )
 
         if proxy_mode == "inherit":
-            return self._request_with_session(True, url, headers, payload)
+            return self._request_with_session(
+                True, url, headers, payload, timeout_seconds,
+            )
 
         if getattr(self, "_auto_proxy_direct_only", False):
-            return self._request_with_session(False, url, headers, payload)
+            return self._request_with_session(
+                False, url, headers, payload, timeout_seconds,
+            )
 
         try:
-            return self._request_with_session(True, url, headers, payload)
+            return self._request_with_session(
+                True, url, headers, payload, timeout_seconds,
+            )
         except requests.RequestException as exc:
             if not self._is_proxy_related_exception(exc):
                 raise
             self._auto_proxy_direct_only = True
             self._logger.warning(f"{self.log_prefix} (BestNAI) 代理失败，回退直连: {exc}")
-            return self._request_with_session(False, url, headers, payload)
+            return self._request_with_session(
+                False, url, headers, payload, timeout_seconds,
+            )
 
-    def _request_with_session(self, trust_env: bool, url: str, headers: dict, payload: dict):
+    def _request_with_session(
+        self,
+        trust_env: bool,
+        url: str,
+        headers: dict,
+        payload: dict,
+        timeout_seconds: float = 120.0,
+    ):
         session = self._get_session(trust_env=trust_env)
-        return session.post(
-            url=url, headers=headers, json=payload,
-            timeout=120, allow_redirects=False,
-        )
+        attr_name = "session" if trust_env else "direct_session"
+        response: Optional[requests.Response] = None
+        try:
+            response = session.post(
+                url=url,
+                headers=headers,
+                json=payload,
+                timeout=timeout_seconds,
+                allow_redirects=False,
+                stream=True,
+            )
+            self._buffer_response(response, BESTNAI_CAPABILITIES.max_response_bytes)
+            return response
+        except Exception:
+            if response is not None:
+                response.close()
+            raise
+        finally:
+            session.close()
+            setattr(self, attr_name, None)
+
+    @staticmethod
+    def _buffer_response(response: requests.Response, max_bytes: int) -> None:
+        """流式读取 requests 响应，避免服务端返回无限大的响应体。"""
+        content_length = response.headers.get("content-length")
+        if content_length:
+            try:
+                declared_length = int(content_length)
+            except (TypeError, ValueError):
+                declared_length = None
+            if declared_length is not None and declared_length > max_bytes:
+                raise ResponseLimitError(
+                    f"API 响应超过 {max_bytes // (1024 * 1024)} MiB 限制"
+                )
+
+        content = bytearray()
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            content.extend(chunk)
+            if len(content) > max_bytes:
+                raise ResponseLimitError(
+                    f"API 响应超过 {max_bytes // (1024 * 1024)} MiB 限制"
+                )
+        response._content = bytes(content)
+        response._content_consumed = True
 
     @staticmethod
     def _is_proxy_related_exception(exc: requests.RequestException) -> bool:
@@ -325,8 +501,14 @@ class BestNAIProvider(BaseImageProvider):
         guidance_scale, cfg_value, noise_schedule, nocache, final_size,
         extra_params, model="", ref_image="", ref_mode="",
         ref_fidelity: float = 1.0, ref_strength: float = 1.0,
+        seed: int = -1,
     ) -> Dict[str, Any]:
         """构造 NewAPI 绘图参数。"""
+        safe_extra_params = self.filter_extra_params(
+            extra_params,
+            self._RESERVED_EXTRA_PARAMS,
+            "BestNAI",
+        )
         combined_prompt = prompt.strip()
         if artist_prompt:
             combined_prompt = f"{artist_prompt.strip()}, {combined_prompt}"
@@ -350,14 +532,13 @@ class BestNAIProvider(BaseImageProvider):
             params["scale"] = guidance_scale
         if noise_schedule:
             params["noise_schedule"] = noise_schedule
-        if isinstance(cfg_value, (int, float)) and 0 <= float(cfg_value) <= 1 and "cfg_rescale" not in (extra_params or {}):
+        if isinstance(cfg_value, (int, float)) and 0 <= float(cfg_value) <= 1:
             params["cfg_rescale"] = float(cfg_value)
-        if nocache is not None and "nocache" not in (extra_params or {}):
+        if nocache is not None:
             params["nocache"] = nocache
-        if isinstance(extra_params, dict):
-            for key, value in extra_params.items():
-                if value not in (None, ""):
-                    params[key] = value
+        if seed >= 0:
+            params["seed"] = seed
+        params.update(safe_extra_params)
 
         # 图生图 / 参考模式
         if ref_image and ref_mode:
@@ -366,7 +547,7 @@ class BestNAIProvider(BaseImageProvider):
             else:
                 image_uri = self._to_data_uri(ref_image)
             if ref_mode == "i2i":
-                if params.get("size"):
+                if params.get("size") and not ref_image.startswith(("http://", "https://")):
                     ref_image = self._resize_to_match(ref_image, params["size"])
                     image_uri = self._to_data_uri(ref_image)
                 params["i2i"] = {"image": image_uri, "strength": 0.5, "noise": 0}
@@ -408,11 +589,16 @@ class BestNAIProvider(BaseImageProvider):
             return None
         if isinstance(size, (list, tuple)) and len(size) == 2:
             try:
-                return [int(size[0]), int(size[1])]
-            except (TypeError, ValueError):
+                dimensions = [float(size[0]), float(size[1])]
+                if not all(value.is_integer() and math.isfinite(value) for value in dimensions):
+                    return None
+                return [int(dimensions[0]), int(dimensions[1])]
+            except (TypeError, ValueError, OverflowError):
                 return None
 
         size_text = str(size).strip().lower().replace("×", "x")
+        if len(size_text) > 32:
+            return None
         size_aliases = {
             "竖": "832x1216", "竖图": "832x1216",
             "横": "1216x832", "横图": "1216x832",
@@ -433,42 +619,117 @@ class BestNAIProvider(BaseImageProvider):
             return f"data:image/png;base64,{b64}"
         if b64.startswith("UklGR"):
             return f"data:image/webp;base64,{b64}"
-        if b64.startswith("R0lGOD"):
-            return f"data:image/gif;base64,{b64}"
         return f"data:image/png;base64,{b64}"
 
     @staticmethod
     def _resize_to_match(b64_data: str, target_size: List[int]) -> str:
-        if not _HAS_PIL or not target_size or len(target_size) != 2:
+        if not target_size or len(target_size) != 2:
             return b64_data
         try:
-            raw = base64.b64decode(b64_data)
-            img = Image.open(io.BytesIO(raw))
-            tw, th = target_size[0], target_size[1]
-            iw, ih = img.size
-            if iw == tw and ih == th:
+            raw = base64.b64decode(b64_data, validate=True)
+            tw, th = int(target_size[0]), int(target_size[1])
+            BaseImageProvider.validate_dimensions(tw, th, BESTNAI_CAPABILITIES)
+            with Image.open(io.BytesIO(raw)) as source:
+                source.load()
+                iw, ih = source.size
+                if iw == tw and ih == th:
+                    return b64_data
+
+                target_ratio = tw / th
+                current_ratio = iw / ih
+                if current_ratio > target_ratio:
+                    crop_width = max(1, min(iw, round(ih * target_ratio)))
+                    left = (iw - crop_width) // 2
+                    crop_box = (left, 0, left + crop_width, ih)
+                else:
+                    crop_height = max(1, min(ih, round(iw / target_ratio)))
+                    top = (ih - crop_height) // 2
+                    crop_box = (0, top, iw, top + crop_height)
+
+                with source.crop(crop_box) as cropped:
+                    with cropped.resize(
+                        (tw, th), Image.Resampling.LANCZOS,
+                    ) as resized:
+                        buf = io.BytesIO()
+                        resized.save(buf, format="PNG")
+            resized_bytes = buf.getvalue()
+            valid, _ = BaseImageProvider.validate_image_bytes(
+                resized_bytes,
+                capabilities=BESTNAI_CAPABILITIES,
+                field_name="缩放后的参考图",
+            )
+            if not valid:
                 return b64_data
-            target_ratio = tw / th
-            current_ratio = iw / ih
-            if current_ratio > target_ratio:
-                new_h = th
-                new_w = int(iw * th / ih)
-            else:
-                new_w = tw
-                new_h = int(ih * tw / iw)
-            img = img.resize((new_w, new_h), Image.LANCZOS)
-            left = (new_w - tw) // 2
-            top = (new_h - th) // 2
-            img = img.crop((left, top, left + tw, top + th))
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            return base64.b64encode(buf.getvalue()).decode("utf-8")
+            return base64.b64encode(resized_bytes).decode("utf-8")
         except Exception:
             return b64_data
 
     # ================================================================
     # 响应解析
     # ================================================================
+
+    def _handle_response(self, response: requests.Response) -> Tuple[bool, str]:
+        if 300 <= response.status_code < 400:
+            location = response.headers.get("location", "")
+            self._logger.error(
+                f"{self.log_prefix} (BestNAI) 重定向: "
+                f"status={response.status_code}, location={location[:200]}"
+            )
+            return False, f"HTTP {response.status_code}: 接口发生重定向，请检查 base_url"
+
+        if response.status_code != 200:
+            error_message = self._extract_error_message(response)
+            self._logger.error(
+                f"{self.log_prefix} (BestNAI) HTTP错误 "
+                f"{response.status_code}: {error_message[:200]}"
+            )
+            return False, f"HTTP {response.status_code}: {error_message[:100]}"
+
+        content_type = response.headers.get("content-type", "").lower()
+        body = response.content or b""
+        looks_like_json = body.lstrip().startswith((b"{", b"["))
+        if "application/json" in content_type or "+json" in content_type or looks_like_json:
+            try:
+                data = response.json()
+            except Exception:
+                return False, "API 返回的 JSON 数据无效"
+
+            image_value = self._extract_first_image(data)
+            if image_value:
+                if image_value.startswith(("http://", "https://")):
+                    if not self.validate_http_url(image_value):
+                        return False, "API 返回的图片 URL 无效"
+                    self._logger.info(f"{self.log_prefix} (BestNAI) 图片链接生成成功")
+                    return True, image_value
+
+                valid, normalized_image, image_size = self.normalize_and_validate_base64_image(
+                    image_value,
+                    capabilities=BESTNAI_CAPABILITIES,
+                    field_name="生成图片",
+                )
+                if not valid:
+                    return False, normalized_image
+                self._logger.info(
+                    f"{self.log_prefix} (BestNAI) 图片生成成功，大小 {image_size} bytes"
+                )
+                return True, normalized_image
+
+            message = self._extract_error_message_from_payload(data) or "未返回图片数据"
+            self._logger.error(f"{self.log_prefix} (BestNAI) JSON响应无图片: {message[:200]}")
+            return False, message[:200]
+
+        valid, error = self.validate_image_bytes(
+            body,
+            capabilities=BESTNAI_CAPABILITIES,
+            field_name="生成图片",
+        )
+        if not valid:
+            return False, error
+        image_base64 = base64.b64encode(body).decode("ascii")
+        self._logger.info(
+            f"{self.log_prefix} (BestNAI) 图片生成成功，大小 {len(body)} bytes"
+        )
+        return True, image_base64
 
     @classmethod
     def _extract_first_image(cls, data: Dict[str, Any]) -> Optional[str]:

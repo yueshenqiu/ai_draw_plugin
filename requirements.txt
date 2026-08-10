@@ -1,5 +1,5 @@
-maibot-sdk>=2.0.0
-requests>=2.32.0
-aiohttp>=3.9.0
-Pillow>=10.0.0
-certifi>=2024.2.2
+maibot-sdk>=2.5.0,<3.0.0
+requests>=2.32.0,<3.0.0
+aiohttp>=3.9.0,<4.0.0
+Pillow>=10.0.0,<14.0.0
+certifi>=2024.2.2,<2030.0.0
