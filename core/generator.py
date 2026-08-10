@@ -210,6 +210,7 @@ async def generate_and_send(
                 # 真实回执进入账本，避免“取消后图片出现但无法撤回”。
 
         if send_ok:
+            send_ts = int(time.time())
             if sent_msg_id:
                 if cancelled_during_send:
                     deleted = await delete_tracked_message(
@@ -221,11 +222,15 @@ async def generate_and_send(
                             "保留账本供手动撤回"
                         )
                 else:
-                    send_ts = int(time.time())
                     schedule_auto_recall(
                         kwargs=kwargs or {}, after_ts=send_ts,
                         message_id=sent_msg_id,
                     )
+            else:
+                schedule_auto_recall(
+                    kwargs=kwargs or {}, after_ts=send_ts,
+                    message_id=None,
+                )
             if cancelled_during_send:
                 raise asyncio.CancelledError
             return True
@@ -326,19 +331,16 @@ async def send_image_result(
             msg_id = await send_fn(image_data, stream_id, group_id, user_id)
 
         normalized_msg_id = _normalize_message_id(msg_id)
-        if not normalized_msg_id:
-            plugin.ctx.logger.error("[发送] 图片发送未返回 message_id，不能确认发送成功")
-            await plugin.ctx.send.text("图片已处理完成，但未收到发送成功回执", stream_id)
-            return False, None
-
-        track_sent_message_id(
-            normalized_msg_id,
-            kwargs=kwargs or {},
-            stream_id=stream_id,
-            group_id=group_id,
-            user_id=user_id,
-        )
-        return True, normalized_msg_id
+        if normalized_msg_id:
+            track_sent_message_id(
+                normalized_msg_id,
+                kwargs=kwargs or {},
+                stream_id=stream_id,
+                group_id=group_id,
+                user_id=user_id,
+            )
+        # 发送调用没有抛异常即视为已提交，message_id 只用于精确撤回。
+        return True, normalized_msg_id or None
     except Exception as e:
         plugin.ctx.logger.error(f"[发送] 图片发送失败: {e}")
         await plugin.ctx.send.text("图片已处理完成，但发送失败了", stream_id)
@@ -1825,8 +1827,8 @@ def schedule_auto_recall(kwargs: dict = None, after_ts: int = 0, message_id: Opt
 
     Args:
         kwargs: 命令 kwargs
-        after_ts: 发送时间戳（为旧调用方保留，不再用于扫描历史消息）。
-        message_id: 发送 API 返回且已由本插件记录的精确 message_id。
+        after_ts: 发送时间戳（Unix 秒），在 message_id 不可用时作为历史匹配基准。
+        message_id: 发送 API 返回的精确 message_id（优先使用）。
     """
     plugin = get_plugin_instance()
     if not plugin:
@@ -1837,9 +1839,6 @@ def schedule_auto_recall(kwargs: dict = None, after_ts: int = 0, message_id: Opt
     stream_id = str(kwargs.get("stream_id", "") or "")
 
     normalized_msg_id = _normalize_message_id(message_id)
-    if not normalized_msg_id:
-        plugin.ctx.logger.warning("[自动撤回] 未取得 message_id，跳过调度")
-        return
 
     allowed_groups = getattr(plugin.config.auto_recall, "allowed_groups", []) or []
     allowed_keys = {str(item).strip() for item in allowed_groups if str(item).strip()}
@@ -1861,12 +1860,13 @@ def schedule_auto_recall(kwargs: dict = None, after_ts: int = 0, message_id: Opt
         kwargs, stream_id=stream_id, group_id=group_id, user_id=user_id,
     )
     tracking_key = tracking_context["session_key"]
-    if not is_tracked_message_id(normalized_msg_id, tracking_key=tracking_key):
+    if normalized_msg_id and not is_tracked_message_id(
+        normalized_msg_id, tracking_key=tracking_key,
+    ):
         plugin.ctx.logger.warning(
             f"[自动撤回] message_id 未由本插件在当前会话记录，跳过: {normalized_msg_id}"
         )
         return
-
     task = asyncio.create_task(auto_recall_task(
         stream_id=stream_id, group_id=group_id, user_id=user_id,
         after_ts=after_ts, message_id=normalized_msg_id,
@@ -1875,12 +1875,78 @@ def schedule_auto_recall(kwargs: dict = None, after_ts: int = 0, message_id: Opt
     plugin._track_task(task)
 
 
+async def _recall_from_recent_history(
+    stream_id: str,
+    group_id: str,
+    user_id: str,
+    after_ts: int,
+    tracking_key: str,
+) -> bool:
+    """从最近历史中定位本 bot 的目标图片消息并撤回。"""
+    plugin = get_plugin_instance()
+    if not plugin:
+        return False
+
+    messages = await fetch_recent_messages(
+        stream_id, limit=10, group_id=group_id, user_id=user_id,
+    )
+    if not messages:
+        plugin.ctx.logger.info(f"[自动撤回] 未获取到消息 stream={stream_id}")
+        return False
+
+    candidates = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        msg_id = _normalize_message_id(msg.get("message_id"))
+        if not msg_id:
+            continue
+        msg_time = int(msg.get("time", 0) or 0)
+        if after_ts and msg_time > 0 and msg_time < after_ts - 2:
+            continue
+        if is_ai_draw_bot_message(msg):
+            candidates.append((msg_time, msg_id))
+
+    if not candidates:
+        plugin.ctx.logger.info(f"[自动撤回] 未找到匹配消息 (after_ts={after_ts})")
+        return False
+
+    if any(item[0] > 0 for item in candidates):
+        candidates.sort(key=lambda item: (
+            abs(item[0] - after_ts),
+            0 if item[0] >= after_ts else 1,
+        ))
+    target_time, target_id = candidates[0]
+
+    try:
+        try:
+            api_message_id: Any = int(target_id)
+        except ValueError:
+            api_message_id = target_id
+        response = await _napcat_action("delete_msg", {"message_id": api_message_id})
+    except Exception as exc:
+        plugin.ctx.logger.error(f"[自动撤回] 撤回 {target_id} 失败: {exc}")
+        return False
+    if not response or response.get("retcode") not in (0, 1, None) or (
+        response.get("status") == "failed"
+    ):
+        plugin.ctx.logger.error(f"[自动撤回] 撤回 {target_id} 返回异常: {response}")
+        return False
+
+    untrack_message_id(target_id)
+    plugin.ctx.logger.info(
+        f"[自动撤回] 历史定位撤回成功: {target_id} "
+        f"(after_ts={after_ts}, msg_time={target_time})"
+    )
+    return True
+
+
 async def auto_recall_task(stream_id: str = "", group_id: str = "", user_id: str = "",
                          after_ts: int = 0, message_id: Optional[str] = None,
                          tracking_key: str = ""):
     """延时后撤回本图消息。
 
-    只使用本插件发送成功后记录的精确 message_id；不会扫描历史消息猜测目标。
+    优先使用精确 message_id；必要时从最近历史中定位目标消息。
     """
     plugin = get_plugin_instance()
     if not plugin:
@@ -1892,17 +1958,22 @@ async def auto_recall_task(stream_id: str = "", group_id: str = "", user_id: str
         await asyncio.sleep(max(0, delay + jitter))
 
         normalized_msg_id = _normalize_message_id(message_id)
-        if not normalized_msg_id or not is_tracked_message_id(
+        if normalized_msg_id and is_tracked_message_id(
             normalized_msg_id, tracking_key=tracking_key,
         ):
-            plugin.ctx.logger.info("[自动撤回] 消息已撤回或不再受本插件追踪，跳过")
-            return
+            deleted = await _delete_tracked_message_for_key(
+                normalized_msg_id, tracking_key,
+            )
+            if deleted:
+                plugin.ctx.logger.info(f"[自动撤回] 精确撤回成功: {normalized_msg_id}")
+                return
+            plugin.ctx.logger.warning(
+                f"[自动撤回] 精确撤回失败: {normalized_msg_id}，改用历史定位"
+            )
 
-        deleted = await _delete_tracked_message_for_key(normalized_msg_id, tracking_key)
-        if deleted:
-            plugin.ctx.logger.info(f"[自动撤回] 精确撤回成功: {normalized_msg_id}")
-        else:
-            plugin.ctx.logger.error(f"[自动撤回] 精确撤回失败: {normalized_msg_id}")
+        await _recall_from_recent_history(
+            stream_id, group_id, user_id, after_ts, tracking_key,
+        )
     except asyncio.CancelledError:
         pass
     except Exception as e:
