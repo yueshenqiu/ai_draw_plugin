@@ -180,62 +180,20 @@ async def generate_and_send(
                 group_id=info["chat_id"] if info.get("chat_type") == "group" else "",
                 user_id=info["user_id"] if info.get("chat_type") == "private" else "",
             )
-        send_task = asyncio.create_task(
-            send_image_result(
-                result, prompt_text or prompt, stream_id,
-                group_id=(
-                    info["chat_id"]
-                    if info.get("chat_type") == "group"
-                    else ""
-                ),
-                user_id=info.get("user_id", ""),
-                kwargs=kwargs or {},
-            ),
-            name="ai-draw-send-image",
+        # 保持 2.3.7 的发送时序：生成完成后直接交给适配器发送，
+        # 发送函数返回后再进入撤回调度。队列只负责任务编排，不介入发送回执。
+        send_ok, sent_msg_id = await send_image_result(
+            result, prompt_text or prompt, stream_id,
+            group_id=info["chat_id"] if info.get("chat_type") == "group" else "",
+            user_id=info.get("user_id", ""),
+            kwargs=kwargs or {},
         )
-        cancelled_during_send = False
-        while True:
-            try:
-                send_ok, sent_msg_id = await asyncio.shield(send_task)
-                break
-            except asyncio.CancelledError:
-                if send_task.cancelled():
-                    raise
-                cancelled_during_send = True
-                if send_task.done():
-                    # 取消与回执在同一轮事件循环相遇时，也必须按取消路径撤回。
-                    send_ok, sent_msg_id = send_task.result()
-                    break
-                # 适配器可能已经接收发送动作。即使卸载流程再次 cancel，仍等待
-                # 真实回执进入账本，避免“取消后图片出现但无法撤回”。
-
         if send_ok:
             send_ts = int(time.time())
-            if sent_msg_id:
-                if cancelled_during_send:
-                    deleted = await delete_tracked_message(
-                        sent_msg_id, kwargs=kwargs or {},
-                    )
-                    if not deleted:
-                        plugin.ctx.logger.warning(
-                            "[生图] 取消期间图片已发出但立即撤回失败，"
-                            "保留账本供手动撤回"
-                        )
-                else:
-                    schedule_auto_recall(
-                        kwargs=kwargs or {}, after_ts=send_ts,
-                        message_id=sent_msg_id,
-                    )
-            else:
-                schedule_auto_recall(
-                    kwargs=kwargs or {}, after_ts=send_ts,
-                    message_id=None,
-                )
-            if cancelled_during_send:
-                raise asyncio.CancelledError
+            schedule_auto_recall(
+                kwargs=kwargs or {}, after_ts=send_ts, message_id=sent_msg_id,
+            )
             return True
-        if cancelled_during_send:
-            raise asyncio.CancelledError
         return False
     except asyncio.CancelledError:
         raise
@@ -339,7 +297,7 @@ async def send_image_result(
                 group_id=group_id,
                 user_id=user_id,
             )
-        # 发送调用没有抛异常即视为已提交，message_id 只用于精确撤回。
+        # 与 2.3.7 一致：发送调用未抛异常即视为已提交，message_id 只供撤回使用。
         return True, normalized_msg_id or None
     except Exception as e:
         plugin.ctx.logger.error(f"[发送] 图片发送失败: {e}")
@@ -565,7 +523,6 @@ async def _napcat_http_call(action: str, params: dict, timeout: int = 60) -> Opt
     慢环境下 HTTP 直连超时预算更长（默认 60s），避免回执超时丢失 message_id。
     """
     import aiohttp
-    from .http_client import build_ssl_context
 
     plugin = get_plugin_instance()
     if not plugin:
@@ -587,19 +544,7 @@ async def _napcat_http_call(action: str, params: dict, timeout: int = 60) -> Opt
     if token:
         headers["Authorization"] = f"Bearer {token}"
     try:
-        allowed_addresses = (
-            ("127.0.0.1", "::1") if host == "localhost" else (_canonical_ip(host) or host,)
-        )
-        connector = aiohttp.TCPConnector(
-            resolver=_PinnedResolver(host, allowed_addresses),
-            use_dns_cache=False,
-            force_close=True,
-            ssl=build_ssl_context(),
-        )
-        async with aiohttp.ClientSession(
-            connector=connector,
-            trust_env=False,
-        ) as session:
+        async with aiohttp.ClientSession() as session:
             async with session.post(
                 url, json=params, headers=headers,
                 timeout=aiohttp.ClientTimeout(total=timeout),
