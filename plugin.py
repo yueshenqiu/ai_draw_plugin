@@ -110,7 +110,7 @@ class PluginSectionConfig(PluginConfigBase):
         ),
     )
     config_version: str = Field(
-        default="4.0.1", description="配置版本号",
+        default="2.4.1", description="配置版本号",
         json_schema_extra=_ui("配置版本", order=99, hidden=True, disabled=True),
     )
 
@@ -609,7 +609,7 @@ class AiDrawPlugin(MaiBotPlugin):
         set_plugin_instance(self)
 
         self.ctx.logger.info(
-            f"ai_draw_plugin v4.0.1 已加载，共 {len(self._loaded_models)} 个模型配置"
+            f"ai_draw_plugin v2.4.1 已加载，共 {len(self._loaded_models)} 个模型配置"
         )
 
     async def on_unload(self) -> None:
