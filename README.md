@@ -281,6 +281,12 @@ ai_draw_plugin/
 3. 在 `providers/__init__.py` 的注册表中添加映射
 4. 在 `config.toml` 新增模型段，`format` 填对应 provider 标识
 
+## 2.4.3 变更摘要
+
+- 修复 `/ad c off` 对 LLM Tool 自动撤回不生效的问题，并在延时撤回前再次检查会话开关。
+- 修复 LLM Tool 丢失会话上下文导致 `/ad s` 尺寸设置不生效的问题。
+- 为 LLM Tool 增加 portrait、landscape、square 尺寸选择与合法值校验。
+
 ## 2.4.2 变更摘要
 
 - 重写图片发送逻辑，统一发送时序与 HTTP 直连行为。

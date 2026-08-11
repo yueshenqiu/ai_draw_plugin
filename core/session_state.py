@@ -247,27 +247,47 @@ class SessionStateManager:
 
     # ==================== 尺寸选择 ====================
 
-    def get_selected_size(self, platform: str, chat_id: str) -> Optional[str]:
+    def get_selected_size(self, platform: str, chat_id: str,
+                          stream_id: str = "") -> Optional[str]:
         key = self._make_key(platform, chat_id)
-        return self._selected_sizes.get(key)
+        if key in self._selected_sizes:
+            return self._selected_sizes[key]
+        stream_key = f"stream:{str(stream_id or '').strip()}"
+        if stream_id and stream_key in self._selected_sizes:
+            return self._selected_sizes[stream_key]
+        return None
 
-    def set_selected_size(self, platform: str, chat_id: str, size: str):
+    def set_selected_size(self, platform: str, chat_id: str, size: str,
+                          stream_id: str = ""):
         key = self._make_key(platform, chat_id)
         self._selected_sizes[key] = size
+        stream_id = str(stream_id or "").strip()
+        if stream_id:
+            self._selected_sizes[f"stream:{stream_id}"] = size
         self._trim_session_mapping(self._selected_sizes)
         _logger.info(f"[ai_draw] 会话 {key} 已切换尺寸: {size}")
 
     # ==================== 自动撤回 ====================
 
-    def is_recall_enabled(self, platform: str, chat_id: str, get_config: Callable) -> bool:
+    def is_recall_enabled(self, platform: str, chat_id: str, get_config: Callable,
+                          stream_id: str = "") -> bool:
         key = self._make_key(platform, chat_id)
         if key in self._recall_enabled:
             return self._recall_enabled[key]
+        # Tool 调用可能只携带 stream_id，无法还原原始 message.platform。
+        # /ad c 设置时会同时保存该别名，避免回退到全局默认值。
+        stream_key = f"stream:{str(stream_id or '').strip()}"
+        if stream_id and stream_key in self._recall_enabled:
+            return self._recall_enabled[stream_key]
         return get_config("auto_recall.enabled", False)
 
-    def set_recall_enabled(self, platform: str, chat_id: str, enabled: bool):
+    def set_recall_enabled(self, platform: str, chat_id: str, enabled: bool,
+                           stream_id: str = ""):
         key = self._make_key(platform, chat_id)
         self._recall_enabled[key] = enabled
+        stream_id = str(stream_id or "").strip()
+        if stream_id:
+            self._recall_enabled[f"stream:{stream_id}"] = enabled
         self._trim_session_mapping(self._recall_enabled)
         _logger.info(f"[ai_draw] 会话 {key} 自动撤回已{'开启' if enabled else '关闭'}")
 

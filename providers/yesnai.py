@@ -50,9 +50,7 @@ class YesNAIProvider(BaseImageProvider):
     def __init__(self, logger, log_prefix: str = ""):
         super().__init__(logger, log_prefix)
 
-    # ================================================================
     # Public API
-    # ================================================================
 
     async def generate(
         self,
@@ -365,9 +363,7 @@ class YesNAIProvider(BaseImageProvider):
                 )
         return bytes(content)
 
-    # ================================================================
     # 参考图参数构建
-    # ================================================================
 
     def _build_ref_params(
         self,
@@ -415,9 +411,7 @@ class YesNAIProvider(BaseImageProvider):
         )
         return "generate", {}
 
-    # ================================================================
     # 响应解析
-    # ================================================================
 
     def _parse_response(self, data: Any) -> Tuple[bool, str]:
         """解析 YesNovelAI 响应，返回 (成功, 图片base64或错误信息)。"""
@@ -471,9 +465,7 @@ class YesNAIProvider(BaseImageProvider):
         )
         return True, normalized_image
 
-    # ================================================================
     # 工具方法
-    # ================================================================
 
     @staticmethod
     def _strip_data_uri(image: str) -> str:

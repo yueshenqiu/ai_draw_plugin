@@ -222,9 +222,7 @@ def _format_duration(seconds: float) -> str:
     return f"{hours} 小时 {minutes} 分"
 
 
-# ================================================================
 # /ad help — 帮助
-# ================================================================
 
 async def handle_ad_help(stream_id: str) -> tuple:
     plugin = get_plugin_instance()
@@ -358,9 +356,7 @@ async def handle_ad_context_reset(kwargs: dict) -> tuple:
     return True, message, 2
 
 
-# ================================================================
 # /ad on|off — 插件总开关
-# ================================================================
 
 async def handle_ad_plugin_toggle(action: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -390,9 +386,7 @@ async def handle_ad_plugin_toggle(action: str, kwargs: dict) -> tuple:
     return False, "未知操作", 1
 
 
-# ================================================================
 # /ad c on|off — 自动撤回开关
-# ================================================================
 
 async def handle_ad_recall_control(action: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -413,20 +407,22 @@ async def handle_ad_recall_control(action: str, kwargs: dict) -> tuple:
         return False, err, 1
 
     if action == "on":
-        plugin._session_state.set_recall_enabled(info["platform"], info["chat_id"], True)
+        plugin._session_state.set_recall_enabled(
+            info["platform"], info["chat_id"], True, stream_id=stream_id,
+        )
         delay = plugin.config.auto_recall.delay_seconds
         await plugin.ctx.send.text(f"自动撤回已开启，将在 {delay}s 后撤回图片", stream_id)
         return True, "自动撤回已开启", 2
     elif action == "off":
-        plugin._session_state.set_recall_enabled(info["platform"], info["chat_id"], False)
+        plugin._session_state.set_recall_enabled(
+            info["platform"], info["chat_id"], False, stream_id=stream_id,
+        )
         await plugin.ctx.send.text("自动撤回已关闭", stream_id)
         return True, "自动撤回已关闭", 2
     return False, "未知操作", 1
 
 
-# ================================================================
 # /ad nsfw <on|off> — NSFW 过滤开关
-# ================================================================
 
 async def handle_ad_nsfw_control(action: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -463,9 +459,7 @@ async def handle_ad_nsfw_control(action: str, kwargs: dict) -> tuple:
     return False, "用法: /ad nsfw <on|off>", 1
 
 
-# ================================================================
 # /ad send <d|f> — 发送方式开关（d=直发 f=合并转发）
-# ================================================================
 
 async def handle_ad_send_mode(action: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -502,9 +496,7 @@ async def handle_ad_send_mode(action: str, kwargs: dict) -> tuple:
     return False, "用法: /ad send <d|f>", 1
 
 
-# ================================================================
 # /ad pt <on|off> — 提示词显示开关
-# ================================================================
 
 async def handle_ad_prompt_show(action: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -533,9 +525,7 @@ async def handle_ad_prompt_show(action: str, kwargs: dict) -> tuple:
     return False, "用法: /ad pt <on|off>", 1
 
 
-# ================================================================
 # /ad st|sp — 管理员模式开关
-# ================================================================
 
 async def handle_ad_admin_toggle(action: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -557,9 +547,7 @@ async def handle_ad_admin_toggle(action: str, kwargs: dict) -> tuple:
     return False, "用法: /ad st|sp", 1
 
 
-# ================================================================
 # /ad w <模型ID> — 切换模型  /ad m — 列出模型
-# ================================================================
 
 async def handle_ad_switch_model(param: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -615,9 +603,7 @@ async def handle_ad_switch_model(param: str, kwargs: dict) -> tuple:
     return False, "未知模型", 1
 
 
-# ================================================================
 # /ad s <尺寸> — 切换尺寸
-# ================================================================
 
 async def handle_ad_switch_size(param: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -629,7 +615,9 @@ async def handle_ad_switch_size(param: str, kwargs: dict) -> tuple:
         return False, "没有权限", 1
 
     if not param:
-        current = plugin._session_state.get_selected_size(info["platform"], info["chat_id"]) or "竖图"
+        current = plugin._session_state.get_selected_size(
+            info["platform"], info["chat_id"], stream_id=stream_id,
+        ) or "竖图"
         available = ", ".join(SIZE_MAPPINGS.keys())
         await plugin.ctx.send.text(f"当前尺寸: {current}\n可用: {available}", stream_id)
         return True, "已查询尺寸", 1
@@ -639,14 +627,14 @@ async def handle_ad_switch_size(param: str, kwargs: dict) -> tuple:
         await plugin.ctx.send.text(f"未知尺寸: {param}\n可用: 竖/横/方", stream_id)
         return False, "未知尺寸", 1
 
-    plugin._session_state.set_selected_size(info["platform"], info["chat_id"], size)
+    plugin._session_state.set_selected_size(
+        info["platform"], info["chat_id"], size, stream_id=stream_id,
+    )
     await plugin.ctx.send.text(f"已切换尺寸: {param} ({size})", stream_id)
     return True, f"已切换尺寸: {size}", 2
 
 
-# ================================================================
 # /ad art <序号> — 切换风格预设（画师串）
-# ================================================================
 
 async def handle_ad_switch_artist(param: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -698,9 +686,7 @@ async def handle_ad_switch_artist(param: str, kwargs: dict) -> tuple:
     return True, f"已切换风格预设: #{idx}", 2
 
 
-# ================================================================
 # /ad 撤回 — 手动撤回
-# ================================================================
 
 async def handle_ad_manual_recall(kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -730,9 +716,7 @@ async def handle_ad_manual_recall(kwargs: dict) -> tuple:
     return True, "撤回完成", 1
 
 
-# ================================================================
 # /ad y <名称> — 引用图片 + 提示词预设 → 图生图
-# ================================================================
 
 _styles_cache: Optional[dict] = None
 
@@ -870,9 +854,7 @@ async def handle_ad_style(style_name: str, kwargs: dict) -> tuple:
     return True, message, 2
 
 
-# ================================================================
 # /ad0 <tags> — 直接 tag 生图
-# ================================================================
 
 async def handle_dr0_ref_draw(mode: str, tags: str, kwargs: dict) -> tuple:
     """直接参考生图：/ad0 rh|r|h|t <英文标签> — 跳过 LLM，直传参考图+标签"""
@@ -1015,9 +997,7 @@ async def handle_dr0_draw(description: str, kwargs: dict) -> tuple:
     return True, message, 2
 
 
-# ================================================================
 # /ad r|h|rh|hr|t <描述> — 参考模式生图
-# ================================================================
 
 async def handle_ad_ref_draw(mode: str, description: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -1073,9 +1053,7 @@ async def handle_ad_ref_draw(mode: str, description: str, kwargs: dict) -> tuple
     return True, message, 2
 
 
-# ================================================================
 # /ad <描述> — LLM 提示词 → 生图
-# ================================================================
 
 async def handle_ad_draw(description: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -1107,9 +1085,31 @@ async def handle_ad_draw(description: str, kwargs: dict) -> tuple:
     return True, message, 2
 
 
-# ================================================================
 # Tool: LLM 触发生图
-# ================================================================
+
+_TOOL_SIZE_ALIASES = {
+    "portrait": "832x1216",
+    "vertical": "832x1216",
+    "landscape": "1216x832",
+    "horizontal": "1216x832",
+    "square": "1024x1024",
+    "832x1216": "832x1216",
+    "1216x832": "1216x832",
+    "1024x1024": "1024x1024",
+}
+
+
+def _normalize_tool_size(size: str) -> tuple[str, Optional[str]]:
+    value = str(size or "").strip().lower().replace("×", "x")
+    if not value or value in {"auto", "default", "自动", "默认"}:
+        return "", None
+    normalized = SIZE_MAPPINGS.get(value) or _TOOL_SIZE_ALIASES.get(value)
+    if normalized:
+        return normalized, None
+    return "", (
+        f"不支持的图片尺寸: {str(size)[:50]}。"
+        "可用值: portrait/832x1216、landscape/1216x832、square/1024x1024"
+    )
 
 async def handle_ad_web_draw(description: str, size: str, kwargs: dict) -> dict:
     plugin = get_plugin_instance()
@@ -1128,11 +1128,15 @@ async def handle_ad_web_draw(description: str, size: str, kwargs: dict) -> dict:
     if not raw_description:
         return {"success": False, "message": "图片描述为空"}
 
+    normalized_size, size_error = _normalize_tool_size(size)
+    if size_error:
+        return {"success": False, "message": size_error}
+
     job, message = await _enqueue_draw_job(
         kwargs,
         _short_job_label("Tool 生图", raw_description),
         lambda job_kwargs: ad_workflow(
-            raw_description, job_kwargs, is_action=True, size=size,
+            raw_description, job_kwargs, is_action=True, size=normalized_size,
         ),
     )
     if not job:
@@ -1146,9 +1150,7 @@ async def handle_ad_web_draw(description: str, size: str, kwargs: dict) -> dict:
     }
 
 
-# ================================================================
 # 核心工作流：描述 → LLM 提示词 → 图片 → 发送
-# ================================================================
 
 async def ad_workflow(
     description: str,
@@ -1330,9 +1332,7 @@ async def ad_workflow(
     return bool(sent)
 
 
-# ================================================================
 # 内部辅助函数
-# ================================================================
 
 def _check_ref_mode_capability(model_config: dict, ref_mode: str) -> tuple:
     """在调用 LLM/生图 API 前确认当前 Provider 声明支持对应参考能力。"""
@@ -1748,4 +1748,3 @@ async def _generate_random_description(
         plugin._session_state.add_recent_random_scene(stream_id, candidate, limit=5)
         return candidate
     return None
-

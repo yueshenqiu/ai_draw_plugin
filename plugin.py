@@ -21,9 +21,7 @@ from .core.job_manager import JobManager
 from .core.session_state import session_state
 
 
-# ================================================================
 # Config Models（适配新 [models.modelX] 结构）
-# ================================================================
 
 def _ui(label: str, *, hint: str = "", order: int = 0, **extra: Any) -> Dict[str, Any]:
     """构造 WebUI 配置项元数据。
@@ -110,7 +108,7 @@ class PluginSectionConfig(PluginConfigBase):
         ),
     )
     config_version: str = Field(
-        default="2.4.2", description="配置版本号",
+        default="2.4.3", description="配置版本号",
         json_schema_extra=_ui("配置版本", order=99, hidden=True, disabled=True),
     )
 
@@ -547,9 +545,7 @@ class AiDrawPluginConfig(PluginConfigBase):
     models: ModelsSectionConfig = Field(default_factory=ModelsSectionConfig)
 
 
-# ================================================================
 # Plugin Class
-# ================================================================
 
 class AiDrawPlugin(MaiBotPlugin):
     """AI Draw 图片生成插件，命令前缀 /ad（AI Draw）"""
@@ -564,9 +560,7 @@ class AiDrawPlugin(MaiBotPlugin):
     SIZE_MAPPINGS: ClassVar[dict] = SIZE_MAPPINGS
     BESTNAI_MODEL_IDS: ClassVar[list] = BESTNAI_MODEL_IDS
 
-    # ================================================================
     # Lifecycle
-    # ================================================================
 
     async def on_load(self) -> None:
         import importlib
@@ -609,7 +603,7 @@ class AiDrawPlugin(MaiBotPlugin):
         set_plugin_instance(self)
 
         self.ctx.logger.info(
-            f"ai_draw_plugin v2.4.2 已加载，共 {len(self._loaded_models)} 个模型配置"
+            f"ai_draw_plugin v2.4.3 已加载，共 {len(self._loaded_models)} 个模型配置"
         )
 
     async def on_unload(self) -> None:
@@ -661,9 +655,7 @@ class AiDrawPlugin(MaiBotPlugin):
         except Exception:
             pass
 
-    # ================================================================
     # Config helpers
-    # ================================================================
 
     def _load_raw_models_config(self) -> dict:
         """直接从 TOML 文件读取 [models] 原始配置（绕过 PluginConfigBase 的字段过滤）。
@@ -719,9 +711,7 @@ class AiDrawPlugin(MaiBotPlugin):
             return obj
         return get_config
 
-    # ================================================================
     # Session info
-    # ================================================================
 
     def _extract_session_info(self, kwargs: dict) -> dict:
         message = kwargs.get("message", {})
@@ -753,9 +743,7 @@ class AiDrawPlugin(MaiBotPlugin):
             return f"stream:{stream_id}"
         return f"{platform}:unknown:{info['user_id'] or 'unknown'}"
 
-    # ================================================================
     # Permission
-    # ================================================================
 
     def _check_user_permission_from_kwargs(self, kwargs: dict) -> bool:
         info = self._extract_session_info(kwargs)
@@ -763,9 +751,7 @@ class AiDrawPlugin(MaiBotPlugin):
             info["platform"], info["chat_id"], info["user_id"], self._get_config_callable(),
         )
 
-    # ================================================================
     # Model config resolution
-    # ================================================================
 
     def _get_model_config_from_kwargs(self, kwargs: dict, apply_artist_preset: bool = True) -> dict:
         """构建合并后的模型配置字典（从 [models.modelX] 中获取完整配置）。
@@ -816,7 +802,10 @@ class AiDrawPlugin(MaiBotPlugin):
 
         # Size selection
         if info["chat_id"]:
-            selected_size = self._session_state.get_selected_size(info["platform"], info["chat_id"])
+            selected_size = self._session_state.get_selected_size(
+                info["platform"], info["chat_id"],
+                stream_id=str(kwargs.get("stream_id", "") or ""),
+            )
             if selected_size:
                 base["size_preset"] = selected_size
                 base["nai_size"] = selected_size
@@ -844,9 +833,7 @@ class AiDrawPlugin(MaiBotPlugin):
                 return mid
         return None
 
-    # ================================================================
     # Task tracking
-    # ================================================================
 
     def _track_task(self, task: asyncio.Task) -> None:
         self._pending_tasks.append(task)
@@ -874,13 +861,20 @@ class AiDrawPlugin(MaiBotPlugin):
         brief_description="生成图片、自拍、照片。用于画图、自拍、拍照、发照片等一切需要生成图像的场景。",
         detailed_description=(
             "使用 BestNAI / NovelAI 根据描述生成二次元插画。\n"
-            "参数：description（必填，关键词列表，空格分隔）、size（可选，图片尺寸）"
+            "参数：description（必填，关键词列表，空格分隔）；size（可选）。\n"
+            "size 只能选择 portrait/832x1216（竖图，人物全身或半身）、"
+            "landscape/1216x832（横图，多人物或宽场景）、"
+            "square/1024x1024（方图，头像或居中构图）。"
+            "根据画面构图主动选择；不确定或需要沿用当前会话设置时省略 size。"
         ),
         parameters=[
             ToolParameterInfo(name="description", param_type=ToolParamType.STRING,
                               description="画面关键词列表，空格分隔。禁止完整句子。", required=True),
             ToolParameterInfo(name="size", param_type=ToolParamType.STRING,
-                              description="图片尺寸（默认从配置获取）", required=False),
+                              description=(
+                                  "可选：portrait、landscape、square，分别对应 "
+                                  "832x1216、1216x832、1024x1024；省略则沿用会话尺寸"
+                              ), required=False),
         ],
     )
     async def handle_ai_draw(self, description: str = "", size: str = "", **kwargs) -> dict:
@@ -1030,9 +1024,7 @@ class AiDrawPlugin(MaiBotPlugin):
         return await handle_ad_draw((matched.get("description") or "").strip(), kwargs)
 
 
-# ================================================================
 # Factory
-# ================================================================
 
 def create_plugin():
     return AiDrawPlugin()

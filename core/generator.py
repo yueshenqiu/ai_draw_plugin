@@ -105,9 +105,7 @@ def _prepare_image_file(image_base64: str) -> str:
 
 
 
-# ================================================================
 # 模型配置解析
-# ================================================================
 
 def load_models_config(raw_config: dict) -> Dict[str, Dict[str, Any]]:
     """从 [models] section 加载所有模型配置。
@@ -144,9 +142,7 @@ def get_model_config(models: Dict[str, dict], model_id: str) -> Optional[Dict[st
     return None
 
 
-# ================================================================
 # 图片生成编排
-# ================================================================
 
 async def generate_and_send(
     prompt: str,
@@ -680,9 +676,7 @@ def _extract_message_id_from_response(resp) -> Optional[str]:
     return None
 
 
-# ================================================================
 # 消息获取与识别
-# ================================================================
 
 def extract_text_from_napcat_message(msg: dict) -> str:
     segments = msg.get("message", msg.get("raw_message", []))
@@ -1551,9 +1545,7 @@ def extract_image_from_message(msg: dict) -> Optional[str]:
     return None
 
 
-# ================================================================
 # 会话信息提取
-# ================================================================
 
 def get_session_info_from_kwargs(kwargs: dict) -> dict:
     """从 kwargs 提取 session 信息。"""
@@ -1576,9 +1568,7 @@ def get_session_info_from_kwargs(kwargs: dict) -> dict:
     return {"platform": "", "chat_id": chat_id, "user_id": user_id, "chat_type": chat_type}
 
 
-# ================================================================
 # 本插件发送消息 ID 追踪（自动/手动撤回的唯一可信来源）
-# ================================================================
 
 def _normalize_message_id(message_id: Any) -> str:
     normalized = str(message_id or "").strip()
@@ -1763,9 +1753,7 @@ async def delete_tracked_message(message_id: Any, kwargs: Optional[dict] = None)
     return await _delete_tracked_message_for_key(message_id, context["session_key"])
 
 
-# ================================================================
 # 自动撤回
-# ================================================================
 
 def schedule_auto_recall(kwargs: dict = None, after_ts: int = 0, message_id: Optional[str] = None):
     """启动自动撤回后台任务。
@@ -1796,6 +1784,7 @@ def schedule_auto_recall(kwargs: dict = None, after_ts: int = 0, message_id: Opt
 
     if not plugin._session_state.is_recall_enabled(
         info["platform"], info["chat_id"], plugin._get_config_callable(),
+        stream_id=stream_id,
     ):
         return
 
@@ -1814,6 +1803,7 @@ def schedule_auto_recall(kwargs: dict = None, after_ts: int = 0, message_id: Opt
         return
     task = asyncio.create_task(auto_recall_task(
         stream_id=stream_id, group_id=group_id, user_id=user_id,
+        platform=info["platform"], chat_id=info["chat_id"],
         after_ts=after_ts, message_id=normalized_msg_id,
         tracking_key=tracking_key,
     ))
@@ -1887,6 +1877,7 @@ async def _recall_from_recent_history(
 
 
 async def auto_recall_task(stream_id: str = "", group_id: str = "", user_id: str = "",
+                         platform: str = "", chat_id: str = "",
                          after_ts: int = 0, message_id: Optional[str] = None,
                          tracking_key: str = ""):
     """延时后撤回本图消息。
@@ -1901,6 +1892,13 @@ async def auto_recall_task(stream_id: str = "", group_id: str = "", user_id: str
         delay = max(0, float(plugin.config.auto_recall.delay_seconds))
         jitter = delay * 0.25 * (random.random() * 2 - 1)
         await asyncio.sleep(max(0, delay + jitter))
+
+        # 开关可能在调度后、延时期间被 /ad c off 关闭；此时必须放弃撤回。
+        if not plugin._session_state.is_recall_enabled(
+            platform, chat_id, plugin._get_config_callable(), stream_id=stream_id,
+        ):
+            plugin.ctx.logger.info("[自动撤回] 会话开关已关闭，跳过已调度消息")
+            return
 
         normalized_msg_id = _normalize_message_id(message_id)
         if normalized_msg_id and is_tracked_message_id(

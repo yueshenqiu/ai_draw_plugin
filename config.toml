@@ -3,7 +3,7 @@
 
 [plugin]
 enabled = true
-config_version = "2.4.2"
+config_version = "2.4.3"
 send_mode = "direct"
 force_forward_when_nsfw_off = true
 use_http_direct = false

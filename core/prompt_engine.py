@@ -30,9 +30,7 @@ def inject_logger(logger):
     _logger = logger
 
 
-# ================================================================
 # LLM API 调用（从 llm_helper.py 迁移）
-# ================================================================
 
 _EXPECTED_OUTPUT_PATTERN = re.compile(
     r"(\[(?:SCENE|PROMPT|NEG|CHARACTER|STYLE|SETTING)\][\s\S]*?(?:\[/(?:SCENE|PROMPT|NEG|CHARACTER|STYLE|SETTING)\])?)",
@@ -180,9 +178,7 @@ def get_custom_api_config(config: Dict[str, Any]) -> Tuple[str, str, str]:
     return api_base, api_key, mdl
 
 
-# ================================================================
 # 提示词模板渲染（从 prompt_rules.py 引用 + 自建渲染逻辑）
-# ================================================================
 
 # 从旧位置导入模板（模板太大不适合内联）
 def _load_templates():
@@ -205,9 +201,7 @@ def _load_templates():
         return "", "", "", ""
 
 
-# ================================================================
 # 输出解析（从 prompt_output_parser.py 迁移）
-# ================================================================
 
 
 def _strip_code_fence(text: str) -> str:
@@ -316,9 +310,7 @@ def parse_prompt_from_structured_output(text: str) -> Optional[str]:
     return None
 
 
-# ================================================================
 # 后处理排序（从 prompt_postprocessor.py 迁移）
-# ================================================================
 
 _COUNT_RE = re.compile(r"^(?:solo|\d+girls|\d+boys|\d+people|1girl|1boy)$", re.IGNORECASE)
 _YEAR_RE = re.compile(r"^year\s+\d{4}$", re.IGNORECASE)
@@ -508,9 +500,7 @@ def normalize_prompt_order(prompt: str) -> str:
     return _join_prompt_segments(out_lines, prompt)
 
 
-# ================================================================
 # LLM 提示词清理
-# ================================================================
 
 def cleanup_llm_prompt(prompt: str) -> str:
     """清理 LLM 返回的原始文本，提取有效提示词。"""
@@ -548,9 +538,7 @@ def cleanup_llm_prompt(prompt: str) -> str:
     return cleaned
 
 
-# ================================================================
 # 时间上下文
-# ================================================================
 
 def build_current_time_context() -> str:
     now = datetime.now()

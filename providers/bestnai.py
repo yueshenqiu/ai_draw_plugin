@@ -76,9 +76,7 @@ class BestNAIProvider(BaseImageProvider):
         self.direct_session: Optional[requests.Session] = None
         self._auto_proxy_direct_only = False
 
-    # ================================================================
     # Public API
-    # ================================================================
 
     async def generate(
         self,
@@ -345,9 +343,7 @@ class BestNAIProvider(BaseImageProvider):
             self._logger.error(f"{self.log_prefix} (BestNAI) 请求异常: {e!r}", exc_info=True)
             return False, f"BestNAI 接口请求失败: {str(e)[:100]}"
 
-    # ================================================================
     # HTTP Session 管理
-    # ================================================================
 
     @staticmethod
     def _create_session(trust_env: bool) -> requests.Session:
@@ -471,9 +467,7 @@ class BestNAIProvider(BaseImageProvider):
             current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
         return False
 
-    # ================================================================
     # 提示词清理
-    # ================================================================
 
     def _sanitize_prompt(self, text: str) -> str:
         """清理提示词中的中/日/韩文和全角符号。"""
@@ -492,9 +486,7 @@ class BestNAIProvider(BaseImageProvider):
             self._logger.warning(f"{self.log_prefix} (BestNAI) 提示词含非英文字符，已自动清理")
         return cleaned
 
-    # ================================================================
     # 生成参数构建
-    # ================================================================
 
     def _build_generation_params(
         self, prompt, artist_prompt, negative_prompt, sampler, steps,
@@ -579,9 +571,7 @@ class BestNAIProvider(BaseImageProvider):
 
         return params
 
-    # ================================================================
     # 尺寸 & 图片工具
-    # ================================================================
 
     @staticmethod
     def _normalize_size(size: Optional[str]) -> Optional[List[int]]:
@@ -664,9 +654,7 @@ class BestNAIProvider(BaseImageProvider):
         except Exception:
             return b64_data
 
-    # ================================================================
     # 响应解析
-    # ================================================================
 
     def _handle_response(self, response: requests.Response) -> Tuple[bool, str]:
         if 300 <= response.status_code < 400:
