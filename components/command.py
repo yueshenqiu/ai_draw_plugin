@@ -8,8 +8,11 @@ plugin.py 中只保留 @Command/@Tool 装饰器的薄包装方法。
 import asyncio
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, Tuple
+
+from ..core.prompt_types import GeneratedPrompt, PersonPrompt, StructuredPrompt
 
 from ..instance import get_plugin_instance
 from ..constants.help_texts import HELP_TEXT
@@ -35,6 +38,155 @@ _LEADING_NOISE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_RANDOM_SELFIE_PREFIX_RE = re.compile(
+    r"^(?:随机\s*自拍|random\s+selfie)(?=$|[\s,，:：])",
+    re.IGNORECASE,
+)
+_RANDOM_PREFIX_RE = re.compile(
+    r"^(?:随机|random|rand)(?=$|[\s,，:：])",
+    re.IGNORECASE,
+)
+_SELFIE_PREFIX_RE = re.compile(
+    r"^(?:自拍|selfie)(?=$|[\s,，:：])",
+    re.IGNORECASE,
+)
+_MODE_SEPARATOR_RE = re.compile(r"^[\s,，:：]+")
+
+
+@dataclass(frozen=True)
+class GenerationRequest:
+    policy: str
+    request_text: str
+    constraints: str
+    is_selfie: bool
+
+
+def _strip_mode_separator(value: str) -> str:
+    return _MODE_SEPARATOR_RE.sub("", value or "").strip()
+
+
+def _parse_generation_request(
+    description: str,
+    is_action: bool,
+) -> GenerationRequest:
+    """解析命令生成策略；Tool 保持旧的自由补全语义。"""
+    raw = str(description or "").strip()
+    from ..core.selfie_engine import detect_selfie_mode, detect_selfie_prefix
+
+    if is_action:
+        return GenerationRequest(
+            policy="tool_legacy",
+            request_text=raw,
+            constraints=raw,
+            is_selfie=detect_selfie_mode(raw),
+        )
+
+    selfie_match = _RANDOM_SELFIE_PREFIX_RE.match(raw)
+    if selfie_match:
+        constraints = _strip_mode_separator(raw[selfie_match.end():])
+        return GenerationRequest(
+            policy="random_content",
+            request_text=constraints,
+            constraints=constraints,
+            is_selfie=True,
+        )
+
+    random_match = _RANDOM_PREFIX_RE.match(raw)
+    if random_match:
+        constraints = _strip_mode_separator(raw[random_match.end():])
+        explicit_selfie = _SELFIE_PREFIX_RE.match(constraints)
+        is_selfie = explicit_selfie is not None
+        if explicit_selfie:
+            constraints = _strip_mode_separator(
+                constraints[explicit_selfie.end():]
+            )
+        return GenerationRequest(
+            policy="random_content",
+            request_text=constraints,
+            constraints=constraints,
+            is_selfie=is_selfie,
+        )
+
+    return GenerationRequest(
+        policy="minimal",
+        request_text=raw,
+        constraints=raw,
+        is_selfie=detect_selfie_prefix(raw),
+    )
+
+
+def _should_read_selfie_schedule(policy: str) -> bool:
+    return policy in {"minimal", "random_content", "tool_legacy"}
+
+
+def _build_selfie_schedule_context(policy: str, activity: str) -> str:
+    activity = str(activity or "").strip()
+    if not activity:
+        return ""
+    if policy == "minimal":
+        guidance = (
+            "精准自拍仅在用户未指定时，参考该活动补一个自然动作或姿态和一个简洁场景；"
+            "不得增加第二个动作、第二处场景或其他自由发挥内容。"
+        )
+    else:
+        guidance = (
+            "随机自拍时优先围绕该活动补充动作、环境、表情和光线；"
+            "用户固定的人物、服装及其他明确条件优先，不得被日程替换。"
+        )
+    return (
+        '<selfie_scene_context source="current_schedule">\n'
+        f"当前日程活动：{activity}\n"
+        f"{guidance}\n"
+        "</selfie_scene_context>"
+    )
+
+
+async def _build_selfie_scene_context(policy: str, description: str) -> str:
+    plugin = get_plugin_instance()
+    if not _should_read_selfie_schedule(policy):
+        return ""
+
+    from ..core.selfie_scene import (
+        get_scene_for_selfie, build_scene_context, get_schedule_activity,
+    )
+
+    schedule_desc = await get_schedule_activity()
+    if schedule_desc:
+        plugin.ctx.logger.info("[自拍场景] 日程增强: %s", schedule_desc[:60])
+
+    if policy in {"minimal", "random_content"}:
+        return _build_selfie_schedule_context(policy, schedule_desc or "")
+
+    scene = await get_scene_for_selfie(
+        schedule_desc or description,
+        api_base=plugin.config.prompt_generator.api_base or "",
+        api_key=plugin.config.prompt_generator.api_key or "",
+        model=plugin.config.prompt_generator.model_name or "",
+    )
+    if not scene:
+        return ""
+    plugin.ctx.logger.info(
+        "[自拍场景] 增强: action=%s env=%s",
+        scene.get("action", "")[:40], scene.get("environment", "")[:30],
+    )
+    return build_scene_context(scene)
+
+
+def _get_random_fixed_constraints(request: GenerationRequest) -> str:
+    constraints = request.constraints.strip()
+    if not request.is_selfie:
+        return constraints
+    return f"自拍，{constraints}" if constraints else "自拍"
+
+
+def _build_random_request_text(constraints: str) -> str:
+    if constraints.strip():
+        return (
+            f"用户固定条件：{constraints.strip()}\n"
+            "请按随机模式自由补充其余画面内容。"
+        )
+    return "请按随机模式生成一个完整且具体的随机画面。"
+
 
 def _short_job_label(prefix: str, description: str, limit: int = 60) -> str:
     text = re.sub(r"\s+", " ", str(description or "")).strip()
@@ -47,7 +199,7 @@ def _compact_job_kwargs(kwargs: dict) -> dict:
     """只保留后台任务所需的会话元数据，避免把整段图片二进制留在队列中。"""
     compact = {
         key: kwargs.get(key)
-        for key in ("stream_id", "user_id", "group_id")
+        for key in ("stream_id", "platform", "user_id", "group_id")
         if kwargs.get(key) not in (None, "")
     }
     message = kwargs.get("message")
@@ -222,7 +374,9 @@ def _format_duration(seconds: float) -> str:
     return f"{hours} 小时 {minutes} 分"
 
 
+# ================================================================
 # /ad help — 帮助
+# ================================================================
 
 async def handle_ad_help(stream_id: str) -> tuple:
     plugin = get_plugin_instance()
@@ -356,7 +510,9 @@ async def handle_ad_context_reset(kwargs: dict) -> tuple:
     return True, message, 2
 
 
+# ================================================================
 # /ad on|off — 插件总开关
+# ================================================================
 
 async def handle_ad_plugin_toggle(action: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -386,7 +542,9 @@ async def handle_ad_plugin_toggle(action: str, kwargs: dict) -> tuple:
     return False, "未知操作", 1
 
 
+# ================================================================
 # /ad c on|off — 自动撤回开关
+# ================================================================
 
 async def handle_ad_recall_control(action: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -422,7 +580,9 @@ async def handle_ad_recall_control(action: str, kwargs: dict) -> tuple:
     return False, "未知操作", 1
 
 
+# ================================================================
 # /ad nsfw <on|off> — NSFW 过滤开关
+# ================================================================
 
 async def handle_ad_nsfw_control(action: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -446,20 +606,22 @@ async def handle_ad_nsfw_control(action: str, kwargs: dict) -> tuple:
         await plugin.ctx.send.text(f"NSFW 过滤当前状态：{state_text}", stream_id)
         return True, "已查询状态", 1
 
-    if action == "on":
-        plugin._session_state.set_nsfw_filter_enabled(info["platform"], info["chat_id"], True,
-                                                       stream_id=stream_id)
-        await plugin.ctx.send.text("NSFW 过滤已开启", stream_id)
-        return True, "NSFW过滤已开启", 2
-    elif action == "off":
-        plugin._session_state.set_nsfw_filter_enabled(info["platform"], info["chat_id"], False,
-                                                       stream_id=stream_id)
-        await plugin.ctx.send.text("NSFW 过滤已关闭", stream_id)
-        return True, "NSFW过滤已关闭", 2
-    return False, "用法: /ad nsfw <on|off>", 1
+    if action not in {"on", "off"}:
+        return False, "用法: /ad nsfw <on|off>", 1
+
+    enabled = action == "on"
+    plugin._session_state.set_nsfw_filter_enabled(
+        info["platform"], info["chat_id"], enabled, stream_id=stream_id,
+    )
+
+    state_text = "开启" if enabled else "关闭"
+    await plugin.ctx.send.text(f"NSFW 过滤已{state_text}", stream_id)
+    return True, f"NSFW过滤已{state_text}", 2
 
 
+# ================================================================
 # /ad send <d|f> — 发送方式开关（d=直发 f=合并转发）
+# ================================================================
 
 async def handle_ad_send_mode(action: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -496,7 +658,9 @@ async def handle_ad_send_mode(action: str, kwargs: dict) -> tuple:
     return False, "用法: /ad send <d|f>", 1
 
 
+# ================================================================
 # /ad pt <on|off> — 提示词显示开关
+# ================================================================
 
 async def handle_ad_prompt_show(action: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -525,7 +689,9 @@ async def handle_ad_prompt_show(action: str, kwargs: dict) -> tuple:
     return False, "用法: /ad pt <on|off>", 1
 
 
+# ================================================================
 # /ad st|sp — 管理员模式开关
+# ================================================================
 
 async def handle_ad_admin_toggle(action: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -547,7 +713,9 @@ async def handle_ad_admin_toggle(action: str, kwargs: dict) -> tuple:
     return False, "用法: /ad st|sp", 1
 
 
+# ================================================================
 # /ad w <模型ID> — 切换模型  /ad m — 列出模型
+# ================================================================
 
 async def handle_ad_switch_model(param: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -603,7 +771,9 @@ async def handle_ad_switch_model(param: str, kwargs: dict) -> tuple:
     return False, "未知模型", 1
 
 
+# ================================================================
 # /ad s <尺寸> — 切换尺寸
+# ================================================================
 
 async def handle_ad_switch_size(param: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -634,7 +804,9 @@ async def handle_ad_switch_size(param: str, kwargs: dict) -> tuple:
     return True, f"已切换尺寸: {size}", 2
 
 
+# ================================================================
 # /ad art <序号> — 切换风格预设（画师串）
+# ================================================================
 
 async def handle_ad_switch_artist(param: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -686,7 +858,9 @@ async def handle_ad_switch_artist(param: str, kwargs: dict) -> tuple:
     return True, f"已切换风格预设: #{idx}", 2
 
 
+# ================================================================
 # /ad 撤回 — 手动撤回
+# ================================================================
 
 async def handle_ad_manual_recall(kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -716,7 +890,9 @@ async def handle_ad_manual_recall(kwargs: dict) -> tuple:
     return True, "撤回完成", 1
 
 
+# ================================================================
 # /ad y <名称> — 引用图片 + 提示词预设 → 图生图
+# ================================================================
 
 _styles_cache: Optional[dict] = None
 
@@ -854,7 +1030,9 @@ async def handle_ad_style(style_name: str, kwargs: dict) -> tuple:
     return True, message, 2
 
 
+# ================================================================
 # /ad0 <tags> — 直接 tag 生图
+# ================================================================
 
 async def handle_dr0_ref_draw(mode: str, tags: str, kwargs: dict) -> tuple:
     """直接参考生图：/ad0 rh|r|h|t <英文标签> — 跳过 LLM，直传参考图+标签"""
@@ -997,7 +1175,9 @@ async def handle_dr0_draw(description: str, kwargs: dict) -> tuple:
     return True, message, 2
 
 
+# ================================================================
 # /ad r|h|rh|hr|t <描述> — 参考模式生图
+# ================================================================
 
 async def handle_ad_ref_draw(mode: str, description: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -1053,7 +1233,9 @@ async def handle_ad_ref_draw(mode: str, description: str, kwargs: dict) -> tuple
     return True, message, 2
 
 
+# ================================================================
 # /ad <描述> — LLM 提示词 → 生图
+# ================================================================
 
 async def handle_ad_draw(description: str, kwargs: dict) -> tuple:
     plugin = get_plugin_instance()
@@ -1085,7 +1267,9 @@ async def handle_ad_draw(description: str, kwargs: dict) -> tuple:
     return True, message, 2
 
 
+# ================================================================
 # Tool: LLM 触发生图
+# ================================================================
 
 _TOOL_SIZE_ALIASES = {
     "portrait": "832x1216",
@@ -1150,7 +1334,9 @@ async def handle_ad_web_draw(description: str, size: str, kwargs: dict) -> dict:
     }
 
 
+# ================================================================
 # 核心工作流：描述 → LLM 提示词 → 图片 → 发送
+# ================================================================
 
 async def ad_workflow(
     description: str,
@@ -1162,15 +1348,17 @@ async def ad_workflow(
 ) -> bool:
     plugin = get_plugin_instance()
     stream_id = kwargs.get("stream_id", "")
-
-    # 自拍判定（在随机模式覆盖 description 之前，以原始用户输入为准）
-    # /ad 命令：严格前缀匹配（/ad 自拍，xxx → selfie；/ad 画自拍 → 非selfie）
-    # Tool 调用：子串匹配（LLM 描述"帮我生成一张自拍" → selfie）
-    from ..core.selfie_engine import detect_selfie_prefix, detect_selfie_mode
-    if is_action:
-        is_selfie = detect_selfie_mode(description)
-    else:
-        is_selfie = detect_selfie_prefix(description)
+    generation_request = _parse_generation_request(description, is_action)
+    policy = generation_request.policy
+    is_selfie = generation_request.is_selfie
+    random_fixed_constraints = (
+        _get_random_fixed_constraints(generation_request)
+        if policy == "random_content" else ""
+    )
+    request_for_history = (
+        random_fixed_constraints or generation_request.constraints or description
+    )
+    description = generation_request.request_text
 
     info = plugin._extract_session_info(kwargs)
     nsfw_enabled = plugin._session_state.is_nsfw_filter_enabled(
@@ -1178,20 +1366,8 @@ async def ad_workflow(
         stream_id=stream_id,
     )
 
-    # 随机模式
-    is_random_selfie = description in ("随机自拍", "random selfie")
-    is_selfie = is_selfie or is_random_selfie
-    if description in ("随机", "random", "rand") or is_random_selfie:
-        rand_desc = await _generate_random_description(
-            selfie=is_random_selfie,
-            nsfw_enabled=nsfw_enabled,
-            stream_id=stream_id,
-        )
-        if not rand_desc:
-            await plugin.ctx.send.text("随机场景生成失败，请稍后再试~", stream_id)
-            return False
-        description = rand_desc
-        plugin.ctx.logger.info("[随机场景] %s", description)
+    if policy == "random_content":
+        description = _build_random_request_text(random_fixed_constraints)
 
     # Provider 能力预检查，避免在不支持参考模式的模型上浪费一次 LLM/API 调用。
     if ref_mode:
@@ -1202,37 +1378,29 @@ async def ad_workflow(
             await plugin.ctx.send.text(reason or "当前模型不支持该参考模式", stream_id)
             return False
 
-    # 自拍场景增强：从日程 + LLM 获取 action/environment/expression/lighting
     selfie_scene_context = ""
-    if is_selfie and plugin.config.prompt_generator.scene_llm_enabled:
-        from ..core.selfie_scene import (
-            get_scene_for_selfie, build_scene_context, get_schedule_activity,
+    if (
+        is_selfie
+        and plugin.config.prompt_generator.scene_llm_enabled
+        and _should_read_selfie_schedule(policy)
+    ):
+        selfie_scene_context = await _build_selfie_scene_context(
+            policy, description,
         )
-        schedule_desc = await get_schedule_activity()
-        if schedule_desc:
-            plugin.ctx.logger.info("[自拍场景] 日程增强: %s", schedule_desc[:60])
-        scene_input = schedule_desc or description
-        scene = await get_scene_for_selfie(
-            scene_input,
-            api_base=plugin.config.prompt_generator.api_base or "",
-            api_key=plugin.config.prompt_generator.api_key or "",
-            model=plugin.config.prompt_generator.model_name or "",
-        )
-        if scene:
-            plugin.ctx.logger.info(
-                "[自拍场景] 增强: action=%s env=%s",
-                scene.get("action", "")[:40], scene.get("environment", "")[:30],
-            )
-            selfie_scene_context = build_scene_context(scene)
 
-    generated_prompt = await _generate_prompt_with_llm(
+    generated = await _generate_prompt_with_llm(
         description, stream_id, is_action, nsfw_enabled,
         selfie_scene_context=selfie_scene_context,
         ref_mode=ref_mode,
+        policy=policy,
+        is_selfie=is_selfie,
     )
-    if not generated_prompt:
+    if not generated or not generated.flat_prompt:
         await plugin.ctx.send.text("提示词生成失败，请稍后再试~", stream_id)
         return False
+
+    generated_prompt = generated.flat_prompt
+    structured_prompt = generated.structured_prompt
 
     plugin.ctx.logger.debug("[LLM生图] 原始提示词: %s", generated_prompt)
 
@@ -1240,11 +1408,15 @@ async def ad_workflow(
     from ..core.prompt_engine import normalize_prompt_order
     from ..core.selfie_engine import detect_selfie_from_output
 
-    # LLM 已明确输出自拍标签时，纠正仅靠关键词前缀可能漏掉的自拍意图。
-    if not is_selfie and detect_selfie_from_output(generated_prompt):
+    # LLM 已明确输出自拍意图或自拍标签时，纠正仅靠关键词前缀可能漏掉的场景。
+    if not is_selfie and (
+        (structured_prompt is not None and structured_prompt.intent == "selfie")
+        or detect_selfie_from_output(generated_prompt)
+    ):
         is_selfie = True
 
     selfie_base_prompt = generated_prompt
+    selfie_base_structured = structured_prompt
     if is_selfie:
         model_cfg = plugin._get_model_config_from_kwargs(
             kwargs,
@@ -1284,10 +1456,19 @@ async def ad_workflow(
                 )
 
         include_selfie_add = selfie_ref_used or not bool(ref_image)
-        generated_prompt = _process_selfie_prompt(generated_prompt, description, include_selfie_add, model_cfg)
+        generated_prompt, structured_prompt = _process_selfie_prompt_result(
+            generated_prompt,
+            structured_prompt,
+            request_for_history,
+            include_selfie_add,
+        )
 
     if plugin.config.prompt_generator.enforce_tag_order:
-        generated_prompt = normalize_prompt_order(generated_prompt)
+        if structured_prompt is not None:
+            structured_prompt = _normalize_structured_prompt_order(structured_prompt)
+            generated_prompt = _render_structured_prompt_flat(structured_prompt)
+        else:
+            generated_prompt = normalize_prompt_order(generated_prompt)
 
     plugin.ctx.logger.info("[LLM生图] 最终提示词: %s", generated_prompt)
 
@@ -1299,12 +1480,11 @@ async def ad_workflow(
         show_prompt = generated_prompt
         header = "\U0001f4dd 提示词:"
         if is_selfie and plugin.config.prompt_show.hide_selfie_prompt_add:
-            show_prompt = _process_selfie_prompt(
-                selfie_base_prompt, description, False,
-                plugin._get_model_config_from_kwargs(
-                    kwargs,
-                    apply_artist_preset=ref_mode not in ("style", "character&style"),
-                ),
+            show_prompt, _ = _process_selfie_prompt_result(
+                selfie_base_prompt,
+                selfie_base_structured,
+                request_for_history,
+                False,
             )
             header = "\U0001f4dd 提示词(已隐藏自拍补充):"
         await plugin.ctx.send.text(f"{header}\n{show_prompt}", stream_id)
@@ -1321,18 +1501,25 @@ async def ad_workflow(
     from ..core.generator import generate_and_send
     sent = await generate_and_send(generated_prompt, model_config, stream_id,
                                    prompt_text=generated_prompt, size=size, kwargs=kwargs,
-                                   ref_image=ref_image, ref_mode=ref_mode)
+                                   ref_image=ref_image, ref_mode=ref_mode,
+                                   structured_prompt=structured_prompt)
     if sent:
-        plugin._session_state.set_last_draw_context(stream_id, generated_prompt, description)
+        plugin._session_state.set_last_draw_context(
+            stream_id, generated_prompt, request_for_history,
+            nsfw_enabled=nsfw_enabled,
+        )
         if is_selfie:
             plugin._session_state.set_last_selfie_context(
-                stream_id, generated_prompt, description,
+                stream_id, generated_prompt, request_for_history,
                 scene_summary=selfie_scene_context,
+                nsfw_enabled=nsfw_enabled,
             )
     return bool(sent)
 
 
+# ================================================================
 # 内部辅助函数
+# ================================================================
 
 def _check_ref_mode_capability(model_config: dict, ref_mode: str) -> tuple:
     """在调用 LLM/生图 API 前确认当前 Provider 声明支持对应参考能力。"""
@@ -1514,21 +1701,145 @@ def _is_prompt_show_enabled_from_kwargs(kwargs: dict) -> bool:
 
 def _process_selfie_prompt(description: str, raw_request: str,
                            include_selfie_add: bool, model_config: dict) -> str:
+    processed, _ = _process_selfie_prompt_result(
+        description, None, raw_request, include_selfie_add,
+    )
+    return processed
+
+
+def _process_selfie_prompt_result(
+    flat_prompt: str,
+    structured_prompt: Optional[StructuredPrompt],
+    raw_request: str,
+    include_selfie_add: bool,
+) -> Tuple[str, Optional[StructuredPrompt]]:
     plugin = get_plugin_instance()
     from ..core.selfie_engine import merge_selfie_prompt
-    from ..core.prompt_engine import remove_selfie_appearance_tags, user_mentions_appearance
+    from ..core.prompt_engine import (
+        remove_selfie_appearance_tags,
+        user_mentions_appearance,
+    )
 
     selfie_add = (plugin.config.prompt_show.selfie_prompt_add or "") if plugin else ""
     policy = (plugin.config.prompt_generator.selfie_appearance_policy or "auto").strip().lower()
     user_specified = user_mentions_appearance(raw_request)
 
-    if policy == "auto" and not user_specified:
-        description = remove_selfie_appearance_tags(description)
-    if include_selfie_add and selfie_add:
-        description = merge_selfie_prompt(description, selfie_add)
-    if policy == "never" and not user_specified:
-        description = remove_selfie_appearance_tags(description)
-    return description
+    if structured_prompt is None:
+        description = flat_prompt
+        if policy == "auto" and not user_specified:
+            description = remove_selfie_appearance_tags(description)
+        if include_selfie_add and selfie_add:
+            description = merge_selfie_prompt(description, selfie_add)
+        if policy == "never" and not user_specified:
+            description = remove_selfie_appearance_tags(description)
+        return description, None
+
+    people = structured_prompt.people
+    if not people:
+        description = flat_prompt
+        if policy == "auto" and not user_specified:
+            description = remove_selfie_appearance_tags(description)
+        if include_selfie_add and selfie_add:
+            description = merge_selfie_prompt(description, selfie_add)
+        if policy == "never" and not user_specified:
+            description = remove_selfie_appearance_tags(description)
+        return description, None
+
+    global_tags = structured_prompt.global_tags
+    should_remove_appearance = (
+        policy == "never"
+        or (policy == "auto" and not user_specified)
+    )
+    if should_remove_appearance:
+        global_tags = tuple(
+            tag for tag in global_tags if not _is_appearance_prompt_tag(tag)
+        )
+
+    processed_people = []
+    for index, person in enumerate(people):
+        positive_source = person.positive_tags
+        if should_remove_appearance:
+            positive_source = tuple(
+                tag for tag in positive_source if not _is_appearance_prompt_tag(tag)
+            )
+        person_text = ", ".join(positive_source)
+        if index == 0 and include_selfie_add and selfie_add:
+            person_text = merge_selfie_prompt(person_text, selfie_add)
+        positive_tags = _split_prompt_tags(person_text)
+        negative_tags = tuple(
+            tag for tag in person.negative_tags
+            if not should_remove_appearance or not _is_appearance_prompt_tag(tag)
+        )
+        positive_keys = {_normalize_prompt_tag(tag) for tag in positive_tags}
+        negative_tags = tuple(
+            tag for tag in negative_tags
+            if _normalize_prompt_tag(tag) not in positive_keys
+        )
+        processed_people.append(PersonPrompt(
+            positive_tags=positive_tags,
+            negative_tags=negative_tags,
+        ))
+    people = tuple(processed_people)
+
+    processed = StructuredPrompt(
+        global_tags=global_tags,
+        people=people,
+        format=structured_prompt.format,
+        intent=structured_prompt.intent,
+        continuity=structured_prompt.continuity,
+    )
+    return _render_structured_prompt_flat(processed), processed
+
+
+def _split_prompt_tags(prompt: str) -> Tuple[str, ...]:
+    return tuple(tag.strip() for tag in (prompt or "").split(",") if tag.strip())
+
+
+def _normalize_prompt_tag(tag: str) -> str:
+    value = re.sub(r"^[+-]?\d+(?:\.\d+)?::", "", str(tag or "").strip())
+    value = re.sub(r"::\s*$", "", value).strip("{}[]() ")
+    return re.sub(r"\s+", " ", value.lower()).strip()
+
+
+def _is_appearance_prompt_tag(tag: str) -> bool:
+    from ..core.prompt_engine import remove_selfie_appearance_tags
+
+    value = _normalize_prompt_tag(tag)
+    return bool(value) and not remove_selfie_appearance_tags(value).strip()
+
+
+def _render_structured_prompt_flat(structured_prompt: StructuredPrompt) -> str:
+    from ..core.prompt_engine import render_structured_prompt_flat
+
+    return render_structured_prompt_flat(
+        structured_prompt.global_tags, structured_prompt.people,
+    )
+
+
+def _normalize_structured_prompt_order(
+    structured_prompt: StructuredPrompt,
+) -> StructuredPrompt:
+    from ..core.prompt_engine import normalize_prompt_order
+
+    global_tags = _split_prompt_tags(normalize_prompt_order(
+        ", ".join(structured_prompt.global_tags),
+    ))
+    people = tuple(
+        PersonPrompt(
+            positive_tags=_split_prompt_tags(normalize_prompt_order(
+                ", ".join(person.positive_tags),
+            )),
+            negative_tags=person.negative_tags,
+        )
+        for person in structured_prompt.people
+    )
+    return StructuredPrompt(
+        global_tags=global_tags,
+        people=people,
+        format=structured_prompt.format,
+        intent=structured_prompt.intent,
+        continuity=structured_prompt.continuity,
+    )
 
 
 async def _generate_prompt_with_llm(
@@ -1536,7 +1847,9 @@ async def _generate_prompt_with_llm(
     is_action: bool = False, nsfw_enabled: bool = False,
     selfie_scene_context: str = "",
     ref_mode: str = "",
-) -> Optional[str]:
+    policy: str = "minimal",
+    is_selfie: bool = False,
+) -> Optional[GeneratedPrompt]:
     plugin = get_plugin_instance()
     gen_cfg = plugin.config.prompt_generator
 
@@ -1545,22 +1858,28 @@ async def _generate_prompt_with_llm(
 
     # 加载模板
     from ..core.rules.prompt_rules import (
-        PROMPT_GENERATOR_TEMPLATE, PROMPT_GENERATOR_JSON_TEMPLATE,
-        SFW_PROMPT_GENERATOR_TEMPLATE, SFW_PROMPT_GENERATOR_JSON_TEMPLATE,
+        CONTENT_POLICY_TEXTS,
+        GENERATION_POLICY_TEXTS,
+        build_prompt_generator_template,
     )
 
     output_format = (gen_cfg.output_format or "json").strip().lower()
-    if nsfw_enabled:
-        default_tpl = SFW_PROMPT_GENERATOR_JSON_TEMPLATE if output_format == "json" else SFW_PROMPT_GENERATOR_TEMPLATE
-    else:
-        default_tpl = PROMPT_GENERATOR_JSON_TEMPLATE if output_format == "json" else PROMPT_GENERATOR_TEMPLATE
-
-    template = gen_cfg.prompt_template or default_tpl
+    template = gen_cfg.prompt_template or build_prompt_generator_template(
+        sfw_enabled=nsfw_enabled,
+        output_format=output_format,
+    )
+    content_policy_text = (
+        CONTENT_POLICY_TEXTS["sfw" if nsfw_enabled else "allow_nsfw"]
+        if gen_cfg.prompt_template else ""
+    )
+    policy_text = GENERATION_POLICY_TEXTS.get(
+        policy, GENERATION_POLICY_TEXTS["minimal"],
+    )
     previous_prompt = ""
     previous_request = ""
     if stream_id:
         previous_prompt, previous_request = plugin._session_state.get_last_draw_context(
-            stream_id, ttl=gen_cfg.inherit_ttl,
+            stream_id, ttl=gen_cfg.inherit_ttl, nsfw_enabled=nsfw_enabled,
         )
 
     prompt = _render_generator_prompt(
@@ -1569,22 +1888,37 @@ async def _generate_prompt_with_llm(
         previous_prompt=previous_prompt or "",
         previous_request=previous_request or "",
         ref_mode=ref_mode,
+        policy=policy,
+        policy_text=policy_text,
+        is_selfie=is_selfie,
+        content_policy_text=content_policy_text,
     )
 
     # LLM 调用
-    from ..core.prompt_engine import call_custom_llm_api, has_custom_api_config, cleanup_llm_prompt
+    from ..core.prompt_engine import (
+        call_custom_llm_api,
+        has_custom_api_config,
+        parse_generated_prompt,
+    )
 
-    if has_custom_api_config({
+    llm_config = {
         "api_base": gen_cfg.api_base, "api_key": gen_cfg.api_key, "model_name": gen_cfg.model_name,
-    }):
+    }
+    generation_temperature = (
+        max(float(gen_cfg.temperature), 1.0)
+        if policy == "random_content" else gen_cfg.temperature
+    )
+    if has_custom_api_config(llm_config):
         success, response, _, _ = await call_custom_llm_api(
             prompt=prompt, api_base=gen_cfg.api_base, api_key=gen_cfg.api_key,
-            model=gen_cfg.model_name, temperature=gen_cfg.temperature, max_tokens=gen_cfg.max_tokens,
+            model=gen_cfg.model_name, temperature=generation_temperature,
+            max_tokens=gen_cfg.max_tokens,
         )
     else:
         try:
             result = await plugin.ctx.llm.generate(
-                prompt=prompt, temperature=gen_cfg.temperature, max_tokens=gen_cfg.max_tokens,
+                prompt=prompt, temperature=generation_temperature,
+                max_tokens=gen_cfg.max_tokens,
             )
             response = result.get("content", "") if isinstance(result, dict) else str(result)
             success = bool(response)
@@ -1599,7 +1933,11 @@ async def _generate_prompt_with_llm(
         plugin.ctx.logger.error("[LLM] 提示词生成失败: LLM 返回空内容")
         return None
 
-    return cleanup_llm_prompt(response)
+    generated = parse_generated_prompt(response)
+    if output_format == "json" and generated.structured_prompt is None:
+        plugin.ctx.logger.error("[LLM] JSON 输出不符合 V4 结构，已终止本次生图")
+        return None
+    return generated
 
 
 def _render_generator_prompt(
@@ -1610,6 +1948,10 @@ def _render_generator_prompt(
     previous_prompt: str = "",
     previous_request: str = "",
     ref_mode: str = "",
+    policy: str = "minimal",
+    policy_text: str = "",
+    is_selfie: bool = False,
+    content_policy_text: str = "",
 ) -> str:
     plugin = get_plugin_instance()
     from ..core.selfie_engine import get_selfie_hint
@@ -1619,10 +1961,20 @@ def _render_generator_prompt(
     if custom_sys:
         custom_sys = custom_sys.strip() + "\n\n"
 
-    selfie_hint = get_selfie_hint()
-    current_time = build_current_time_context()
+    selfie_hint = get_selfie_hint() if is_selfie else ""
+    current_time = (
+        build_current_time_context() if policy == "tool_legacy" else ""
+    )
 
     prompt = template.replace("<<CUSTOM_SYSTEM_PROMPT>>", custom_sys)
+    if "<<CONTENT_POLICY>>" in prompt:
+        prompt = prompt.replace("<<CONTENT_POLICY>>", content_policy_text)
+    elif content_policy_text:
+        prompt = f"{prompt.rstrip()}\n\n{content_policy_text}"
+    if "<<GENERATION_POLICY>>" in prompt:
+        prompt = prompt.replace("<<GENERATION_POLICY>>", policy_text)
+    elif policy_text:
+        prompt = f"{prompt.rstrip()}\n\n{policy_text}"
     previous_context = ""
     if previous_prompt:
         previous_context = (
@@ -1639,6 +1991,15 @@ def _render_generator_prompt(
     prompt = prompt.replace("<<CURRENT_TIME_CONTEXT>>", current_time)
     prompt = prompt.replace("<<SELFIE_HINT>>", selfie_hint)
     prompt = prompt.replace("<<TAG_CANDIDATES>>", "")
+    if policy in {"minimal", "random_content"}:
+        prompt = (
+            f"{prompt.rstrip()}\n\n"
+            "<final_source_check priority=\"highest\">\n"
+            f"原始用户条件：{request.strip()}\n"
+            "输出前逐项核对原始条件中的人物、服装、动作、物品和场景；除 SFW 转换外，"
+            "任何明确条件都不得遗漏或用相似概念替代。\n"
+            "</final_source_check>"
+        )
     return prompt.strip()
 
 
@@ -1669,82 +2030,3 @@ def _build_ref_context(ref_mode: str) -> str:
             "</reference_image_rules>"
         )
     return ""
-
-
-async def _generate_random_description(
-    selfie: bool = False,
-    nsfw_enabled: bool = True,
-    stream_id: str = "",
-) -> Optional[str]:
-    plugin = get_plugin_instance()
-    rand_cfg = plugin.config.random_scene
-    from ..core.random_scene import (
-        normalize_random_scene_description,
-        is_random_scene_too_similar,
-    )
-
-    selfie_extra = ""
-    if selfie:
-        selfie_extra = "\n\n额外要求（自拍模式）：\n- 必须明确是自拍\n- 场景适合由同一角色本人出镜"
-
-    recent_scenes = plugin._session_state.get_recent_random_scenes(stream_id)
-    history = ""
-    if recent_scenes:
-        history = "\n".join(recent_scenes)
-        history = f"\n\n以下是最近已生成过的内容，禁止与它们重复或相似：\n{history}"
-
-    content_level = (
-        "全年龄、安全、穿着完整，不包含露骨或性暗示内容"
-        if nsfw_enabled else
-        "可包含成人向内容，但仍需避免违法、未成年人或非自愿题材"
-    )
-    prompt = (
-        "随机生成一个二次元插画场景，并用空格分隔的中文短标签描述它。\n"
-        f"内容级别：{content_level}\n"
-        "要求：\n- 题材尽量多样\n"
-        "- 结果必须具体、可视化、适合转成 Danbooru 风格标签\n"
-        "- 只输出 1 行，包含 6-10 个中文短标签\n"
-        f"- 标签尽量简短，使用明确视觉概念{selfie_extra}"
-        f"{history}"
-    )
-
-    from ..core.prompt_engine import call_custom_llm_api, has_custom_api_config
-    api_cfg = {
-        "api_base": plugin.config.prompt_generator.api_base or "",
-        "api_key": plugin.config.prompt_generator.api_key or "",
-        "model_name": plugin.config.prompt_generator.model_name or "",
-    }
-
-    for attempt in range(3):
-        try:
-            if has_custom_api_config(api_cfg):
-                success, response, _, _ = await call_custom_llm_api(
-                    prompt=prompt,
-                    api_base=api_cfg["api_base"],
-                    api_key=api_cfg["api_key"],
-                    model=api_cfg["model_name"],
-                    temperature=rand_cfg.temperature,
-                    max_tokens=rand_cfg.max_tokens,
-                )
-                if not success:
-                    plugin.ctx.logger.error("[随机场景] 自定义 API 失败: %s", response)
-                    return None
-            else:
-                result = await plugin.ctx.llm.generate(
-                    prompt=prompt, temperature=rand_cfg.temperature, max_tokens=rand_cfg.max_tokens,
-                )
-                response = result.get("content", "") if isinstance(result, dict) else str(result)
-        except Exception as e:
-            plugin.ctx.logger.error("[随机场景] LLM调用失败: %s", e)
-            return None
-
-        lines = [line.strip() for line in (response or "").strip().split("\n") if line.strip()]
-        candidate = normalize_random_scene_description(lines[0]) if lines else ""
-        if not candidate:
-            continue
-        if recent_scenes and is_random_scene_too_similar(candidate, recent_scenes, threshold=0.6):
-            plugin.ctx.logger.info("[随机场景] 第 %s 次结果与近期场景过于相似，重新生成", attempt + 1)
-            continue
-        plugin._session_state.add_recent_random_scene(stream_id, candidate, limit=5)
-        return candidate
-    return None

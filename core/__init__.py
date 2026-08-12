@@ -40,7 +40,11 @@ from .prompt_engine import (
     remove_selfie_appearance_tags,
     user_mentions_appearance,
     build_current_time_context,
+    parse_generated_prompt,
+    parse_structured_prompt,
+    render_structured_prompt_flat,
 )
+from .prompt_types import GeneratedPrompt, PersonPrompt, StructuredPrompt
 from .selfie_engine import (
     detect_selfie_mode,
     detect_selfie_prefix,
@@ -63,11 +67,6 @@ from .image_utils import (
     cleanup_queue_image_spool,
 )
 from .http_client import close_session
-from .random_scene import (
-    normalize_random_scene_description,
-    is_random_scene_too_similar,
-    get_random_scene_similarity_score,
-)
 
 __all__ = [
     "session_state",
@@ -105,6 +104,12 @@ __all__ = [
     "remove_selfie_appearance_tags",
     "user_mentions_appearance",
     "build_current_time_context",
+    "parse_generated_prompt",
+    "parse_structured_prompt",
+    "render_structured_prompt_flat",
+    "GeneratedPrompt",
+    "PersonPrompt",
+    "StructuredPrompt",
     "detect_selfie_mode",
     "detect_selfie_prefix",
     "detect_selfie_from_output",
@@ -123,7 +128,4 @@ __all__ = [
     "remove_queue_image_spool",
     "cleanup_queue_image_spool",
     "close_session",
-    "normalize_random_scene_description",
-    "is_random_scene_too_similar",
-    "get_random_scene_similarity_score",
 ]

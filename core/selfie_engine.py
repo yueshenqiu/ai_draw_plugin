@@ -37,9 +37,10 @@ SELFIE_HINT_FOR_LLM = """
 - 如果用户明确要求 cosplay，使用 `角色tag (cosplay)` 标记形式
 
 ## 自拍类型选择规则
-1. 根据用户描述匹配最合适的类型
-2. 根据上下文推断
-3. 随机选择增加多样性
+1. 必须服从当前 generation_policy，不得用本段覆盖精准/随机/Tool 的补全边界
+2. 用户明确指定自拍类型、角度或合照时，严格按用户要求选择
+3. minimal 模式未指定类型时固定使用普通手机前置自拍；允许用当前日程补齐缺少的动作和场景，但不得随机改变自拍类型
+4. random_content 与 tool_legacy 模式可根据允许的上下文选择或随机自拍类型
 
 ## 自拍类型及对应标签
 ### 1. 手机前置自拍 → 必须: selfie, pov, looking at viewer
@@ -51,6 +52,7 @@ SELFIE_HINT_FOR_LLM = """
 ## 通用规则
 - 必须: looking at viewer（直视镜头）
 - 必须: pov（第一人称视角，镜子自拍除外）
+- 输出最终 JSON 前必须按选定的自拍类型逐项检查上述必需标签，缺少任何一项都要补齐
 - 前置自拍时手机在画面外，不要添加 holding phone
 - 不要使用 selfie stick、holding selfie stick
 - 禁止生成角色外貌描述和角色/作品标签

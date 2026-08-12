@@ -19,7 +19,9 @@ from .prompt_engine import call_custom_llm_api, has_custom_api_config
 _logger = logging.getLogger("ai_draw_plugin")
 
 
+# ================================================================
 # 确定性映射（LLM 失败时兜底）
+# ================================================================
 
 # 活动关键词 → 动作 / 环境 / 表情 / 光线
 _ACTIVITY_SCENE_MAP: Dict[str, Dict[str, str]] = {
@@ -146,7 +148,9 @@ def get_scene_fallback(description: str) -> Dict[str, str]:
     return scene
 
 
+# ================================================================
 # LLM 场景生成
+# ================================================================
 
 _SCENE_LLM_PROMPT = """You are a selfie scene tag generator for anime image generation.
 Given a description of what someone is currently doing, output a JSON object with 4 keys:
@@ -322,7 +326,9 @@ def build_scene_context(scene: Dict[str, str]) -> str:
     return "\n".join(parts)
 
 
+# ================================================================
 # 日程接入：从 autonomous_planning_plugin 获取当前活动
+# ================================================================
 
 _ACTIVITY_API = "xuqian13.autonomous-planning-plugin-v4.get_current_activity"
 

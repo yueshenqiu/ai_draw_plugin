@@ -8,6 +8,7 @@ import asyncio
 import base64
 from collections import OrderedDict
 import ipaddress
+import inspect
 import os
 import random
 import re
@@ -21,6 +22,7 @@ from urllib.parse import unquote, urljoin, urlparse, urlunparse
 
 from ..instance import get_plugin_instance
 from ..providers import get_provider_class
+from .prompt_types import StructuredPrompt
 from .image_utils import (
     MAX_IMAGE_BYTES,
     decode_base64_image,
@@ -105,7 +107,9 @@ def _prepare_image_file(image_base64: str) -> str:
 
 
 
+# ================================================================
 # 模型配置解析
+# ================================================================
 
 def load_models_config(raw_config: dict) -> Dict[str, Dict[str, Any]]:
     """从 [models] section 加载所有模型配置。
@@ -142,7 +146,9 @@ def get_model_config(models: Dict[str, dict], model_id: str) -> Optional[Dict[st
     return None
 
 
+# ================================================================
 # 图片生成编排
+# ================================================================
 
 async def generate_and_send(
     prompt: str,
@@ -153,6 +159,7 @@ async def generate_and_send(
     kwargs: dict = None,
     ref_image: str = "",
     ref_mode: str = "",
+    structured_prompt: Optional[StructuredPrompt] = None,
 ) -> bool:
     """后台任务：生成图片 → 发送结果 → 触发自动撤回。"""
     plugin = get_plugin_instance()
@@ -161,7 +168,15 @@ async def generate_and_send(
 
     try:
         image_size = size or model_config.get("size_preset") or model_config.get("nai_size") or model_config.get("default_size", "1024x1280")
-        success, result = await generate_image(prompt, model_config, image_size, stream_id, ref_image, ref_mode)
+        success, result = await generate_image(
+            prompt=prompt,
+            model_config=model_config,
+            size=image_size,
+            stream_id=stream_id,
+            ref_image=ref_image,
+            ref_mode=ref_mode,
+            structured_prompt=structured_prompt,
+        )
 
         if not success:
             await plugin.ctx.send.text(f"生成图片失败：{result}", stream_id)
@@ -209,6 +224,7 @@ async def generate_image(
     stream_id: str = "",
     ref_image: str = "",
     ref_mode: str = "",
+    structured_prompt: Optional[StructuredPrompt] = None,
 ) -> Tuple[bool, str]:
     """调用 Provider 生成图片。"""
     plugin = get_plugin_instance()
@@ -222,13 +238,31 @@ async def generate_image(
 
     provider = provider_cls(logger=plugin.ctx.logger, log_prefix="[ai_draw]")
     try:
-        return await provider.generate(
-            prompt=prompt, model_config=model_config,
-            size=size, ref_image=ref_image, ref_mode=ref_mode,
-        )
+        provider_kwargs = {
+            "prompt": prompt,
+            "model_config": model_config,
+            "size": size,
+            "ref_image": ref_image,
+            "ref_mode": ref_mode,
+        }
+        if structured_prompt is not None and _supports_structured_prompt(provider.generate):
+            provider_kwargs["structured_prompt"] = structured_prompt
+        return await provider.generate(**provider_kwargs)
     except Exception as e:
         plugin.ctx.logger.error(f"[生图] Provider 调用失败: {e}", exc_info=True)
         return False, f"图片生成失败: {str(e)[:100]}"
+
+
+def _supports_structured_prompt(generate: Any) -> bool:
+    try:
+        parameters = inspect.signature(generate).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "structured_prompt"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 async def send_image_result(
@@ -676,7 +710,9 @@ def _extract_message_id_from_response(resp) -> Optional[str]:
     return None
 
 
+# ================================================================
 # 消息获取与识别
+# ================================================================
 
 def extract_text_from_napcat_message(msg: dict) -> str:
     segments = msg.get("message", msg.get("raw_message", []))
@@ -1545,7 +1581,9 @@ def extract_image_from_message(msg: dict) -> Optional[str]:
     return None
 
 
+# ================================================================
 # 会话信息提取
+# ================================================================
 
 def get_session_info_from_kwargs(kwargs: dict) -> dict:
     """从 kwargs 提取 session 信息。"""
@@ -1568,7 +1606,9 @@ def get_session_info_from_kwargs(kwargs: dict) -> dict:
     return {"platform": "", "chat_id": chat_id, "user_id": user_id, "chat_type": chat_type}
 
 
+# ================================================================
 # 本插件发送消息 ID 追踪（自动/手动撤回的唯一可信来源）
+# ================================================================
 
 def _normalize_message_id(message_id: Any) -> str:
     normalized = str(message_id or "").strip()
@@ -1753,7 +1793,9 @@ async def delete_tracked_message(message_id: Any, kwargs: Optional[dict] = None)
     return await _delete_tracked_message_for_key(message_id, context["session_key"])
 
 
+# ================================================================
 # 自动撤回
+# ================================================================
 
 def schedule_auto_recall(kwargs: dict = None, after_ts: int = 0, message_id: Optional[str] = None):
     """启动自动撤回后台任务。

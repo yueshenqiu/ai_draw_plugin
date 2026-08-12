@@ -18,10 +18,13 @@ from .instance import set_plugin_instance, clear_plugin_instance
 from .core.generator import load_models_config
 from .core.image_utils import cleanup_queue_image_spool
 from .core.job_manager import JobManager
+from .core.session_context import extract_session_info
 from .core.session_state import session_state
 
 
+# ================================================================
 # Config Models（适配新 [models.modelX] 结构）
+# ================================================================
 
 def _ui(label: str, *, hint: str = "", order: int = 0, **extra: Any) -> Dict[str, Any]:
     """构造 WebUI 配置项元数据。
@@ -108,7 +111,7 @@ class PluginSectionConfig(PluginConfigBase):
         ),
     )
     config_version: str = Field(
-        default="2.4.3", description="配置版本号",
+        default="2.4.4", description="配置版本号",
         json_schema_extra=_ui("配置版本", order=99, hidden=True, disabled=True),
     )
 
@@ -358,8 +361,11 @@ class PromptGeneratorSection(PluginConfigBase):
         json_schema_extra=_ui("轻量排序提示词", order=5, hint="对生成的提示词标签做轻量重排"),
     )
     scene_llm_enabled: bool = Field(
-        default=True, description="是否启用自拍场景LLM增强（使用本配置的模型）",
-        json_schema_extra=_ui("自拍场景 LLM 增强", order=6, hint="启用后用本配置的模型增强自拍场景描述"),
+        default=True, description="是否启用自拍日程与场景增强",
+        json_schema_extra=_ui(
+            "自拍日程与场景增强", order=6,
+            hint="普通/随机自拍读取当前日程并交给主提示词 LLM；Tool 自拍保留独立场景增强",
+        ),
     )
     temperature: float = Field(
         default=0.2, ge=0.0, le=2.0, description="LLM温度",
@@ -393,19 +399,6 @@ class PromptGeneratorSection(PluginConfigBase):
     def _normalize_appearance_policy(cls, value: Any) -> str:
         s = str(value or "auto").strip().lower()
         return s if s in {"auto", "never", "keep"} else "auto"
-
-
-class RandomSceneSection(PluginConfigBase):
-    __ui_label__: ClassVar[str] = "随机场景生成配置"
-    __ui_order__: ClassVar[int] = 8
-    temperature: float = Field(
-        default=1.0, ge=0.0, le=2.0, description="LLM温度",
-        json_schema_extra=_ui("LLM 温度", order=0, step=0.1, hint="随机场景生成温度，越高越多样"),
-    )
-    max_tokens: int = Field(
-        default=200, ge=1, le=4000, description="LLM最大输出token",
-        json_schema_extra=_ui("最大输出 token", order=1),
-    )
 
 
 class QueueSection(PluginConfigBase):
@@ -539,13 +532,14 @@ class AiDrawPluginConfig(PluginConfigBase):
     prompt_show: PromptShowSection = Field(default_factory=PromptShowSection)
     artist_presets: ArtistPresetsSection = Field(default_factory=ArtistPresetsSection)
     styles: StylesSection = Field(default_factory=StylesSection)
-    random_scene: RandomSceneSection = Field(default_factory=RandomSceneSection)
     queue: QueueSection = Field(default_factory=QueueSection)
     custom_prompt: CustomPromptSection = Field(default_factory=CustomPromptSection)
     models: ModelsSectionConfig = Field(default_factory=ModelsSectionConfig)
 
 
+# ================================================================
 # Plugin Class
+# ================================================================
 
 class AiDrawPlugin(MaiBotPlugin):
     """AI Draw 图片生成插件，命令前缀 /ad（AI Draw）"""
@@ -560,7 +554,9 @@ class AiDrawPlugin(MaiBotPlugin):
     SIZE_MAPPINGS: ClassVar[dict] = SIZE_MAPPINGS
     BESTNAI_MODEL_IDS: ClassVar[list] = BESTNAI_MODEL_IDS
 
+    # ================================================================
     # Lifecycle
+    # ================================================================
 
     async def on_load(self) -> None:
         import importlib
@@ -603,7 +599,7 @@ class AiDrawPlugin(MaiBotPlugin):
         set_plugin_instance(self)
 
         self.ctx.logger.info(
-            f"ai_draw_plugin v2.4.3 已加载，共 {len(self._loaded_models)} 个模型配置"
+            f"ai_draw_plugin v2.4.4 已加载，共 {len(self._loaded_models)} 个模型配置"
         )
 
     async def on_unload(self) -> None:
@@ -655,7 +651,9 @@ class AiDrawPlugin(MaiBotPlugin):
         except Exception:
             pass
 
+    # ================================================================
     # Config helpers
+    # ================================================================
 
     def _load_raw_models_config(self) -> dict:
         """直接从 TOML 文件读取 [models] 原始配置（绕过 PluginConfigBase 的字段过滤）。
@@ -711,26 +709,12 @@ class AiDrawPlugin(MaiBotPlugin):
             return obj
         return get_config
 
+    # ================================================================
     # Session info
+    # ================================================================
 
     def _extract_session_info(self, kwargs: dict) -> dict:
-        message = kwargs.get("message", {})
-        if isinstance(message, dict) and message:
-            platform = str(message.get("platform", "") or "")
-            info = message.get("message_info", {}) or {}
-            group_info = info.get("group_info") or {}
-            user_info = info.get("user_info") or {}
-            user_id = str(user_info.get("user_id", "") or "")
-            group_id = str(group_info.get("group_id") or "")
-            chat_id = group_id or user_id
-            chat_type = "group" if group_id else "private"
-            return {"platform": platform, "chat_id": chat_id, "user_id": user_id, "chat_type": chat_type}
-
-        user_id = str(kwargs.get("user_id", "") or "")
-        group_id = str(kwargs.get("group_id", "") or "")
-        chat_id = group_id or user_id or str(kwargs.get("stream_id", "") or "")
-        chat_type = "group" if group_id else "private"
-        return {"platform": "", "chat_id": chat_id, "user_id": user_id, "chat_type": chat_type}
+        return extract_session_info(kwargs)
 
     def _get_job_session_key(self, kwargs: dict) -> str:
         """返回队列使用的稳定会话键，避免不同平台或会话互相串任务。"""
@@ -743,7 +727,9 @@ class AiDrawPlugin(MaiBotPlugin):
             return f"stream:{stream_id}"
         return f"{platform}:unknown:{info['user_id'] or 'unknown'}"
 
+    # ================================================================
     # Permission
+    # ================================================================
 
     def _check_user_permission_from_kwargs(self, kwargs: dict) -> bool:
         info = self._extract_session_info(kwargs)
@@ -751,7 +737,9 @@ class AiDrawPlugin(MaiBotPlugin):
             info["platform"], info["chat_id"], info["user_id"], self._get_config_callable(),
         )
 
+    # ================================================================
     # Model config resolution
+    # ================================================================
 
     def _get_model_config_from_kwargs(self, kwargs: dict, apply_artist_preset: bool = True) -> dict:
         """构建合并后的模型配置字典（从 [models.modelX] 中获取完整配置）。
@@ -833,7 +821,9 @@ class AiDrawPlugin(MaiBotPlugin):
                 return mid
         return None
 
+    # ================================================================
     # Task tracking
+    # ================================================================
 
     def _track_task(self, task: asyncio.Task) -> None:
         self._pending_tasks.append(task)
@@ -1024,7 +1014,9 @@ class AiDrawPlugin(MaiBotPlugin):
         return await handle_ad_draw((matched.get("description") or "").strip(), kwargs)
 
 
+# ================================================================
 # Factory
+# ================================================================
 
 def create_plugin():
     return AiDrawPlugin()

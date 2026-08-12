@@ -47,7 +47,6 @@ class SessionStateManager:
         self._send_mode: Dict[str, str] = {}  # /ad send direct|forward 会话级发送方式
         self._last_draw_context: Dict[str, Tuple[str, str, float]] = {}
         self._last_selfie_context: Dict[str, Tuple[str, str, str, Dict[str, List[str]], float]] = {}
-        self._recent_random_scenes: Dict[str, List[str]] = {}
         self._loaded_models: Dict[str, dict] = {}  # 由 plugin.on_load 注入
 
     @staticmethod
@@ -370,22 +369,41 @@ class SessionStateManager:
 
     # ==================== 上一轮提示词上下文（Action 专用）====================
 
-    def get_last_draw_context(self, chat_stream_id: str, ttl: float = 0) -> Tuple[Optional[str], Optional[str]]:
+    @staticmethod
+    def _content_context_key(
+        chat_stream_id: str, nsfw_enabled: Optional[bool],
+    ) -> str:
+        if nsfw_enabled is None:
+            return chat_stream_id
+        mode = "filter_on" if nsfw_enabled else "filter_off"
+        return f"{chat_stream_id}::content_mode:{mode}"
+
+    def get_last_draw_context(
+        self, chat_stream_id: str, ttl: float = 0,
+        nsfw_enabled: Optional[bool] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
         if not chat_stream_id:
             return None, None
-        entry = self._last_draw_context.get(chat_stream_id)
+        context_key = self._content_context_key(chat_stream_id, nsfw_enabled)
+        entry = self._last_draw_context.get(context_key)
         if entry is None:
             return None, None
         prompt, request, ts = entry
         if ttl > 0 and (time.time() - ts) > ttl:
-            self._last_draw_context.pop(chat_stream_id, None)
+            self._last_draw_context.pop(context_key, None)
             return None, None
         return prompt, request or None
 
-    def set_last_draw_context(self, chat_stream_id: str, prompt: str, request: str = ""):
+    def set_last_draw_context(
+        self, chat_stream_id: str, prompt: str, request: str = "",
+        nsfw_enabled: Optional[bool] = None,
+    ):
         if not chat_stream_id or not isinstance(prompt, str) or not prompt.strip():
             return
-        self._last_draw_context[chat_stream_id] = (prompt.strip(), (request or "").strip(), time.time())
+        context_key = self._content_context_key(chat_stream_id, nsfw_enabled)
+        self._last_draw_context[context_key] = (
+            prompt.strip(), (request or "").strip(), time.time(),
+        )
         self._trim_oldest(self._last_draw_context, self._MAX_CONTEXT_ENTRIES)
 
     def get_last_draw_prompt(self, chat_stream_id: str) -> Optional[str]:
@@ -398,22 +416,25 @@ class SessionStateManager:
     # ==================== 上一轮自拍场景 ====================
 
     def get_last_selfie_context(
-        self, chat_stream_id: str, ttl: float = 0
+        self, chat_stream_id: str, ttl: float = 0,
+        nsfw_enabled: Optional[bool] = None,
     ) -> Tuple[Optional[str], Optional[str], Optional[str], Dict[str, List[str]]]:
         if not chat_stream_id:
             return None, None, None, {}
-        entry = self._last_selfie_context.get(chat_stream_id)
+        context_key = self._content_context_key(chat_stream_id, nsfw_enabled)
+        entry = self._last_selfie_context.get(context_key)
         if entry is None:
             return None, None, None, {}
         prompt, request, scene_summary, anchor_data, ts = entry
         if ttl > 0 and (time.time() - ts) > ttl:
-            self._last_selfie_context.pop(chat_stream_id, None)
+            self._last_selfie_context.pop(context_key, None)
             return None, None, None, {}
         return prompt or None, request or None, scene_summary or None, dict(anchor_data or {})
 
     def set_last_selfie_context(
         self, chat_stream_id: str, prompt: str, request: str = "",
         scene_summary: str = "", anchor_data: Optional[Dict[str, List[str]]] = None,
+        nsfw_enabled: Optional[bool] = None,
     ):
         if not chat_stream_id:
             return
@@ -422,7 +443,8 @@ class SessionStateManager:
         normalized_anchor = dict(anchor_data or {})
         if not prompt_text and not scene_text and not normalized_anchor:
             return
-        self._last_selfie_context[chat_stream_id] = (
+        context_key = self._content_context_key(chat_stream_id, nsfw_enabled)
+        self._last_selfie_context[context_key] = (
             prompt_text, (request or "").strip(), scene_text,
             normalized_anchor, time.time(),
         )
@@ -433,27 +455,16 @@ class SessionStateManager:
         if not chat_stream_id:
             return False
         removed = False
+        context_keys = (
+            chat_stream_id,
+            self._content_context_key(chat_stream_id, True),
+            self._content_context_key(chat_stream_id, False),
+        )
         for mapping in (self._last_draw_context, self._last_selfie_context):
-            if mapping.pop(chat_stream_id, None) is not None:
-                removed = True
+            for context_key in context_keys:
+                if mapping.pop(context_key, None) is not None:
+                    removed = True
         return removed
-
-    def get_recent_random_scenes(self, chat_stream_id: str) -> List[str]:
-        if not chat_stream_id:
-            return []
-        return list(self._recent_random_scenes.get(chat_stream_id, []))
-
-    def add_recent_random_scene(self, chat_stream_id: str, scene: str, limit: int = 5) -> None:
-        if not chat_stream_id or not scene or not scene.strip():
-            return
-        scenes = self._recent_random_scenes.setdefault(chat_stream_id, [])
-        normalized = scene.strip()
-        if normalized in scenes:
-            scenes.remove(normalized)
-        scenes.append(normalized)
-        del scenes[:-max(1, int(limit))]
-        self._trim_oldest(self._recent_random_scenes, self._MAX_CONTEXT_ENTRIES)
-
 
 def _normalize_artist_presets(presets) -> List[Dict]:
     """归一化画师预设：支持 dict 格式 {name: prompt} 和 list 格式 [{name, prompt}]。"""

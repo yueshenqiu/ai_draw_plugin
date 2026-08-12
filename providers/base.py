@@ -11,10 +11,13 @@ import binascii
 import io
 import json
 import math
-from typing import Dict, Any, Tuple, Optional, Set
+from typing import TYPE_CHECKING, Dict, Any, Tuple, Optional, Set
 from urllib.parse import urlsplit
 
 from PIL import Image, UnidentifiedImageError
+
+if TYPE_CHECKING:
+    from ..core.prompt_types import StructuredPrompt
 
 
 class ResponseLimitError(ValueError):
@@ -42,6 +45,7 @@ class BaseImageProvider(ABC):
         size: Optional[str] = None,
         ref_image: str = "",
         ref_mode: str = "",
+        structured_prompt: Optional["StructuredPrompt"] = None,
     ) -> Tuple[bool, str]:
         """生成图片。
 
@@ -51,6 +55,7 @@ class BaseImageProvider(ABC):
             size: 图片尺寸（如 "832x1216" 或 "竖图"）
             ref_image: 参考图片 base64（用于图生图/角色参考/画风参考）
             ref_mode: 参考模式（i2i / character / style / character&style）
+            structured_prompt: 当前任务的可选 NovelAI 分层提示词
 
         Returns:
             Tuple[bool, str]: (是否成功, 图片数据或错误信息)

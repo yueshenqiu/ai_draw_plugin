@@ -6,11 +6,12 @@
 """
 
 import asyncio
+from dataclasses import replace
 import json
 import math
 import re
 import ssl
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -18,6 +19,9 @@ import certifi
 
 from .base import BaseImageProvider, ResponseLimitError
 from .capabilities import YESNAI_CAPABILITIES
+
+if TYPE_CHECKING:
+    from ..core.prompt_types import StructuredPrompt
 
 
 class YesNAIProvider(BaseImageProvider):
@@ -36,6 +40,7 @@ class YesNAIProvider(BaseImageProvider):
         "director_reference_images", "director_reference_strength_values",
         "director_reference_secondary_strength_values", "ref_image", "ref_mode",
         "ref_strength", "ref_fidelity",
+        "characterPrompts", "v4_prompt", "v4_negative_prompt",
     }
 
     # 匹配中/日/韩文 + 全角符号（NewAPI 仅允许英文，YesNovelAI 原生 NAI 同样要求英文 tag）
@@ -50,7 +55,72 @@ class YesNAIProvider(BaseImageProvider):
     def __init__(self, logger, log_prefix: str = ""):
         super().__init__(logger, log_prefix)
 
+    def _build_request_body(
+        self,
+        model_name: str,
+        action: str,
+        full_prompt: str,
+        parameters: Dict[str, Any],
+        negative_prompt: str,
+        artist_prompt: str = "",
+        custom_prompt_add: str = "",
+        structured_prompt: Optional["StructuredPrompt"] = None,
+    ) -> Dict[str, Any]:
+        request_parameters = dict(parameters)
+        request_prompt = full_prompt
+        if structured_prompt is not None and structured_prompt.people:
+            center = {"x": 0.5, "y": 0.5}
+            character_prompts = []
+            positive_captions = []
+            negative_captions = []
+            for person in structured_prompt.people:
+                positive = ", ".join(person.positive_tags)
+                negative = ", ".join(person.negative_tags)
+                character_prompts.append({
+                    "prompt": positive,
+                    "uc": negative,
+                    "center": dict(center),
+                    "enabled": True,
+                })
+                positive_captions.append({
+                    "char_caption": positive,
+                    "centers": [dict(center)],
+                })
+                negative_captions.append({
+                    "char_caption": negative,
+                    "centers": [dict(center)],
+                })
+            request_parameters["characterPrompts"] = character_prompts
+            request_parameters["v4_prompt"] = {
+                "caption": {
+                    "base_caption": "",
+                    "char_captions": positive_captions,
+                },
+                "use_coords": False,
+                "use_order": True,
+            }
+            request_parameters["v4_negative_prompt"] = {
+                "caption": {
+                    "base_caption": negative_prompt or "",
+                    "char_captions": negative_captions,
+                },
+                "legacy_uc": False,
+            }
+            request_prompt = ", ".join(part for part in (
+                artist_prompt.strip(),
+                custom_prompt_add.strip(),
+                ", ".join(structured_prompt.global_tags).strip(),
+            ) if part)
+        return {
+            "model": model_name,
+            "action": action,
+            "input": request_prompt,
+            "parameters": request_parameters,
+        }
+
+    # ================================================================
     # Public API
+    # ================================================================
 
     async def generate(
         self,
@@ -59,6 +129,7 @@ class YesNAIProvider(BaseImageProvider):
         size: Optional[str] = None,
         ref_image: str = "",
         ref_mode: str = "",
+        structured_prompt: Optional["StructuredPrompt"] = None,
     ) -> Tuple[bool, str]:
         """调用 YesNovelAI /v1/nai/generate-image 接口生成图片（异步）。"""
         try:
@@ -147,6 +218,11 @@ class YesNAIProvider(BaseImageProvider):
             # ── 安全清理 CJK 字符 ──
             full_prompt = self._sanitize_prompt(full_prompt)
             negative_prompt = self._sanitize_prompt(negative_prompt)
+            custom_prompt_add = self._sanitize_prompt(custom_prompt_add)
+            artist_prompt = self._sanitize_prompt(artist_prompt or "")
+            structured_prompt = self._sanitize_structured_prompt(
+                structured_prompt, model_name,
+            )
 
             steps = self.bounded_int(
                 steps,
@@ -242,13 +318,16 @@ class YesNAIProvider(BaseImageProvider):
             if ref_extra:
                 parameters.update(ref_extra)
 
-            # ── 构建请求体 ──
-            body: Dict[str, Any] = {
-                "model": model_name,
-                "action": action,
-                "input": full_prompt,
-                "parameters": parameters,
-            }
+            body = self._build_request_body(
+                model_name=model_name,
+                action=action,
+                full_prompt=full_prompt,
+                parameters=parameters,
+                negative_prompt=negative_prompt,
+                artist_prompt=artist_prompt,
+                custom_prompt_add=custom_prompt_add,
+                structured_prompt=structured_prompt,
+            )
 
             headers = {
                 "Content-Type": "application/json",
@@ -363,7 +442,9 @@ class YesNAIProvider(BaseImageProvider):
                 )
         return bytes(content)
 
+    # ================================================================
     # 参考图参数构建
+    # ================================================================
 
     def _build_ref_params(
         self,
@@ -411,7 +492,9 @@ class YesNAIProvider(BaseImageProvider):
         )
         return "generate", {}
 
+    # ================================================================
     # 响应解析
+    # ================================================================
 
     def _parse_response(self, data: Any) -> Tuple[bool, str]:
         """解析 YesNovelAI 响应，返回 (成功, 图片base64或错误信息)。"""
@@ -465,7 +548,9 @@ class YesNAIProvider(BaseImageProvider):
         )
         return True, normalized_image
 
+    # ================================================================
     # 工具方法
+    # ================================================================
 
     @staticmethod
     def _strip_data_uri(image: str) -> str:
@@ -539,3 +624,40 @@ class YesNAIProvider(BaseImageProvider):
                 f"{self.log_prefix} (YesNAI) 提示词含非英文字符，已自动清理"
             )
         return cleaned
+
+    def _sanitize_structured_prompt(self, structured_prompt, model: str):
+        if structured_prompt is None or not self._is_novelai_v4_model(model):
+            return None
+        global_tags = tuple(
+            cleaned for tag in structured_prompt.global_tags
+            if (cleaned := self._sanitize_prompt(tag))
+        )
+        people = []
+        for person in structured_prompt.people:
+            positive_tags = tuple(
+                cleaned for tag in person.positive_tags
+                if (cleaned := self._sanitize_prompt(tag))
+            )
+            if not positive_tags:
+                return None
+            negative_tags = tuple(
+                cleaned for tag in person.negative_tags
+                if (cleaned := self._sanitize_prompt(tag))
+            )
+            people.append(replace(
+                person,
+                positive_tags=positive_tags,
+                negative_tags=negative_tags,
+            ))
+        if not global_tags:
+            return None
+        return replace(
+            structured_prompt,
+            global_tags=global_tags,
+            people=tuple(people),
+        )
+
+    @staticmethod
+    def _is_novelai_v4_model(model: str) -> bool:
+        value = str(model or "").strip().lower()
+        return "nai-diffusion-4" in value or "novelai-v4" in value

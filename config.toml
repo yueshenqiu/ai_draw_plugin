@@ -3,7 +3,7 @@
 
 [plugin]
 enabled = true
-config_version = "2.4.3"
+config_version = "2.4.4"
 send_mode = "direct"
 force_forward_when_nsfw_off = true
 use_http_direct = false
@@ -64,10 +64,6 @@ prompt = "artist:kedama milk,artist:satou kuuki,artist:kz oji,artist:croriin,mas
 [[styles.presets]]
 name = "BGD质感"
 prompt = "BJD texture, top-down shot, delicate skin texture, added blue noise, dark background, natural soft light highlights, 8K ultra HD, cinematic lighting, detail sharpening, transparent texture"
-
-[random_scene]
-temperature = 1.0
-max_tokens = 200
 
 [queue]
 enabled = false

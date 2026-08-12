@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 
 from .http_client import get_session
+from .prompt_types import GeneratedPrompt, PersonPrompt, StructuredPrompt
 
 _logger = logging.getLogger("ai_draw_plugin")
 
@@ -30,7 +31,9 @@ def inject_logger(logger):
     _logger = logger
 
 
+# ================================================================
 # LLM API 调用（从 llm_helper.py 迁移）
+# ================================================================
 
 _EXPECTED_OUTPUT_PATTERN = re.compile(
     r"(\[(?:SCENE|PROMPT|NEG|CHARACTER|STYLE|SETTING)\][\s\S]*?(?:\[/(?:SCENE|PROMPT|NEG|CHARACTER|STYLE|SETTING)\])?)",
@@ -178,7 +181,9 @@ def get_custom_api_config(config: Dict[str, Any]) -> Tuple[str, str, str]:
     return api_base, api_key, mdl
 
 
+# ================================================================
 # 提示词模板渲染（从 prompt_rules.py 引用 + 自建渲染逻辑）
+# ================================================================
 
 # 从旧位置导入模板（模板太大不适合内联）
 def _load_templates():
@@ -201,7 +206,9 @@ def _load_templates():
         return "", "", "", ""
 
 
+# ================================================================
 # 输出解析（从 prompt_output_parser.py 迁移）
+# ================================================================
 
 
 def _strip_code_fence(text: str) -> str:
@@ -218,9 +225,24 @@ def _strip_code_fence(text: str) -> str:
 
 
 def _join_tags(tags) -> str:
-    if not tags or not isinstance(tags, list):
+    if not tags or not isinstance(tags, (list, tuple)):
         return ""
     return ", ".join([t.strip() for t in tags if isinstance(t, str) and t.strip()]).strip()
+
+
+def _normalize_tag_sequence(value: Any) -> Tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(
+        tag.strip()
+        for tag in value
+        if isinstance(tag, str) and tag.strip()
+    )
+
+
+def _normalize_choice(value: Any, allowed: Tuple[str, ...], default: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in allowed else default
 
 
 def parse_structured_prompt_payload(text: str) -> Optional[Dict[str, Any]]:
@@ -255,39 +277,103 @@ def parse_structured_prompt_payload(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _render_from_v2(obj: dict) -> Optional[str]:
-    global_tags = obj.get("global")
-    if not isinstance(global_tags, list):
-        return None
+def render_structured_prompt_flat(
+    global_tags: Tuple[str, ...], people: Tuple[PersonPrompt, ...],
+) -> str:
+    """将分层提示词渲染为完整的正向兼容字符串。"""
     first_line = _join_tags(global_tags)
     if not first_line:
-        return None
+        return ""
 
-    people = obj.get("people", []) or []
-    if not isinstance(people, list):
-        people = []
-
-    format_value = str(obj.get("format", "") or "").strip().lower()
-    valid_people = []
-    for person_tags in people:
-        if not isinstance(person_tags, list):
-            continue
-        person_line = [t.strip() for t in person_tags if isinstance(t, str) and t.strip()]
-        if person_line:
-            valid_people.append(person_line)
-
-    if format_value != "multi" or len(valid_people) <= 1:
-        if valid_people:
-            merged = _join_tags(global_tags + valid_people[0])
+    if len(people) <= 1:
+        if people:
+            merged = _join_tags(global_tags + people[0].positive_tags)
             return merged if merged else first_line
         return first_line
 
     lines = [first_line + ","]
-    for i, person_tags in enumerate(valid_people, start=1):
-        person_line = _join_tags(person_tags)
+    for i, person in enumerate(people, start=1):
+        person_line = _join_tags(person.positive_tags)
         if person_line:
             lines.append(f"char{i}:{person_line},")
     return "\n".join(lines).strip()
+
+
+def _render_positive_fallback(obj: Dict[str, Any]) -> str:
+    """从不可用的结构对象中尽量保留正向标签，且绝不混入人物负向。"""
+    global_tags = _normalize_tag_sequence(obj.get("global"))
+    raw_people = obj.get("people")
+    people = []
+    if isinstance(raw_people, list):
+        for item in raw_people:
+            value = item.get("prompt") if isinstance(item, dict) else item
+            positive_tags = _normalize_tag_sequence(value)
+            if not positive_tags and isinstance(value, str):
+                positive_tags = tuple(
+                    tag.strip()
+                    for tag in re.split(r"[,\n]", value)
+                    if tag.strip()
+                )
+            if positive_tags:
+                people.append(PersonPrompt(positive_tags=positive_tags, negative_tags=()))
+
+    if global_tags:
+        return render_structured_prompt_flat(global_tags, tuple(people))
+    return _join_tags(tuple(
+        tag for person in people for tag in person.positive_tags
+    ))
+
+
+def parse_structured_prompt(obj: Dict[str, Any]) -> Optional[StructuredPrompt]:
+    """把 v2+ global/people JSON 归一成不可变的内部结构。"""
+    global_tags = _normalize_tag_sequence(obj.get("global"))
+    if not global_tags:
+        return None
+
+    raw_people = obj.get("people", []) or []
+    people_list = []
+    if not isinstance(raw_people, list):
+        return None
+    for item in raw_people:
+        if isinstance(item, dict):
+            positive_tags = _normalize_tag_sequence(item.get("prompt"))
+            if not positive_tags:
+                return None
+            negative_tags = _normalize_tag_sequence(item.get("negative_prompt"))
+        else:
+            positive_tags = _normalize_tag_sequence(item)
+            if not positive_tags:
+                return None
+            negative_tags = ()
+        people_list.append(PersonPrompt(
+            positive_tags=positive_tags,
+            negative_tags=negative_tags,
+        ))
+    people = tuple(people_list)
+
+    format_value = "multi" if len(people) > 1 else "single"
+    flat_prompt = render_structured_prompt_flat(global_tags, people)
+    if not flat_prompt:
+        return None
+
+    return StructuredPrompt(
+        global_tags=global_tags,
+        people=people,
+        format=format_value,
+        intent=_normalize_choice(obj.get("intent"), ("normal", "selfie"), "normal"),
+        continuity=_normalize_choice(
+            obj.get("continuity"), ("new", "keep", "adjust", "switch"), "new",
+        ),
+    )
+
+
+def _render_from_v2(obj: dict) -> Optional[str]:
+    structured = parse_structured_prompt(obj)
+    if not structured:
+        return _render_positive_fallback(obj) or None
+    return render_structured_prompt_flat(
+        structured.global_tags, structured.people,
+    )
 
 
 def parse_prompt_from_structured_output(text: str) -> Optional[str]:
@@ -310,7 +396,37 @@ def parse_prompt_from_structured_output(text: str) -> Optional[str]:
     return None
 
 
+def parse_generated_prompt(text: str) -> GeneratedPrompt:
+    """解析 LLM 输出，并在可用时同时返回 NovelAI 分层提示词。"""
+    obj = parse_structured_prompt_payload(text)
+    if obj:
+        version = obj.get("version")
+        if version in (2, 3, 4) or (isinstance(version, int) and version >= 2):
+            structured = parse_structured_prompt(obj)
+            if structured:
+                return GeneratedPrompt(
+                    flat_prompt=render_structured_prompt_flat(
+                        structured.global_tags, structured.people,
+                    ),
+                    structured_prompt=structured,
+                )
+            fallback = _render_positive_fallback(obj)
+            if fallback:
+                return GeneratedPrompt(flat_prompt=fallback)
+
+        prompt = obj.get("prompt")
+        if isinstance(prompt, str) and prompt.strip():
+            normalized = prompt.strip()
+            if "\\n|" in normalized:
+                normalized = normalized.replace("\\n", "\n")
+            return GeneratedPrompt(flat_prompt=normalized)
+
+    return GeneratedPrompt(flat_prompt=_cleanup_plain_llm_prompt(text))
+
+
+# ================================================================
 # 后处理排序（从 prompt_postprocessor.py 迁移）
+# ================================================================
 
 _COUNT_RE = re.compile(r"^(?:solo|\d+girls|\d+boys|\d+people|1girl|1boy)$", re.IGNORECASE)
 _YEAR_RE = re.compile(r"^year\s+\d{4}$", re.IGNORECASE)
@@ -500,16 +616,13 @@ def normalize_prompt_order(prompt: str) -> str:
     return _join_prompt_segments(out_lines, prompt)
 
 
+# ================================================================
 # LLM 提示词清理
+# ================================================================
 
-def cleanup_llm_prompt(prompt: str) -> str:
-    """清理 LLM 返回的原始文本，提取有效提示词。"""
+def _cleanup_plain_llm_prompt(prompt: str) -> str:
     if not prompt:
         return ""
-
-    parsed = parse_prompt_from_structured_output(prompt)
-    if parsed:
-        return parsed
 
     cleaned = prompt.strip()
     if cleaned.startswith("```") and cleaned.endswith("```"):
@@ -538,7 +651,14 @@ def cleanup_llm_prompt(prompt: str) -> str:
     return cleaned
 
 
+def cleanup_llm_prompt(prompt: str) -> str:
+    """兼容旧调用：始终返回可显示、可发送的完整正向提示词字符串。"""
+    return parse_generated_prompt(prompt).flat_prompt
+
+
+# ================================================================
 # 时间上下文
+# ================================================================
 
 def build_current_time_context() -> str:
     now = datetime.now()

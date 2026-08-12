@@ -7,12 +7,13 @@
 
 import asyncio
 import base64
+from dataclasses import replace
 import io
 import json
 import math
 import re
 import ssl
-from typing import Dict, Any, Tuple, Optional, List
+from typing import TYPE_CHECKING, Dict, Any, Tuple, Optional, List
 
 import requests
 import certifi
@@ -23,6 +24,9 @@ from urllib3.util.ssl_ import create_urllib3_context
 
 from .base import BaseImageProvider, ResponseLimitError
 from .capabilities import BESTNAI_CAPABILITIES
+
+if TYPE_CHECKING:
+    from ..core.prompt_types import StructuredPrompt
 
 
 class SSLAdapter(HTTPAdapter):
@@ -57,6 +61,7 @@ class BestNAIProvider(BaseImageProvider):
         "director_reference_images", "director_reference_strength_values",
         "director_reference_secondary_strength_values", "ref_image", "ref_mode",
         "ref_strength", "ref_fidelity", "max_tokens", "stream",
+        "characters", "use_coords", "use_order",
     }
 
     # 匹配中/日/韩文 + 全角符号（NewAPI 仅允许英文）
@@ -76,7 +81,9 @@ class BestNAIProvider(BaseImageProvider):
         self.direct_session: Optional[requests.Session] = None
         self._auto_proxy_direct_only = False
 
+    # ================================================================
     # Public API
+    # ================================================================
 
     async def generate(
         self,
@@ -85,6 +92,7 @@ class BestNAIProvider(BaseImageProvider):
         size: Optional[str] = None,
         ref_image: str = "",
         ref_mode: str = "",
+        structured_prompt: Optional["StructuredPrompt"] = None,
     ) -> Tuple[bool, str]:
         """调用 BestNAI Chat Completions 接口生成图片（异步）。"""
         try:
@@ -140,8 +148,12 @@ class BestNAIProvider(BaseImageProvider):
             # 安全清理：NewAPI 不允许非英文内容
             full_prompt = self._sanitize_prompt(full_prompt)
             negative_prompt = self._sanitize_prompt(negative_prompt)
+            custom_prompt_add = self._sanitize_prompt(custom_prompt_add)
             if artist_prompt:
                 artist_prompt = self._sanitize_prompt(artist_prompt)
+            structured_prompt = self._sanitize_structured_prompt(
+                structured_prompt, model_name,
+            )
 
             normalized_size = self._normalize_size(final_size)
             if final_size and normalized_size is None:
@@ -236,6 +248,14 @@ class BestNAIProvider(BaseImageProvider):
                 ref_fidelity=ref_fidelity,
                 ref_strength=ref_strength,
                 seed=seed,
+                structured_prompt=structured_prompt,
+                structured_base_prompt=(
+                    f"{custom_prompt_add}, {', '.join(structured_prompt.global_tags)}"
+                    if structured_prompt is not None and custom_prompt_add
+                    else ", ".join(structured_prompt.global_tags)
+                    if structured_prompt is not None
+                    else ""
+                ),
             )
 
             # max_tokens 预算
@@ -343,7 +363,9 @@ class BestNAIProvider(BaseImageProvider):
             self._logger.error(f"{self.log_prefix} (BestNAI) 请求异常: {e!r}", exc_info=True)
             return False, f"BestNAI 接口请求失败: {str(e)[:100]}"
 
+    # ================================================================
     # HTTP Session 管理
+    # ================================================================
 
     @staticmethod
     def _create_session(trust_env: bool) -> requests.Session:
@@ -467,7 +489,9 @@ class BestNAIProvider(BaseImageProvider):
             current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
         return False
 
+    # ================================================================
     # 提示词清理
+    # ================================================================
 
     def _sanitize_prompt(self, text: str) -> str:
         """清理提示词中的中/日/韩文和全角符号。"""
@@ -486,7 +510,9 @@ class BestNAIProvider(BaseImageProvider):
             self._logger.warning(f"{self.log_prefix} (BestNAI) 提示词含非英文字符，已自动清理")
         return cleaned
 
+    # ================================================================
     # 生成参数构建
+    # ================================================================
 
     def _build_generation_params(
         self, prompt, artist_prompt, negative_prompt, sampler, steps,
@@ -494,6 +520,8 @@ class BestNAIProvider(BaseImageProvider):
         extra_params, model="", ref_image="", ref_mode="",
         ref_fidelity: float = 1.0, ref_strength: float = 1.0,
         seed: int = -1,
+        structured_prompt: Optional["StructuredPrompt"] = None,
+        structured_base_prompt: str = "",
     ) -> Dict[str, Any]:
         """构造 NewAPI 绘图参数。"""
         safe_extra_params = self.filter_extra_params(
@@ -510,6 +538,21 @@ class BestNAIProvider(BaseImageProvider):
             "prompt": combined_prompt,
             "n_samples": 1,
         }
+
+        if structured_prompt is not None and structured_prompt.people:
+            base_prompt = structured_base_prompt.strip()
+            if artist_prompt:
+                base_prompt = f"{artist_prompt.strip()}, {base_prompt}"
+            params["prompt"] = base_prompt
+            params["characters"] = [
+                {
+                    "prompt": ", ".join(person.positive_tags),
+                    "negative_prompt": ", ".join(person.negative_tags),
+                }
+                for person in structured_prompt.people
+            ]
+            params["use_coords"] = False
+            params["use_order"] = True
 
         normalized_size = self._normalize_size(final_size)
         if normalized_size:
@@ -571,7 +614,46 @@ class BestNAIProvider(BaseImageProvider):
 
         return params
 
+    def _sanitize_structured_prompt(self, structured_prompt, model: str):
+        if structured_prompt is None or not self._is_novelai_v4_model(model):
+            return None
+        global_tags = tuple(
+            cleaned for tag in structured_prompt.global_tags
+            if (cleaned := self._sanitize_prompt(tag))
+        )
+        people = []
+        for person in structured_prompt.people:
+            positive_tags = tuple(
+                cleaned for tag in person.positive_tags
+                if (cleaned := self._sanitize_prompt(tag))
+            )
+            if not positive_tags:
+                return None
+            negative_tags = tuple(
+                cleaned for tag in person.negative_tags
+                if (cleaned := self._sanitize_prompt(tag))
+            )
+            people.append(replace(
+                person,
+                positive_tags=positive_tags,
+                negative_tags=negative_tags,
+            ))
+        if not global_tags:
+            return None
+        return replace(
+            structured_prompt,
+            global_tags=global_tags,
+            people=tuple(people),
+        )
+
+    @staticmethod
+    def _is_novelai_v4_model(model: str) -> bool:
+        value = str(model or "").strip().lower()
+        return "nai-diffusion-4" in value or "novelai-v4" in value
+
+    # ================================================================
     # 尺寸 & 图片工具
+    # ================================================================
 
     @staticmethod
     def _normalize_size(size: Optional[str]) -> Optional[List[int]]:
@@ -654,7 +736,9 @@ class BestNAIProvider(BaseImageProvider):
         except Exception:
             return b64_data
 
+    # ================================================================
     # 响应解析
+    # ================================================================
 
     def _handle_response(self, response: requests.Response) -> Tuple[bool, str]:
         if 300 <= response.status_code < 400:
