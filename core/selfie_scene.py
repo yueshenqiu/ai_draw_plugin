@@ -206,9 +206,12 @@ async def generate_scene_tags(
 
     # 优先使用自定义 API，否则使用 plugin.ctx.llm
     if has_custom_api_config({"api_base": api_base, "api_key": api_key, "model_name": model}):
+        deepseek_compatible = "deepseek" in str(model or "").lower()
         success, response, _, _ = await call_custom_llm_api(
             prompt=prompt, api_base=api_base, api_key=api_key,
             model=model, temperature=0.7, max_tokens=600, timeout=30,
+            structured_output=True,
+            thinking_mode="disabled" if deepseek_compatible else "auto",
         )
         if not success:
             _logger.warning(f"[SelfieScene] 自定义 API 调用失败: {response}")

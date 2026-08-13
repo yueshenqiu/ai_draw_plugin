@@ -17,6 +17,7 @@ import re
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -40,10 +41,62 @@ _EXPECTED_OUTPUT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_OPTIONAL_LLM_FIELDS = ("thinking", "reasoning_effort", "response_format")
+_UNSUPPORTED_PARAMETER_RE = re.compile(
+    r"(?:unsupported|unknown|unrecognized|unexpected|not\s+supported|"
+    r"not\s+allowed|extra\s+(?:field|input|parameter)|invalid\s+parameter|"
+    r"不支持|未知|未识别|不允许|多余|额外参数)",
+    re.IGNORECASE,
+)
+
+
+def _is_optional_parameter_rejection(
+    status: int, response_text: str, payload: Dict[str, Any],
+) -> bool:
+    if status not in (400, 422):
+        return False
+    present = [key for key in _OPTIONAL_LLM_FIELDS if key in payload]
+    if not present:
+        return False
+    error_text = str(response_text or "").lower()
+    return bool(_UNSUPPORTED_PARAMETER_RE.search(error_text)) and (
+        any(key in error_text for key in present)
+        or "extra field" in error_text
+        or "extra input" in error_text
+        or "额外参数" in error_text
+        or "多余" in error_text
+    )
+
 
 def _extract_final_answer_from_reasoning(reasoning: str) -> str:
     if not reasoning:
         return ""
+
+    # 部分推理模型会在输出预算耗尽前把最终 JSON 写入 reasoning_content，
+    # 却来不及生成独立 content。只回收可完整解析的标签槽位，避免把推理草稿当提示词。
+    reasoning_tail = reasoning[-65536:]
+    decoder = json.JSONDecoder()
+    object_starts = [
+        index for index, char in enumerate(reasoning_tail) if char == "{"
+    ]
+    for start in reversed(object_starts[-128:]):
+        try:
+            obj, _ = decoder.raw_decode(reasoning_tail[start:])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if parse_structured_prompt(obj) is None:
+            continue
+        candidate = json.dumps(
+            obj, ensure_ascii=False, separators=(",", ":"),
+        )
+        _logger.info(
+            "[LLM] 从 reasoning_content 提取到有效标签槽位 JSON，长度=%d",
+            len(candidate),
+        )
+        return candidate
+
     matches = list(_EXPECTED_OUTPUT_PATTERN.finditer(reasoning))
     if not matches:
         return ""
@@ -53,7 +106,7 @@ def _extract_final_answer_from_reasoning(reasoning: str) -> str:
         candidate = candidate[:2000]
     if not re.search(r"\[(?:SCENE|PROMPT|NEG)\][\s\S]+?\[/(?:SCENE|PROMPT|NEG)\]", candidate, re.IGNORECASE):
         return ""
-    _logger.info(f"[LLM] 从 reasoning_content 提取到有效输出，长度={len(candidate)}")
+    _logger.info(f"[LLM] 从 reasoning_content 提取到有效旧格式输出，长度={len(candidate)}")
     return candidate
 
 
@@ -65,6 +118,10 @@ async def call_custom_llm_api(
     temperature: float = 0.2,
     max_tokens: int = 4000,
     timeout: int = 120,
+    structured_output: bool = False,
+    thinking_mode: str = "auto",
+    reasoning_effort: str = "low",
+    json_response_mode: str = "auto",
 ) -> Tuple[bool, str, str, str]:
     """调用 OpenAI 兼容的 LLM API（异步非阻塞）。
 
@@ -91,21 +148,44 @@ async def call_custom_llm_api(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    hostname = (urlparse(api_base).hostname or "").lower()
+    official_deepseek = hostname == "api.deepseek.com"
+    deepseek_compatible = official_deepseek or "deepseek" in model.lower()
+    thinking_mode = str(thinking_mode or "auto").strip().lower()
+    reasoning_effort = str(reasoning_effort or "low").strip().lower()
+    json_response_mode = str(json_response_mode or "auto").strip().lower()
+    thinking_enabled = thinking_mode == "enabled" or (
+        thinking_mode == "auto" and deepseek_compatible
+    )
+    if thinking_mode == "disabled":
+        payload["thinking"] = {"type": "disabled"}
+    elif thinking_enabled:
+        payload["thinking"] = {"type": "enabled"}
+        if reasoning_effort in {"low", "high", "max"}:
+            payload["reasoning_effort"] = reasoning_effort
+    if structured_output and (
+        json_response_mode == "enabled"
+        or (json_response_mode == "auto" and deepseek_compatible)
+    ):
+        payload["response_format"] = {"type": "json_object"}
 
     prompt_bytes = len(prompt.encode("utf-8"))
     _logger.info(f"[LLM] 调用 {url} model={model} input={prompt_bytes}bytes")
 
-    start_time = time.time()
+    overall_start_time = time.time()
     last_error = ""
+    compatibility_fallback_used = False
 
     for attempt in range(1, 4):
+        attempt_start_time = time.time()
         try:
             session = await get_session(timeout)
             async with session.post(url, headers=headers, json=payload) as resp:
-                header_time = time.time() - start_time
+                header_time = time.time() - attempt_start_time
                 if resp.status == 200:
                     data = await resp.json()
-                    total_elapsed = time.time() - start_time
+                    total_elapsed = time.time() - overall_start_time
+                    body_time = max(0.0, total_elapsed - (attempt_start_time - overall_start_time) - header_time)
                     choices = data.get("choices", [])
                     if not choices:
                         return False, "LLM 返回空的 choices 列表", "", model
@@ -123,19 +203,34 @@ async def call_custom_llm_api(
                         if extracted:
                             content = extracted
                         else:
-                            return False, "LLM 返回空内容且 reasoning 中无格式化输出", "", model
+                            return False, "LLM 返回空内容且 reasoning 中无有效标签槽位 JSON", "", model
 
                     if not content:
                         return False, "LLM 返回空内容", "", model
 
                     actual_model = data.get("model", model)
-                    body_time = total_elapsed - header_time
                     _logger.info(
-                        f"[LLM] 成功 total={total_elapsed:.1f}s header={header_time:.1f}s "
-                        f"body={body_time:.1f}s output_len={len(content)} model={actual_model}"
+                        f"[LLM] 成功 attempt={attempt} total={total_elapsed:.1f}s "
+                        f"attempt_header={header_time:.1f}s attempt_body={body_time:.1f}s "
+                        f"output_len={len(content)} model={actual_model}"
                     )
                     return True, content, reasoning, actual_model
 
+                elif resp.status in (400, 422) and not compatibility_fallback_used:
+                    text = await resp.text()
+                    if _is_optional_parameter_rejection(resp.status, text, payload):
+                        for key in _OPTIONAL_LLM_FIELDS:
+                            payload.pop(key, None)
+                        compatibility_fallback_used = True
+                        _logger.warning(
+                            "[LLM] 当前接口不接受可选思考/JSON参数，已自动移除并重试 "
+                            "(HTTP %s: %s)",
+                            resp.status,
+                            text[:200],
+                        )
+                        continue
+                    _logger.error(f"[LLM] HTTP {resp.status}: {text[:500]}")
+                    return False, f"API 请求失败 (HTTP {resp.status})", "", model
                 elif resp.status in (429, 502, 503, 504):
                     text = await resp.text()
                     last_error = f"HTTP {resp.status}: {text[:300]}"
@@ -150,11 +245,15 @@ async def call_custom_llm_api(
 
         except asyncio.TimeoutError:
             last_error = f"请求超时 ({timeout}s)"
+            _logger.warning(
+                f"[LLM] 第{attempt}次请求超时，已耗时 {time.time() - attempt_start_time:.1f}s"
+            )
             if attempt < 3:
                 await asyncio.sleep(2)
                 continue
         except aiohttp.ClientConnectorError as e:
             last_error = f"连接失败: {str(e)[:200]}"
+            _logger.warning(f"[LLM] 第{attempt}次连接失败 ({last_error})")
             if attempt < 3:
                 await asyncio.sleep(2)
                 continue
@@ -265,13 +364,10 @@ def parse_structured_prompt_payload(text: str) -> Optional[Dict[str, Any]]:
         if not isinstance(obj, dict):
             continue
 
-        version = obj.get("version")
         has_v2_fields = isinstance(obj.get("global"), list)
         has_v1_prompt = isinstance(obj.get("prompt"), str) and obj.get("prompt", "").strip()
-        if version in (2, 3) or (isinstance(version, int) and version >= 2):
-            if has_v2_fields or has_v1_prompt:
-                return obj
-            continue
+        if has_v2_fields:
+            return obj
         if has_v1_prompt:
             return obj
     return None
@@ -324,7 +420,12 @@ def _render_positive_fallback(obj: Dict[str, Any]) -> str:
     ))
 
 
-def parse_structured_prompt(obj: Dict[str, Any]) -> Optional[StructuredPrompt]:
+def parse_structured_prompt(
+    obj: Dict[str, Any],
+    *,
+    intent: Optional[str] = None,
+    continuity: Optional[str] = None,
+) -> Optional[StructuredPrompt]:
     """把 v2+ global/people JSON 归一成不可变的内部结构。"""
     global_tags = _normalize_tag_sequence(obj.get("global"))
     if not global_tags:
@@ -360,9 +461,15 @@ def parse_structured_prompt(obj: Dict[str, Any]) -> Optional[StructuredPrompt]:
         global_tags=global_tags,
         people=people,
         format=format_value,
-        intent=_normalize_choice(obj.get("intent"), ("normal", "selfie"), "normal"),
+        intent=_normalize_choice(
+            intent if intent is not None else obj.get("intent"),
+            ("normal", "selfie"),
+            "normal",
+        ),
         continuity=_normalize_choice(
-            obj.get("continuity"), ("new", "keep", "adjust", "switch"), "new",
+            continuity if continuity is not None else obj.get("continuity"),
+            ("new", "keep", "adjust", "switch"),
+            "new",
         ),
     )
 
@@ -381,8 +488,7 @@ def parse_prompt_from_structured_output(text: str) -> Optional[str]:
     if not obj:
         return None
 
-    version = obj.get("version")
-    if version in (2, 3) or (isinstance(version, int) and version >= 2):
+    if isinstance(obj.get("global"), list):
         rendered = _render_from_v2(obj)
         if rendered:
             return rendered
@@ -396,13 +502,19 @@ def parse_prompt_from_structured_output(text: str) -> Optional[str]:
     return None
 
 
-def parse_generated_prompt(text: str) -> GeneratedPrompt:
+def parse_generated_prompt(
+    text: str,
+    *,
+    intent: Optional[str] = None,
+    continuity: Optional[str] = None,
+) -> GeneratedPrompt:
     """解析 LLM 输出，并在可用时同时返回 NovelAI 分层提示词。"""
     obj = parse_structured_prompt_payload(text)
     if obj:
-        version = obj.get("version")
-        if version in (2, 3, 4) or (isinstance(version, int) and version >= 2):
-            structured = parse_structured_prompt(obj)
+        if isinstance(obj.get("global"), list):
+            structured = parse_structured_prompt(
+                obj, intent=intent, continuity=continuity,
+            )
             if structured:
                 return GeneratedPrompt(
                     flat_prompt=render_structured_prompt_flat(

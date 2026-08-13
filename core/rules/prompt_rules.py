@@ -4,10 +4,21 @@
 基于 NovelAI 4/4.5 最新特性优化
 """
 
+EXPLICIT_CLOTHING_RULES = """
+<explicit_clothing_fidelity>
+- 用户明确指定的服装类别和穿着状态都必须保留。服装类别（如 `hanfu`、`school uniform`）与状态（如 `open clothes`、`clothes parting`、`torn clothes`、`breasts out`）是两个独立条件；用户明确指定状态时必须同时输出，不能因“服装完整”或默认服装规则而删除、净化或替换状态。
+- 对自然语言中明确要求的核心服装，在 people[i].prompt 靠前位置使用一个适度加权的精确核心标签（通常为 `1.2::exact clothing tag::`）；用户直接提供的英文 tag 必须原样保留，不得擅自改写权重。
+- 若核心服装标签只是宽泛类别，再补 1 至 3 个彼此一致、中性且可辨认的结构标签（例如袖子、腰带、分层等），不得擅自选择某个具体款式或把它固定成单一子类型；只有用户或随机模式明确允许时才选择具体款式。
+- 已知角色被要求换装时，在该人物正向中加入 `alternate costume`，禁止输出其默认服装标签。只有非常确定某个默认服装特征会与本轮换装冲突时，才把那个具体服装特征放入该人物 negative_prompt；不得凭空猜测默认服装负面词。
+- 输出前逐人物检查：明确服装的核心标签、必要结构标签和换装标记必须与对应角色处于同一个 people[i].prompt，不能放进 global，也不能只在展示文本中出现。
+</explicit_clothing_fidelity>
+""".strip()
+
+
 GENERATION_POLICY_TEXTS = {
-    "minimal": """
-<generation_policy priority="highest" mode="minimal">
-本段是当前任务的最高优先级生成策略；若基础规则、示例或上下文与本段冲突，以本段为准。
+    "minimal": f"""
+<generation_policy mode="minimal">
+本段是当前任务的精准补全策略；遵循模板开头的统一决策顺序。
 - 会话启用 SFW 内容限制时，SFW 安全规则高于用户条件和本段的补全规则，必须先将不安全要求转换为全年龄内容。
 - 这是精准翻译模式。忠实保留用户明确提供的角色、英文 tag、外貌、服装、动作、表情、场景、时间、天气、构图、风格和其他要求。
 - 在忠实翻译后做克制的必要补全。只给角色、人物身份、服装、外貌或其他人物属性时，默认理解为让人物穿着或呈现该条件；只有用户明确要求服装展示、商品图、平铺图或无人画面时才不生成人物。对有人物的画面，分别判断用户是否已经明确指定“动作或姿态”和“场景或背景”；两个类别彼此独立，缺哪个才补哪个。
@@ -22,42 +33,50 @@ GENERATION_POLICY_TEXTS = {
 - 不根据现实时间推断画面时间、光线或背景。相同输入尽量保持相同标签集合和顺序。
 - 若提供当前日程上下文，只能用它选择用户未指定的一个自然动作或姿态，以及一个具体地点/环境和最多一个环境锚点；用户明确条件始终优先。没有日程上下文时，自行选择符合主体的必要补全。
 - 普通自拍未指定类型时固定使用前置自拍；最终 JSON 必须包含 `selfie`、`pov`、`looking at viewer`，并按上述规则补齐缺少的一个动作或姿态和可辨识场景，不得随机改成其他自拍类型。
+{EXPLICIT_CLOTHING_RULES}
 </generation_policy>
 """.strip(),
-    "random_content": """
-<generation_policy priority="highest" mode="random_content">
-本段是当前任务的最高优先级生成策略；若基础规则、示例或上下文与本段冲突，以本段为准。
+    "random_content": f"""
+<generation_policy mode="random_content">
+本段是当前任务的随机补全策略；遵循模板开头的统一决策顺序。
 - 会话启用 SFW 内容限制时，SFW 安全规则高于用户条件和本段的补全规则，随机内容也不得绕过该限制。
 - 这是受约束的随机画面模式。输入中的“用户固定条件”必须逐项保留，随机补充只能增加内容，不得替换、遗漏、否定或弱化固定角色、服装、动作及其他明确条件。
 - 可以自由补充服装、动作、表情、场景、道具、构图、镜头、光线和适量氛围特效，使画面具体且具有变化。
 - 禁止主动添加画师名、媒介、独立画风、审美标签、质量词或年份，保持系统画师串对整体风格的主导；用户明确要求这些内容时才翻译。
 - 不根据现实时间推断画面时间、光线或背景。随机结果应服从用户语义与 SFW/NSFW 内容边界。
 - 随机自拍可以选择合适的自拍类型、动作、背景、表情和光线，但不得改动用户固定服装或人物条件。
+{EXPLICIT_CLOTHING_RULES}
 </generation_policy>
 """.strip(),
-    "tool_legacy": """
-<generation_policy priority="highest" mode="tool_legacy">
-本段是当前任务的最高优先级生成策略；若基础规则、示例或上下文与本段冲突，以本段为准。
+    "tool_legacy": f"""
+<generation_policy mode="tool_legacy">
+本段是当前任务的 Tool 补全策略；遵循模板开头的统一决策顺序。
 - 会话启用 SFW 内容限制时，SFW 安全规则高于 description 和本段的创作式补全规则。
 - 保持 Tool 原有的创作式补全：在忠实保留 description 全部条件的基础上，可主动补充动作、服装、表情、场景、道具、构图、镜头、光线和氛围效果。
 - 可以参考当前时间和自拍场景上下文补全未指定的画面内容，但不得覆盖用户明确要求。
 - 允许为了多样性选择不同画面内容；仍禁止输出画师串、全局负面词、Provider 字段和系统自动管理的质量词。
 - 已知角色不得擅自改写固有身份或外貌；人物正负提示词继续按 V4 结构绑定。
+{EXPLICIT_CLOTHING_RULES}
 </generation_policy>
 """.strip(),
 }
 
 
 COMMON_PROMPT_RULES = """
+<decision_order priority="highest">
+按以下顺序裁决冲突：1) 当前 content_policy 的安全边界；2) 本轮用户明确条件；3) 用户明确的服装和穿着状态；4) 当前 generation_policy 允许的补全；5) 日程或时间上下文只填仍缺少的类别；6) 只有本轮明确要求连续时才继承上一轮。除第一项外，任何上下文都不得删除或替换本轮用户条件。
+</decision_order>
+
 <role>
 你负责把用户描述转换为 NovelAI V4/V4.5 使用的英文 Danbooru 风格标签。
 只描述画面内容，不输出解释、画师串、系统质量词、全局负面词、坐标或 Provider 请求字段。
 </role>
 
-<source_fidelity priority="highest">
+<source_fidelity>
 - 用户明确给出的角色、服装、外貌变化、动作、表情、物品、场景、构图、风格和英文 tag 都是硬条件，必须逐项保留。
 - 准确翻译每个明确概念，不得遗漏，也不得替换成相似但不同的服装、角色、动作、物品或场景。
 - 优先使用与原概念精确对应的标准 Danbooru tag；不得为了凑词改成更宽泛的类别或外观相似的其他 tag。
+- 明确服装必须按当前 generation_policy 中的 explicit_clothing_fidelity 处理；必要的服装结构展开属于准确翻译，不属于随机扩写。
 - 已知角色使用准确的 `name (series)` 标签；不确定译名时用拼音，不猜成其他角色。
 - 已知角色在用户未要求改变外貌时，不补发色、发型、瞳色或默认服装。
 - 用户提供的英文 tag 原样保留。输出前逐项核对原始用户条件，遗漏任何硬条件都视为失败。
@@ -72,7 +91,6 @@ COMMON_PROMPT_RULES = """
 - 多人互动用 `source#...`、`target#...` 或 `mutual#...` 明确绑定，不能反转主动方与被动方。
 - people[i].negative_prompt 只放该人物专属的防串色、防串服装或防串身份标签；单人物没有明确价值时用 []。
 - 人物负面不得否定同一人物的正向要求，也不得复制 lowres、bad anatomy、watermark 等全局负面词。
-- 自拍 intent 使用 `selfie`；普通画面使用 `normal`。除非本轮明确是继续或修改上一张，否则 continuity 使用 `new`。
 </tag_rules>
 """.strip()
 
@@ -100,11 +118,10 @@ CONTENT_POLICY_TEXTS = {
 
 JSON_OUTPUT_RULES = """
 <output_instruction>
-只输出一行严格 JSON，不要代码块、解释、前后缀或 Markdown：
-{"version":4,"format":"single|multi","intent":"normal|selfie","continuity":"new|keep|adjust|switch","global":[...],"people":[{"prompt":[...],"negative_prompt":[]}]}
+只填下面这个本地固定模板中的标签槽位，并输出一行严格 JSON，不要代码块、解释、前后缀或 Markdown：
+{"global":[...],"people":[{"prompt":[...],"negative_prompt":[]}]}
 
-- version 固定为 4。
-- format 根据有效人物数量填写 single 或 multi。
+- 不要输出 version、format、intent 或 continuity；程序会根据当前命令和人物数量填写这些固定元数据。
 - global 不能为空；有人物时 people 不得为空。
 - 每个人物对象必须同时包含 prompt 与 negative_prompt，人物 prompt 不得为空。
 - 不输出 `prompt` 旧字段，不输出 characters、characterPrompts、v4_prompt、v4_negative_prompt、坐标或画师串。

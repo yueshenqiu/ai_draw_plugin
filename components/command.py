@@ -119,6 +119,42 @@ def _should_read_selfie_schedule(policy: str) -> bool:
     return policy in {"minimal", "random_content", "tool_legacy"}
 
 
+_CONTINUATION_REQUEST_RE = re.compile(
+    r"(?:继续|再来(?:一张|一个)?|还是这个|这身|这套|保持(?:这身|这套|设定)?|"
+    r"换(?:个|一个)(?:姿势|动作|角度|场景|背景)|修改|改成|重画|重绘|"
+    r"\b(?:again|continue|keep(?: this)?|same|redo|rerender|"
+    r"change (?:the )?(?:pose|action|angle|scene|background|outfit)))\b",
+    re.IGNORECASE,
+)
+
+_ACTION_HINT_RE = re.compile(
+    r"躺|卧|坐|站|跪|趴|蹲|走|跑|跳|睡|抱|拿|握|举|抬|托|"
+    r"微笑|笑|哭|看|望|挥手|摆|伸手|跷|盘腿|\b(?:lying|sitting|standing|"
+    r"kneeling|crouching|sleeping|walking|running|holding|looking|smile|"
+    r"waving)\b",
+    re.IGNORECASE,
+)
+_SCENE_HINT_RE = re.compile(
+    r"在[^，,。；;]{1,24}|床|卧室|浴室|教室|学校|街道|客厅|厨房|庭院|花园|"
+    r"室内|室外|背景|白底|纯色|空白|\b(?:bed|bedroom|bathroom|classroom|school|"
+    r"street|living room|kitchen|garden|indoors|outdoors|background)\b",
+    re.IGNORECASE,
+)
+
+
+def _should_inherit_previous_context(request_text: str) -> bool:
+    """仅在用户明确表达连续绘图时注入上一轮，避免新主题携带旧 Prompt。"""
+    return bool(_CONTINUATION_REQUEST_RE.search(str(request_text or "")))
+
+
+def _selfie_context_needed(description: str, policy: str) -> bool:
+    """普通/随机自拍只在动作或场景仍缺失时读取日程；Tool 保持旧行为。"""
+    if policy == "tool_legacy":
+        return True
+    text = str(description or "").strip()
+    return not (_ACTION_HINT_RE.search(text) and _SCENE_HINT_RE.search(text))
+
+
 def _build_selfie_schedule_context(policy: str, activity: str) -> str:
     activity = str(activity or "").strip()
     if not activity:
@@ -126,12 +162,14 @@ def _build_selfie_schedule_context(policy: str, activity: str) -> str:
     if policy == "minimal":
         guidance = (
             "精准自拍仅在用户未指定时，参考该活动补一个自然动作或姿态和一个简洁场景；"
-            "不得增加第二个动作、第二处场景或其他自由发挥内容。"
+            "不得增加第二个动作、第二处场景或其他自由发挥内容；"
+            "日程只提供动作和场景参考，不是穿搭来源，不得改变、替换或弱化用户指定服装。"
         )
     else:
         guidance = (
             "随机自拍时优先围绕该活动补充动作、环境、表情和光线；"
-            "用户固定的人物、服装及其他明确条件优先，不得被日程替换。"
+            "日程只提供动作和场景参考，不是穿搭来源；"
+            "用户固定的人物、服装及其他明确条件优先，不得被日程替换或弱化。"
         )
     return (
         '<selfie_scene_context source="current_schedule">\n'
@@ -1383,6 +1421,7 @@ async def ad_workflow(
         is_selfie
         and plugin.config.prompt_generator.scene_llm_enabled
         and _should_read_selfie_schedule(policy)
+        and _selfie_context_needed(description, policy)
     ):
         selfie_scene_context = await _build_selfie_scene_context(
             policy, description,
@@ -1461,6 +1500,11 @@ async def ad_workflow(
             structured_prompt,
             request_for_history,
             include_selfie_add,
+        )
+
+    if ref_mode in {"character", "character&style"}:
+        generated_prompt, structured_prompt = _process_character_reference_prompt_result(
+            generated_prompt, structured_prompt,
         )
 
     if plugin.config.prompt_generator.enforce_tag_order:
@@ -1808,6 +1852,158 @@ def _is_appearance_prompt_tag(tag: str) -> bool:
     return bool(value) and not remove_selfie_appearance_tags(value).strip()
 
 
+_REFERENCE_HAIR_TRAIT_RE = re.compile(
+    r"(?:\b(?:black|blonde|brown|blue|pink|white|silver|red|green|purple|"
+    r"orange|gray|grey|aqua|cyan|multicolored|two[- ]tone|gradient) hair\b|"
+    r"\b(?:very )?(?:long|short|medium) hair\b|\b(?:straight|wavy|curly|"
+    r"messy|spiked|fluffy|layered|silky|glossy|detailed) hair\b|"
+    r"\b(?:twintails?|twin tails|ponytail|side ponytail|pigtails?|braids?|"
+    r"side braid|hair bun|double bun|bob cut|hime cut|ahoge|bangs|blunt bangs|"
+    r"hair over shoulders|hair over one eye)\b)",
+    re.IGNORECASE,
+)
+_REFERENCE_EYE_TRAIT_RE = re.compile(
+    r"(?:\b(?:black|brown|blue|red|green|purple|orange|gray|grey|golden|"
+    r"yellow|pink|aqua|cyan|amber|multicolored) eyes?\b|\b[a-z]+-eyed\b|"
+    r"\b(?:heterochromia|detailed eyes|shiny eyes|large eyes|narrow eyes|"
+    r"long eyelashes|eyelashes)\b)",
+    re.IGNORECASE,
+)
+_REFERENCE_FACE_TRAIT_RE = re.compile(
+    r"(?:\b(?:delicate|detailed|sharp|soft|round|oval|long|small) facial features\b|"
+    r"\b(?:round|oval|long|heart-shaped|square) face\b|\b(?:small|large|button|"
+    r"pointed) nose\b|\b(?:thin|thick|bushy) eyebrows\b|\b(?:freckles|mole|"
+    r"beauty mark)\b)",
+    re.IGNORECASE,
+)
+_REFERENCE_SKIN_TRAIT_RE = re.compile(
+    r"\b(?:pale|fair|light|dark|brown|tan|tanned|olive|white|black|blue|green|"
+    r"red|purple|gray|grey) skin\b",
+    re.IGNORECASE,
+)
+_REFERENCE_FIXED_MARK_RE = re.compile(
+    r"\b(?:facial tattoo|face tattoo|tattoo|birthmark|facial scar|face scar|"
+    r"body scar|piercing|navel piercing|lip piercing|nose piercing)\b",
+    re.IGNORECASE,
+)
+_REFERENCE_BODY_TRAITS = {
+    "petite", "slim", "slender", "skinny", "curvy", "chubby", "plump",
+    "muscular", "athletic", "tall", "short", "shortstack",
+    "flat chest", "small breasts", "medium breasts", "large breasts",
+    "huge breasts", "gigantic breasts", "compact breasts", "rounded breasts",
+    "natural breasts", "perky breasts", "sagging breasts", "high bust",
+}
+_REFERENCE_SPECIES_TRAITS = {
+    "elf", "dark elf", "pointy ears", "animal ears", "cat ears", "dog ears",
+    "fox ears", "bunny ears", "wolf ears", "cat girl", "dog girl", "fox girl",
+    "demon girl", "angel", "oni", "kemonomimi", "tail", "wings", "horns",
+}
+
+
+def _normalize_reference_trait_tag(tag: str) -> str:
+    value = str(tag or "").strip()
+    value = re.sub(r"^[+-]?\d+(?:\.\d+)?::", "", value).strip()
+    value = re.sub(r"::\s*$", "", value).strip()
+    while len(value) >= 2 and (
+        (value[0] == "{" and value[-1] == "}")
+        or (value[0] == "[" and value[-1] == "]")
+    ):
+        value = value[1:-1].strip()
+    return re.sub(r"\s+", " ", value.lower()).strip()
+
+
+def _is_character_reference_trait(tag: str) -> bool:
+    value = _normalize_reference_trait_tag(tag)
+    if not value:
+        return False
+    if re.search(r"\([^)]+\)(?:\s*\(cosplay\))?$", value) or "cosplay" in value:
+        return True
+    if _REFERENCE_HAIR_TRAIT_RE.search(value) or _REFERENCE_EYE_TRAIT_RE.search(value):
+        return True
+    if _REFERENCE_FACE_TRAIT_RE.search(value) or _REFERENCE_SKIN_TRAIT_RE.search(value):
+        return True
+    if _REFERENCE_FIXED_MARK_RE.search(value):
+        return True
+    if value in _REFERENCE_BODY_TRAITS or value in _REFERENCE_SPECIES_TRAITS:
+        return True
+    if re.fullmatch(r"[a-hj-z](?:\.|-)?\s*cup", value):
+        return True
+    return False
+
+
+def _reference_person_fallback(global_tags: Tuple[str, ...]) -> str:
+    normalized = {_normalize_reference_trait_tag(tag) for tag in global_tags}
+    has_girl = any("girl" in tag for tag in normalized)
+    has_boy = any("boy" in tag for tag in normalized)
+    if has_girl and not has_boy:
+        return "girl"
+    if has_boy and not has_girl:
+        return "boy"
+    return "person"
+
+
+def _filter_character_reference_flat_prompt(prompt: str) -> str:
+    lines = []
+    for line in str(prompt or "").splitlines():
+        stripped = line.strip()
+        prefix = ""
+        match = re.match(r"^(char\d+:)\s*", stripped, re.IGNORECASE)
+        if match:
+            prefix = match.group(1)
+            stripped = stripped[match.end():]
+        trailing_comma = stripped.endswith(",")
+        tags = [tag.strip() for tag in stripped.strip(",").split(",") if tag.strip()]
+        filtered = [tag for tag in tags if not _is_character_reference_trait(tag)]
+        if not filtered:
+            if prefix:
+                filtered = ["person"]
+            else:
+                continue
+        rendered = ", ".join(filtered)
+        if prefix:
+            rendered = f"{prefix}{rendered}"
+        if trailing_comma:
+            rendered += ","
+        lines.append(rendered)
+    return "\n".join(lines).strip() or "person"
+
+
+def _process_character_reference_prompt_result(
+    flat_prompt: str,
+    structured_prompt: Optional[StructuredPrompt],
+) -> Tuple[str, Optional[StructuredPrompt]]:
+    if structured_prompt is None:
+        return _filter_character_reference_flat_prompt(flat_prompt), None
+
+    global_tags = tuple(
+        tag for tag in structured_prompt.global_tags
+        if not _is_character_reference_trait(tag)
+    )
+    fallback = _reference_person_fallback(global_tags)
+    people = []
+    for person in structured_prompt.people:
+        positive_tags = tuple(
+            tag for tag in person.positive_tags
+            if not _is_character_reference_trait(tag)
+        ) or (fallback,)
+        negative_tags = tuple(
+            tag for tag in person.negative_tags
+            if not _is_character_reference_trait(tag)
+        )
+        people.append(PersonPrompt(
+            positive_tags=positive_tags,
+            negative_tags=negative_tags,
+        ))
+    processed = StructuredPrompt(
+        global_tags=global_tags,
+        people=tuple(people),
+        format=structured_prompt.format,
+        intent=structured_prompt.intent,
+        continuity=structured_prompt.continuity,
+    )
+    return _render_structured_prompt_flat(processed), processed
+
+
 def _render_structured_prompt_flat(structured_prompt: StructuredPrompt) -> str:
     from ..core.prompt_engine import render_structured_prompt_flat
 
@@ -1840,6 +2036,13 @@ def _normalize_structured_prompt_order(
         intent=structured_prompt.intent,
         continuity=structured_prompt.continuity,
     )
+
+
+def _resolve_prompt_max_tokens(
+    configured: int, output_format: str, model_name: str,
+) -> int:
+    """Use the configured output budget without model-specific inflation."""
+    return max(1, int(configured))
 
 
 async def _generate_prompt_with_llm(
@@ -1877,7 +2080,7 @@ async def _generate_prompt_with_llm(
     )
     previous_prompt = ""
     previous_request = ""
-    if stream_id:
+    if stream_id and _should_inherit_previous_context(request_text):
         previous_prompt, previous_request = plugin._session_state.get_last_draw_context(
             stream_id, ttl=gen_cfg.inherit_ttl, nsfw_enabled=nsfw_enabled,
         )
@@ -1908,17 +2111,21 @@ async def _generate_prompt_with_llm(
         max(float(gen_cfg.temperature), 1.0)
         if policy == "random_content" else gen_cfg.temperature
     )
+    effective_max_tokens = _resolve_prompt_max_tokens(
+        gen_cfg.max_tokens, output_format, gen_cfg.model_name,
+    )
     if has_custom_api_config(llm_config):
         success, response, _, _ = await call_custom_llm_api(
             prompt=prompt, api_base=gen_cfg.api_base, api_key=gen_cfg.api_key,
             model=gen_cfg.model_name, temperature=generation_temperature,
-            max_tokens=gen_cfg.max_tokens,
+            max_tokens=effective_max_tokens,
+            structured_output=output_format == "json",
         )
     else:
         try:
             result = await plugin.ctx.llm.generate(
                 prompt=prompt, temperature=generation_temperature,
-                max_tokens=gen_cfg.max_tokens,
+                max_tokens=effective_max_tokens,
             )
             response = result.get("content", "") if isinstance(result, dict) else str(result)
             success = bool(response)
@@ -1934,6 +2141,26 @@ async def _generate_prompt_with_llm(
         return None
 
     generated = parse_generated_prompt(response)
+    if generated.structured_prompt is not None:
+        parsed = generated.structured_prompt
+        resolved_format = "multi" if len(parsed.people) > 1 else "single"
+        resolved_intent = "selfie" if is_selfie else "normal"
+        resolved_continuity = "adjust" if previous_prompt else "new"
+        if (
+            parsed.format != resolved_format
+            or parsed.intent != resolved_intent
+            or parsed.continuity != resolved_continuity
+        ):
+            generated = GeneratedPrompt(
+                flat_prompt=generated.flat_prompt,
+                structured_prompt=StructuredPrompt(
+                    global_tags=parsed.global_tags,
+                    people=parsed.people,
+                    format=resolved_format,
+                    intent=resolved_intent,
+                    continuity=resolved_continuity,
+                ),
+            )
     if output_format == "json" and generated.structured_prompt is None:
         plugin.ctx.logger.error("[LLM] JSON 输出不符合 V4 结构，已终止本次生图")
         return None
@@ -1994,7 +2221,7 @@ def _render_generator_prompt(
     if policy in {"minimal", "random_content"}:
         prompt = (
             f"{prompt.rstrip()}\n\n"
-            "<final_source_check priority=\"highest\">\n"
+            "<final_source_check>\n"
             f"原始用户条件：{request.strip()}\n"
             "输出前逐项核对原始条件中的人物、服装、动作、物品和场景；除 SFW 转换外，"
             "任何明确条件都不得遗漏或用相似概念替代。\n"
@@ -2007,8 +2234,10 @@ def _build_ref_context(ref_mode: str) -> str:
     mode = (ref_mode or "").strip().lower()
     if mode == "character":
         return (
-            "<reference_image_rules>提供了角色参考图。不要自行编造或覆盖角色的固定外貌，"
-            "尤其是发色、发型、瞳色、脸型和固有身份；服装、动作和场景仍按用户要求生成。"
+            "<reference_image_rules priority=\"highest\">提供了角色参考图，参考图是人物身份和固定外貌的唯一来源。"
+            "忽略公共模板中要求填写已知角色名或原创人物外貌的规则；禁止输出角色名、作品名、cosplay 身份，"
+            "也禁止输出发色、发型、瞳色、脸型、肤色、种族特征、固定饰物、体型和胸部尺寸等人物固有特征。"
+            "只描述人数、服装及穿着状态、临时身体状态或伤势、动作、姿势、表情、视线、道具、构图和场景。"
             "</reference_image_rules>"
         )
     if mode == "style":
@@ -2019,8 +2248,10 @@ def _build_ref_context(ref_mode: str) -> str:
         )
     if mode == "character&style":
         return (
-            "<reference_image_rules>参考图同时负责角色固定外貌与画风。不要编造固定外貌，"
-            "也不要添加画师名或额外风格标签；只描述服装、动作、构图、场景和光线。"
+            "<reference_image_rules priority=\"highest\">参考图同时是人物身份、固定外貌和画风的唯一来源。"
+            "忽略公共模板中要求填写已知角色名或原创人物外貌的规则；禁止输出角色名、作品名、cosplay 身份，"
+            "以及发色、发型、瞳色、脸型、肤色、种族特征、固定饰物、体型、胸部尺寸、画师名或额外风格标签。"
+            "只描述人数、服装及穿着状态、临时身体状态或伤势、动作、姿势、表情、视线、道具、构图、场景和光线。"
             "</reference_image_rules>"
         )
     if mode == "i2i":
