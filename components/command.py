@@ -6,6 +6,7 @@ plugin.py 中只保留 @Command/@Tool 装饰器的薄包装方法。
 """
 
 import asyncio
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -127,33 +128,9 @@ _CONTINUATION_REQUEST_RE = re.compile(
     re.IGNORECASE,
 )
 
-_ACTION_HINT_RE = re.compile(
-    r"躺|卧|坐|站|跪|趴|蹲|走|跑|跳|睡|抱|拿|握|举|抬|托|"
-    r"微笑|笑|哭|看|望|挥手|摆|伸手|跷|盘腿|\b(?:lying|sitting|standing|"
-    r"kneeling|crouching|sleeping|walking|running|holding|looking|smile|"
-    r"waving)\b",
-    re.IGNORECASE,
-)
-_SCENE_HINT_RE = re.compile(
-    r"在[^，,。；;]{1,24}|床|卧室|浴室|教室|学校|街道|客厅|厨房|庭院|花园|"
-    r"室内|室外|背景|白底|纯色|空白|\b(?:bed|bedroom|bathroom|classroom|school|"
-    r"street|living room|kitchen|garden|indoors|outdoors|background)\b",
-    re.IGNORECASE,
-)
-
-
 def _should_inherit_previous_context(request_text: str) -> bool:
     """仅在用户明确表达连续绘图时注入上一轮，避免新主题携带旧 Prompt。"""
     return bool(_CONTINUATION_REQUEST_RE.search(str(request_text or "")))
-
-
-def _selfie_context_needed(description: str, policy: str) -> bool:
-    """普通/随机自拍只在动作或场景仍缺失时读取日程；Tool 保持旧行为。"""
-    if policy == "tool_legacy":
-        return True
-    text = str(description or "").strip()
-    return not (_ACTION_HINT_RE.search(text) and _SCENE_HINT_RE.search(text))
-
 
 def _build_selfie_schedule_context(policy: str, activity: str) -> str:
     activity = str(activity or "").strip()
@@ -1421,7 +1398,6 @@ async def ad_workflow(
         is_selfie
         and plugin.config.prompt_generator.scene_llm_enabled
         and _should_read_selfie_schedule(policy)
-        and _selfie_context_needed(description, policy)
     ):
         selfie_scene_context = await _build_selfie_scene_context(
             policy, description,
@@ -2108,7 +2084,7 @@ async def _generate_prompt_with_llm(
         "api_base": gen_cfg.api_base, "api_key": gen_cfg.api_key, "model_name": gen_cfg.model_name,
     }
     generation_temperature = (
-        max(float(gen_cfg.temperature), 1.0)
+        max(float(gen_cfg.temperature), 0.7)
         if policy == "random_content" else gen_cfg.temperature
     )
     effective_max_tokens = _resolve_prompt_max_tokens(
@@ -2120,6 +2096,7 @@ async def _generate_prompt_with_llm(
             model=gen_cfg.model_name, temperature=generation_temperature,
             max_tokens=effective_max_tokens,
             structured_output=output_format == "json",
+            retry_without_thinking_on_empty=True,
         )
     else:
         try:
@@ -2161,10 +2138,41 @@ async def _generate_prompt_with_llm(
                     continuity=resolved_continuity,
                 ),
             )
-    if output_format == "json" and generated.structured_prompt is None:
-        plugin.ctx.logger.error("[LLM] JSON 输出不符合 V4 结构，已终止本次生图")
+    if not generated.flat_prompt.strip():
+        plugin.ctx.logger.error("[LLM] 输出中没有可用提示词，已终止本次生图")
         return None
+    if output_format == "json" and generated.structured_prompt is None:
+        raw_response = response.strip()
+        if _is_unusable_json_fallback(raw_response):
+            plugin.ctx.logger.error("[LLM] JSON 输出损坏，已终止本次生图")
+            return None
+        plugin.ctx.logger.warning("[LLM] 未取得 V4 分层结构，本次按兼容平铺提示词生成")
     return generated
+
+
+def _is_unusable_json_fallback(response: str) -> bool:
+    text = str(response or "").strip()
+    if text.startswith("```") and text.endswith("```"):
+        text = text[3:-3].strip()
+        if "\n" in text:
+            first_line, rest = text.split("\n", 1)
+            if first_line.strip().lower() in {"json", "javascript"}:
+                text = rest.strip()
+    # NovelAI 的合法弱化权重 `[tag]` 和旧 `[PROMPT]...` 都以 `[` 开头；
+    # 默认结构化兼容层只把损坏的 JSON 对象判为不可用。
+    if not text.startswith("{"):
+        return False
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return True
+    if not isinstance(payload, dict):
+        return True
+    return not (
+        isinstance(payload.get("global"), list)
+        or isinstance(payload.get("prompt"), str)
+        and payload.get("prompt", "").strip()
+    )
 
 
 def _render_generator_prompt(
@@ -2218,15 +2226,6 @@ def _render_generator_prompt(
     prompt = prompt.replace("<<CURRENT_TIME_CONTEXT>>", current_time)
     prompt = prompt.replace("<<SELFIE_HINT>>", selfie_hint)
     prompt = prompt.replace("<<TAG_CANDIDATES>>", "")
-    if policy in {"minimal", "random_content"}:
-        prompt = (
-            f"{prompt.rstrip()}\n\n"
-            "<final_source_check>\n"
-            f"原始用户条件：{request.strip()}\n"
-            "输出前逐项核对原始条件中的人物、服装、动作、物品和场景；除 SFW 转换外，"
-            "任何明确条件都不得遗漏或用相似概念替代。\n"
-            "</final_source_check>"
-        )
     return prompt.strip()
 
 

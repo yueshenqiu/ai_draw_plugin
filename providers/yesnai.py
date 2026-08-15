@@ -28,6 +28,13 @@ class YesNAIProvider(BaseImageProvider):
     """YesNovelAI 图片生成 Provider（NAI 原生格式）"""
 
     default_endpoint = "/v1/nai/generate-image"
+    # 最新接口的 2048/3,145,728 限制针对生成尺寸；参考图继续沿用原安全上限，
+    # 由 YesNAI/NovelAI 的参考图流程执行其自身缩放。
+    _REFERENCE_IMAGE_CAPABILITIES = replace(
+        YESNAI_CAPABILITIES,
+        max_dimension=4096,
+        max_pixels=16_777_216,
+    )
 
     _RESERVED_EXTRA_PARAMS = {
         "model", "action", "input", "prompt", "parameters", "size",
@@ -69,11 +76,16 @@ class YesNAIProvider(BaseImageProvider):
         request_parameters = dict(parameters)
         request_prompt = full_prompt
         if structured_prompt is not None and structured_prompt.people:
-            center = {"x": 0.5, "y": 0.5}
+            layout = self.character_layout(len(structured_prompt.people))
             character_prompts = []
             positive_captions = []
             negative_captions = []
-            for person in structured_prompt.people:
+            for index, person in enumerate(structured_prompt.people):
+                if layout:
+                    x, y, _ = layout[index]
+                    center = {"x": x, "y": y}
+                else:
+                    center = {"x": 0.5, "y": 0.5}
                 positive = ", ".join(person.positive_tags)
                 negative = ", ".join(person.negative_tags)
                 character_prompts.append({
@@ -96,7 +108,7 @@ class YesNAIProvider(BaseImageProvider):
                     "base_caption": "",
                     "char_captions": positive_captions,
                 },
-                "use_coords": False,
+                "use_coords": bool(layout),
                 "use_order": True,
             }
             request_parameters["v4_negative_prompt"] = {
@@ -265,7 +277,7 @@ class YesNAIProvider(BaseImageProvider):
             if ref_image and ref_mode:
                 valid, normalized_ref, _ = self.normalize_and_validate_base64_image(
                     ref_image,
-                    capabilities=YESNAI_CAPABILITIES,
+                    capabilities=self._REFERENCE_IMAGE_CAPABILITIES,
                     field_name="参考图",
                 )
                 if not valid:
@@ -391,15 +403,7 @@ class YesNAIProvider(BaseImageProvider):
                             return False, f"HTTP {response.status}: 接口发生重定向，请检查 base_url"
 
                         if response.status < 200 or response.status >= 300:
-                            detail = text[:500]
-                            low = detail.lower()
-                            # NSFW 拦截
-                            if response.status in (400, 422) and any(
-                                k in low
-                                for k in ("nsfw", "sensitive", "moderation", "blocked", "safety")
-                            ):
-                                return False, f"内容被安全拦截: {detail[:100]}"
-                            return False, f"HTTP {response.status}: {detail[:200]}"
+                            return False, self._format_http_error(response.status, text)
 
                         try:
                             data = json.loads(text)
@@ -495,6 +499,49 @@ class YesNAIProvider(BaseImageProvider):
     # ================================================================
     # 响应解析
     # ================================================================
+
+    @staticmethod
+    def _format_http_error(status: int, text: str) -> str:
+        detail = str(text or "")[:500]
+        code = ""
+        message = ""
+        try:
+            payload = json.loads(detail)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict):
+                code = str(error.get("code") or "")
+                message = str(error.get("message") or "")
+            elif isinstance(error, str):
+                message = error
+            code = code or str(payload.get("code") or "")
+            message = message or str(payload.get("message") or payload.get("detail") or "")
+
+        combined = f"{code} {message} {detail}".lower()
+        if status in (400, 422) and any(
+            marker in combined
+            for marker in ("nsfw", "sensitive", "moderation", "blocked", "safety")
+        ):
+            return f"内容被安全拦截: {(message or detail)[:100]}"
+        if "pricing_feature_requires_paid_base" in combined:
+            return (
+                "YesNAI 定价规则拒绝了参考图功能："
+                "当前基础请求未被服务端计为付费，请检查 PricingRule"
+            )
+
+        status_messages = {
+            401: "YesNAI API Token 无效、过期或已禁用",
+            402: "YesNAI Gems 余额不足",
+            403: "YesNAI API Token 没有当前模型权限",
+            413: "YesNAI Native 请求体或图片超过限制",
+            429: "YesNAI 免费限速或 Token 额度已达到限制",
+        }
+        if status in status_messages:
+            return status_messages[status]
+        code_label = f" [{code[:80]}]" if code else ""
+        return f"HTTP {status}{code_label}: {(message or detail)[:200]}"
 
     def _parse_response(self, data: Any) -> Tuple[bool, str]:
         """解析 YesNovelAI 响应，返回 (成功, 图片base64或错误信息)。"""

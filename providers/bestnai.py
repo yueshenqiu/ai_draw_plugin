@@ -544,15 +544,24 @@ class BestNAIProvider(BaseImageProvider):
             if artist_prompt:
                 base_prompt = f"{artist_prompt.strip()}, {base_prompt}"
             params["prompt"] = base_prompt
-            params["characters"] = [
-                {
+            layout = self.character_layout(len(structured_prompt.people))
+            characters = []
+            for index, person in enumerate(structured_prompt.people):
+                character = {
                     "prompt": ", ".join(person.positive_tags),
                     "negative_prompt": ", ".join(person.negative_tags),
                 }
-                for person in structured_prompt.people
-            ]
-            params["use_coords"] = False
+                if layout:
+                    character["position"] = layout[index][2]
+                characters.append(character)
+            params["characters"] = characters
+            params["use_coords"] = bool(layout)
             params["use_order"] = True
+            self._logger.info(
+                f"{self.log_prefix} (BestNAI) V4人物结构: "
+                f"count={len(characters)} use_coords={bool(layout)} "
+                f"positions={','.join(item.get('position', '-') for item in characters)}"
+            )
 
         normalized_size = self._normalize_size(final_size)
         if normalized_size:

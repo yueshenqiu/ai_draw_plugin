@@ -111,7 +111,7 @@ class PluginSectionConfig(PluginConfigBase):
         ),
     )
     config_version: str = Field(
-        default="2.4.4", description="配置版本号",
+        default="2.4.6", description="配置版本号",
         json_schema_extra=_ui("配置版本", order=99, hidden=True, disabled=True),
     )
 

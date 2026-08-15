@@ -33,9 +33,47 @@ class BaseImageProvider(ABC):
     # 子类覆写：config 中 endpoint 留空时，走该 Provider 的内置默认路径
     default_endpoint: str = ""
 
+    _EXPLICIT_CHARACTER_LAYOUTS = {
+        2: (
+            (0.3, 0.5, "B3"),
+            (0.7, 0.5, "D3"),
+        ),
+        3: (
+            (0.3, 0.5, "B3"),
+            (0.5, 0.5, "C3"),
+            (0.7, 0.5, "D3"),
+        ),
+        4: (
+            (0.3, 0.3, "B2"),
+            (0.7, 0.3, "D2"),
+            (0.3, 0.7, "B4"),
+            (0.7, 0.7, "D4"),
+        ),
+        5: (
+            (0.5, 0.1, "C1"),
+            (0.1, 0.5, "A3"),
+            (0.9, 0.5, "E3"),
+            (0.3, 0.9, "B5"),
+            (0.7, 0.9, "D5"),
+        ),
+        6: (
+            (0.3, 0.1, "B1"),
+            (0.7, 0.1, "D1"),
+            (0.1, 0.5, "A3"),
+            (0.9, 0.5, "E3"),
+            (0.3, 0.9, "B5"),
+            (0.7, 0.9, "D5"),
+        ),
+    }
+
     def __init__(self, logger, log_prefix: str = ""):
         self._logger = logger
         self.log_prefix = log_prefix
+
+    @classmethod
+    def character_layout(cls, count: int) -> Tuple[Tuple[float, float, str], ...]:
+        """返回二至六人的统一 NAI 坐标布局；其他人数继续使用自动布局。"""
+        return cls._EXPLICIT_CHARACTER_LAYOUTS.get(count, ())
 
     @abstractmethod
     async def generate(

@@ -98,6 +98,8 @@ YESNAI_CAPABILITIES = ProviderCapabilities(
         "ddim", "plms",
     ],
     supported_sizes=["832x1216", "1216x832", "1024x1024"],
+    max_dimension=2048,
+    max_pixels=3_145_728,
     dimension_multiple=64,
     enforce_supported_samplers=True,
 )
