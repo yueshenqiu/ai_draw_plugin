@@ -236,6 +236,7 @@ requests>=2.32.0,<3.0.0
 aiohttp>=3.9.0,<4.0.0
 Pillow>=10.0.0,<14.0.0
 certifi>=2024.2.2,<2030.0.0
+msgpack>=1.1.2,<2.0.0
 ```
 
 ### 安装步骤
@@ -317,7 +318,7 @@ artist_preset = "无"
 | `format` | 默认端点 | 说明 |
 |---|---|---|
 | `bestnai` | `/v1/chat/completions` | OpenAI Chat Completions 兼容的 BestNAI/NovelAI 接口 |
-| `yesnai` | `/v1/nai/generate-image` | YesNovelAI business-api 原生 NAI 请求格式 |
+| `yesnai` | `/native/ai/generate-image-stream` | YesNovelAI Native MessagePack 流式请求格式 |
 
 端点留空时使用 Provider 默认值。YesNAI 未声明“角色+画风”组合参考能力，使用 `rh/hr` 前应确认当前 Provider 能力。
 
@@ -445,6 +446,11 @@ ai_draw_plugin/
 Provider 若不接受 `structured_prompt`，生成器会保持旧调用兼容，不会为了兼容而重复调用图像 API。
 
 ## 更新日志
+
+### 2.4.7
+
+- YesNAI 改用 Native MessagePack 流式端点，收到最终帧后立即返回，并在服务端明确不支持流式时兼容 ZIP 响应。
+- 对齐 NAI Launcher 的 V4/V4.5 请求结构、参考图预处理与采样参数，恢复 YesNAI 人物参考并改善长任务的收图稳定性。
 
 ### 2.4.6
 

@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
-"""YesNovelAI 原生 Provider。
-
-通过 YesNovelAI business-api 的 /v1/nai/generate-image 端点调用 NovelAI 图片生成。
-实现 BaseImageProvider 接口，对接自建 YesNovelAI 平台。
-"""
+"""通过 YesNovelAI Native 低层接口调用 NovelAI 图片生成。"""
 
 import asyncio
+import base64
 from dataclasses import replace
+import io
 import json
 import math
 import re
 import ssl
+import zipfile
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 import certifi
+import msgpack
+from PIL import Image
 
 from .base import BaseImageProvider, ResponseLimitError
 from .capabilities import YESNAI_CAPABILITIES
@@ -27,7 +28,11 @@ if TYPE_CHECKING:
 class YesNAIProvider(BaseImageProvider):
     """YesNovelAI 图片生成 Provider（NAI 原生格式）"""
 
-    default_endpoint = "/v1/nai/generate-image"
+    default_endpoint = "/native/ai/generate-image"
+    _NATIVE_ZIP_MAX_ENTRIES = 32
+    _NATIVE_STREAM_MAX_BYTES = 256 * 1024 * 1024
+    _NATIVE_STREAM_TOTAL_TIMEOUT = 600.0
+    _STREAM_FALLBACK_HTTP_STATUSES = frozenset({404, 405, 406, 415, 501})
     # 最新接口的 2048/3,145,728 限制针对生成尺寸；参考图继续沿用原安全上限，
     # 由 YesNAI/NovelAI 的参考图流程执行其自身缩放。
     _REFERENCE_IMAGE_CAPABILITIES = replace(
@@ -45,9 +50,15 @@ class YesNAIProvider(BaseImageProvider):
         "reference_images", "reference_image_multiple",
         "reference_strength_multiple", "reference_information_extracted_multiple",
         "director_reference_images", "director_reference_strength_values",
-        "director_reference_secondary_strength_values", "ref_image", "ref_mode",
+        "director_reference_secondary_strength_values",
+        "director_reference_information_extracted",
+        "director_reference_descriptions", "ref_image", "ref_mode",
         "ref_strength", "ref_fidelity",
-        "characterPrompts", "v4_prompt", "v4_negative_prompt",
+        "characterPrompts", "v4_prompt", "v4_negative_prompt", "stream",
+        "params_version", "use_coords", "legacy_v3_extend", "legacy_uc",
+        "dynamic_thresholding", "controlnet_strength",
+        "normalize_reference_strength_multiple",
+        "deliberate_euler_ancestral_bug", "prefer_brownian",
     }
 
     # 匹配中/日/韩文 + 全角符号（NewAPI 仅允许英文，YesNovelAI 原生 NAI 同样要求英文 tag）
@@ -123,12 +134,101 @@ class YesNAIProvider(BaseImageProvider):
                 custom_prompt_add.strip(),
                 ", ".join(structured_prompt.global_tags).strip(),
             ) if part)
+
+            request_parameters["v4_prompt"]["caption"]["base_caption"] = request_prompt
+
+        if self._is_novelai_v4_model(model_name):
+            request_parameters.setdefault("v4_prompt", {
+                "caption": {
+                    "base_caption": request_prompt,
+                    "char_captions": [],
+                },
+                "use_coords": False,
+                "use_order": True,
+            })
+            request_parameters.setdefault("v4_negative_prompt", {
+                "caption": {
+                    "base_caption": negative_prompt or "",
+                    "char_captions": [],
+                },
+                "legacy_uc": False,
+            })
+
         return {
             "model": model_name,
             "action": action,
             "input": request_prompt,
             "parameters": request_parameters,
+            "use_new_shared_trial": True,
         }
+
+    @classmethod
+    def _resolve_request_url(
+        cls,
+        base_url: str,
+        configured_endpoint: str = "",
+    ) -> str:
+        """解析 YesNAI Native 地址，兼容站点根地址与 Launcher Base URL。"""
+        base_parts = urlsplit(str(base_url or "").strip())
+        if base_parts.fragment:
+            raise ValueError("YesNAI base_url 不能包含 URL fragment")
+        base_path = base_parts.path.rstrip("/")
+        base_has_native_prefix = base_path.lower().endswith("/native")
+
+        endpoint_text = str(configured_endpoint or "").strip()
+        endpoint_parts = urlsplit(endpoint_text)
+        if endpoint_parts.scheme or endpoint_parts.netloc:
+            raise ValueError("YesNAI endpoint 必须是相对路径")
+        if endpoint_parts.fragment:
+            raise ValueError("YesNAI endpoint 不能包含 URL fragment")
+        endpoint_path = (
+            f"/{endpoint_parts.path.strip('/')}"
+            if endpoint_parts.path
+            else ""
+        )
+        endpoint_lower = endpoint_path.lower()
+        if endpoint_lower in {"", "/native", "/v1/nai/generate-image"}:
+            endpoint_path = (
+                "/ai/generate-image"
+                if base_has_native_prefix
+                else cls.default_endpoint
+            )
+        elif base_has_native_prefix and endpoint_lower.startswith("/native/"):
+            base_path = base_path[:-len("/native")]
+        if endpoint_path.lower().endswith("/ai/generate-image-stream"):
+            endpoint_path = endpoint_path[:-len("-stream")]
+
+        query = endpoint_parts.query or base_parts.query
+        return urlunsplit((
+            base_parts.scheme,
+            base_parts.netloc,
+            f"{base_path}{endpoint_path}",
+            query,
+            "",
+        ))
+
+    @classmethod
+    def _resolve_stream_request_url(
+        cls,
+        base_url: str,
+        configured_endpoint: str = "",
+    ) -> str:
+        """将兼容配置中的生成端点解析为 Native 流式端点。"""
+        resolved = cls._resolve_request_url(base_url, configured_endpoint)
+        parts = urlsplit(resolved)
+        path = parts.path.rstrip("/")
+        path_lower = path.lower()
+        if path_lower.endswith("/ai/generate-image-stream"):
+            return resolved
+        if path_lower.endswith("/ai/generate-image"):
+            return urlunsplit((
+                parts.scheme,
+                parts.netloc,
+                f"{path}-stream",
+                parts.query,
+                parts.fragment,
+            ))
+        return resolved
 
     # ================================================================
     # Public API
@@ -143,7 +243,7 @@ class YesNAIProvider(BaseImageProvider):
         ref_mode: str = "",
         structured_prompt: Optional["StructuredPrompt"] = None,
     ) -> Tuple[bool, str]:
-        """调用 YesNovelAI /v1/nai/generate-image 接口生成图片（异步）。"""
+        """调用 YesNovelAI Native 接口生成图片（异步）。"""
         try:
             if not self.validate_config(model_config):
                 return False, "模型配置不完整（缺少 base_url 或 model）"
@@ -155,12 +255,17 @@ class YesNAIProvider(BaseImageProvider):
                     f"API Token 将以明文传输，建议改用 HTTPS"
                 )
 
-            endpoint = (model_config.get("endpoint") or model_config.get("nai_endpoint") or "").strip()
-            if not endpoint:
-                endpoint = self.default_endpoint
-            if not endpoint.startswith('/'):
-                endpoint = f"/{endpoint}"
-            url = f"{base_url}{endpoint}"
+            configured_endpoint = (
+                model_config.get("endpoint")
+                or model_config.get("nai_endpoint")
+                or ""
+            )
+            non_stream_url = self._resolve_request_url(
+                base_url, configured_endpoint,
+            )
+            stream_url = self._resolve_stream_request_url(
+                base_url, configured_endpoint,
+            )
 
             api_key = model_config.get("api_key", "")
             token = api_key
@@ -275,10 +380,12 @@ class YesNAIProvider(BaseImageProvider):
             )
 
             if ref_image and ref_mode:
-                valid, normalized_ref, _ = self.normalize_and_validate_base64_image(
-                    ref_image,
-                    capabilities=self._REFERENCE_IMAGE_CAPABILITIES,
-                    field_name="参考图",
+                valid, normalized_ref, _ = (
+                    self.normalize_and_validate_base64_image(
+                        ref_image,
+                        capabilities=self._REFERENCE_IMAGE_CAPABILITIES,
+                        field_name="参考图",
+                    )
                 )
                 if not valid:
                     return False, normalized_ref
@@ -301,6 +408,20 @@ class YesNAIProvider(BaseImageProvider):
                 "scale": scale,
                 "negative_prompt": negative_prompt or "",
             }
+            if self._is_novelai_v4_model(model_name):
+                # Match Launcher's explicit V4 sampler contract instead of
+                # relying on upstream compatibility defaults.
+                parameters.update({
+                    "params_version": 3,
+                    "use_coords": False,
+                    "legacy_v3_extend": False,
+                    "legacy_uc": False,
+                    "dynamic_thresholding": False,
+                    "controlnet_strength": 1.0,
+                    "normalize_reference_strength_multiple": True,
+                    "deliberate_euler_ancestral_bug": False,
+                    "prefer_brownian": True,
+                })
 
             seed = self.bounded_int(
                 seed,
@@ -340,16 +461,22 @@ class YesNAIProvider(BaseImageProvider):
                 custom_prompt_add=custom_prompt_add,
                 structured_prompt=structured_prompt,
             )
+            stream_body = dict(body)
+            stream_parameters = dict(body["parameters"])
+            stream_parameters["stream"] = "msgpack"
+            stream_body["parameters"] = stream_parameters
 
-            headers = {
+            stream_headers = {
                 "Content-Type": "application/json",
+                "Accept": "application/x-msgpack",
             }
             if token:
-                headers["Authorization"] = f"Bearer {token}"
+                stream_headers["Authorization"] = f"Bearer {token}"
 
             self._logger.info(
                 f"{self.log_prefix} (YesNAI) 请求: model={model_name} "
-                f"action={action} size={width}x{height} steps={steps}"
+                f"action={action} size={width}x{height} steps={steps} "
+                f"transport=native-stream"
             )
 
             # ── 发送请求 ──
@@ -377,23 +504,21 @@ class YesNAIProvider(BaseImageProvider):
                 ssl_context = ssl.create_default_context(cafile=certifi.where())
                 connector = aiohttp.TCPConnector(ssl=ssl_context)
                 async with aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+                    timeout=aiohttp.ClientTimeout(
+                        total=self._NATIVE_STREAM_TOTAL_TIMEOUT,
+                        connect=min(timeout_seconds, 30.0),
+                        sock_read=timeout_seconds,
+                    ),
                     trust_env=False,
                     connector=connector,
                 ) as session:
                     async with session.post(
-                        url,
-                        headers=headers,
-                        json=body,
+                        stream_url,
+                        headers=stream_headers,
+                        json=stream_body,
                         proxy=proxy,
                         allow_redirects=False,
                     ) as response:
-                        raw_response = await self._read_limited_response(
-                            response,
-                            YESNAI_CAPABILITIES.max_response_bytes,
-                        )
-                        text = raw_response.decode("utf-8-sig", errors="replace")
-
                         if 300 <= response.status < 400:
                             location = response.headers.get("location", "")
                             self._logger.error(
@@ -403,24 +528,65 @@ class YesNAIProvider(BaseImageProvider):
                             return False, f"HTTP {response.status}: 接口发生重定向，请检查 base_url"
 
                         if response.status < 200 or response.status >= 300:
-                            return False, self._format_http_error(response.status, text)
+                            raw_response = await self._read_limited_response(
+                                response,
+                                YESNAI_CAPABILITIES.max_response_bytes,
+                            )
+                            text = raw_response.decode("utf-8-sig", errors="replace")
+                            if not self._streaming_is_unsupported(
+                                response.status, text,
+                            ):
+                                return False, self._format_http_error(
+                                    response.status, text,
+                                )
+                            self._logger.warning(
+                                f"{self.log_prefix} (YesNAI) Native 流式端点不可用，"
+                                f"回退 ZIP: status={response.status}"
+                            )
+                        else:
+                            return await self._read_native_stream_response(response)
 
-                        try:
-                            data = json.loads(text)
-                        except (TypeError, ValueError, json.JSONDecodeError):
-                            return False, "API 返回非 JSON 数据"
+                    fallback_headers = {
+                        "Content-Type": "application/json",
+                        "Accept": "application/zip, application/json",
+                    }
+                    if token:
+                        fallback_headers["Authorization"] = f"Bearer {token}"
+                    async with session.post(
+                        non_stream_url,
+                        headers=fallback_headers,
+                        json=body,
+                        proxy=proxy,
+                        allow_redirects=False,
+                    ) as response:
+                        raw_response = await self._read_limited_response(
+                            response,
+                            YESNAI_CAPABILITIES.max_response_bytes,
+                        )
+                        if 300 <= response.status < 400:
+                            return False, (
+                                f"HTTP {response.status}: 接口发生重定向，请检查 base_url"
+                            )
+                        if response.status < 200 or response.status >= 300:
+                            text = raw_response.decode(
+                                "utf-8-sig", errors="replace",
+                            )
+                            return False, self._format_http_error(
+                                response.status, text,
+                            )
+                        return self._parse_success_response(raw_response)
             except ResponseLimitError as exc:
                 return False, str(exc)
             except (asyncio.TimeoutError, TimeoutError):
-                return False, f"请求超时 ({timeout_seconds}s)"
+                return False, (
+                    f"收图超时（连续 {timeout_seconds}s 未收到数据，"
+                    f"或单次请求时长超过 {self._NATIVE_STREAM_TOTAL_TIMEOUT}s）"
+                )
             except aiohttp.ClientError as exc:
                 return False, f"网络错误: {type(exc).__name__}: {exc}"
             except Exception as exc:
                 self._logger.error(f"{self.log_prefix} (YesNAI) 请求异常: {exc!r}", exc_info=True)
                 return False, f"请求失败: {str(exc)[:100]}"
-
-            # ── 解析响应 ──
-            return self._parse_response(data)
 
         except Exception as e:
             self._logger.error(f"{self.log_prefix} (YesNAI) 未知异常: {e!r}", exc_info=True)
@@ -446,6 +612,255 @@ class YesNAIProvider(BaseImageProvider):
                 )
         return bytes(content)
 
+    async def _read_native_stream_response(
+        self,
+        response: aiohttp.ClientResponse,
+    ) -> Tuple[bool, str]:
+        """读取 Native 流，收到 final 帧后立即返回最终图片。"""
+        content_type = str(response.headers.get("Content-Type", "")).lower()
+        buffer = bytearray()
+        mode = ""
+        total_received = 0
+        decoded_frames = 0
+
+        async for chunk in response.content.iter_chunked(64 * 1024):
+            if not chunk:
+                continue
+            total_received += len(chunk)
+            if total_received > self._NATIVE_STREAM_MAX_BYTES:
+                raise ResponseLimitError("Native 流累计数据超过 256 MiB 限制")
+            buffer.extend(chunk)
+
+            if not mode:
+                mode = self._detect_native_stream_mode(buffer, content_type)
+                if not mode:
+                    if len(buffer) > YESNAI_CAPABILITIES.max_response_bytes:
+                        raise ResponseLimitError("Native 流单帧超过 48 MiB 限制")
+                    continue
+
+            buffer_limit = YESNAI_CAPABILITIES.max_response_bytes
+            if mode == "msgpack":
+                buffer_limit += 4
+            if len(buffer) > buffer_limit:
+                raise ResponseLimitError("Native 流单帧超过 48 MiB 限制")
+
+            if mode == "raw":
+                continue
+
+            if mode == "sse":
+                while True:
+                    block = self._pop_sse_block(buffer)
+                    if block is None:
+                        break
+                    event = self._decode_sse_event(block)
+                    if event is None:
+                        continue
+                    decoded_frames += 1
+                    result = self._parse_native_stream_event(event)
+                    if result is not None:
+                        return result
+                continue
+
+            while len(buffer) >= 4:
+                frame_length = int.from_bytes(buffer[:4], "big", signed=False)
+                if (
+                    frame_length <= 0
+                    or frame_length > YESNAI_CAPABILITIES.max_response_bytes
+                ):
+                    return False, "Native MessagePack 帧长度无效"
+                if len(buffer) < 4 + frame_length:
+                    break
+
+                frame = bytes(buffer[4:4 + frame_length])
+                del buffer[:4 + frame_length]
+                try:
+                    event = msgpack.unpackb(
+                        frame,
+                        raw=False,
+                        strict_map_key=False,
+                        max_str_len=YESNAI_CAPABILITIES.max_response_bytes,
+                        max_bin_len=YESNAI_CAPABILITIES.max_response_bytes,
+                        max_array_len=100_000,
+                        max_map_len=100_000,
+                        max_ext_len=YESNAI_CAPABILITIES.max_response_bytes,
+                    )
+                except Exception as exc:
+                    self._logger.warning(
+                        f"{self.log_prefix} (YesNAI) MessagePack 帧解析失败: "
+                        f"{type(exc).__name__}"
+                    )
+                    continue
+
+                decoded_frames += 1
+                result = self._parse_native_stream_event(event)
+                if result is not None:
+                    return result
+
+        if mode == "sse" and buffer.strip():
+            event = self._decode_sse_event(bytes(buffer))
+            if event is not None:
+                decoded_frames += 1
+                result = self._parse_native_stream_event(event)
+                if result is not None:
+                    return result
+
+        if mode == "raw" or (not mode and buffer):
+            return self._parse_success_response(bytes(buffer))
+        if mode == "msgpack" and buffer:
+            return False, "Native MessagePack 流在半帧处结束"
+        return False, (
+            f"Native 流结束但未收到最终图片（已解析 {decoded_frames} 帧）"
+        )
+
+    @staticmethod
+    def _detect_native_stream_mode(
+        buffer: bytearray,
+        content_type: str,
+    ) -> str:
+        sample = bytes(buffer[:64]).lstrip(b"\xef\xbb\xbf \t\r\n")
+        if sample.startswith((b"PK\x03\x04", b"{", b"[")):
+            return "raw"
+        if sample.startswith((b"data:", b"event:", b"retry:", b":")):
+            return "sse"
+        if len(buffer) < 4:
+            return ""
+        if len(buffer) >= 4:
+            frame_length = int.from_bytes(buffer[:4], "big", signed=False)
+            if 0 < frame_length <= YESNAI_CAPABILITIES.max_response_bytes:
+                return "msgpack"
+        if "application/x-msgpack" in content_type:
+            return "msgpack"
+        if "text/event-stream" in content_type:
+            return "sse"
+        if "zip" in content_type or "json" in content_type:
+            return "raw"
+        return ""
+
+    @staticmethod
+    def _pop_sse_block(buffer: bytearray) -> Optional[bytes]:
+        separators = ((b"\r\n\r\n", 4), (b"\n\n", 2))
+        matches = [
+            (index, size)
+            for separator, size in separators
+            if (index := buffer.find(separator)) >= 0
+        ]
+        if not matches:
+            return None
+        index, separator_size = min(matches, key=lambda item: item[0])
+        block = bytes(buffer[:index])
+        del buffer[:index + separator_size]
+        return block
+
+    @staticmethod
+    def _decode_sse_event(block: bytes) -> Optional[Dict[str, Any]]:
+        event_type = ""
+        data_lines = []
+        for raw_line in block.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith(b":"):
+                continue
+            if line.startswith(b"event:"):
+                event_type = line[6:].strip().decode("utf-8", errors="replace")
+            elif line.startswith(b"data:"):
+                data_lines.append(line[5:].lstrip())
+        if not data_lines:
+            return None
+        data = b"\n".join(data_lines)
+        if data.strip() == b"[DONE]":
+            return None
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if event_type and not payload.get("event_type"):
+            payload["event_type"] = event_type
+        return payload
+
+    def _parse_native_stream_event(
+        self,
+        event: Any,
+    ) -> Optional[Tuple[bool, str]]:
+        if not isinstance(event, dict):
+            return None
+        normalized: Dict[str, Any] = {}
+        for key, value in event.items():
+            if isinstance(key, bytes):
+                key = key.decode("utf-8", errors="replace")
+            normalized[str(key)] = value
+
+        event_type = str(normalized.get("event_type") or "").strip().lower()
+        if event_type == "error" or normalized.get("error"):
+            message = (
+                normalized.get("message")
+                or normalized.get("error")
+                or "Native 流式生成失败"
+            )
+            return False, f"Native 流错误: {str(message)[:300]}"
+        if event_type != "final":
+            return None
+
+        image_bytes = self._coerce_native_stream_image(
+            normalized.get("image", normalized.get("data")),
+        )
+        if not image_bytes:
+            return False, "Native final 帧没有图片数据"
+        valid, error = self.validate_image_bytes(
+            image_bytes,
+            capabilities=YESNAI_CAPABILITIES,
+            field_name="生成图片",
+        )
+        if not valid:
+            return False, error
+        sample_index = normalized.get("samp_ix", 0)
+        self._logger.info(
+            f"{self.log_prefix} (YesNAI) 流式图片生成成功，"
+            f"sample={sample_index} size={len(image_bytes)} bytes"
+        )
+        return True, base64.b64encode(image_bytes).decode("ascii")
+
+    @staticmethod
+    def _coerce_native_stream_image(value: Any) -> bytes:
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, (bytearray, memoryview)):
+            return bytes(value)
+        if isinstance(value, list):
+            if len(value) > YESNAI_CAPABILITIES.max_image_bytes:
+                return b""
+            try:
+                return bytes(value)
+            except (TypeError, ValueError):
+                return b""
+        if isinstance(value, str):
+            encoded = value.strip()
+            if "," in encoded and encoded.lower().startswith("data:image/"):
+                encoded = encoded.split(",", 1)[1]
+            max_encoded_length = (
+                (YESNAI_CAPABILITIES.max_image_bytes + 2) // 3
+            ) * 4 + 4
+            if not encoded or len(encoded) > max_encoded_length:
+                return b""
+            try:
+                return base64.b64decode(encoded, validate=True)
+            except (ValueError, TypeError):
+                return b""
+        return b""
+
+    @classmethod
+    def _streaming_is_unsupported(cls, status: int, text: str) -> bool:
+        if status in cls._STREAM_FALLBACK_HTTP_STATUSES:
+            return True
+        if status not in {400, 422}:
+            return False
+        detail = str(text or "").lower()
+        return any(marker in detail for marker in (
+            "streaming is not allowed",
+            "streaming_unsupported",
+            "stream not allowed",
+        ))
+
     # ================================================================
     # 参考图参数构建
     # ================================================================
@@ -469,25 +884,29 @@ class YesNAIProvider(BaseImageProvider):
         b64 = self._strip_data_uri(ref_image)
 
         if ref_mode == "i2i":
+            strength = 0.5
             return "img2img", {
                 "image": b64,
-                "strength": 0.5,
+                "strength": strength,
                 "noise": 0.0,
-                "img2img": True,
+                "img2img": {"strength": strength},
             }
 
-        if ref_mode == "style":
+        if ref_mode in ("style", "character", "character&style"):
+            director_image = self._prepare_director_reference_image(b64)
+            secondary_strength = round(1.0 - ref_fidelity, 2)
             return "generate", {
-                "reference_image_multiple": [b64],
-                "reference_strength_multiple": [ref_strength],
-                "reference_information_extracted_multiple": [0.7],
-            }
-
-        if ref_mode in ("character", "character&style"):
-            return "generate", {
-                "director_reference_images": [b64],
+                "director_reference_images": [director_image],
                 "director_reference_strength_values": [ref_strength],
-                "director_reference_secondary_strength_values": [ref_fidelity],
+                "director_reference_secondary_strength_values": [secondary_strength],
+                "director_reference_information_extracted": [1.0],
+                "director_reference_descriptions": [{
+                    "caption": {
+                        "base_caption": ref_mode,
+                        "char_captions": [],
+                    },
+                    "legacy_uc": False,
+                }],
             }
 
         # 未知模式，回退普通生图
@@ -496,9 +915,131 @@ class YesNAIProvider(BaseImageProvider):
         )
         return "generate", {}
 
+    @staticmethod
+    def _prepare_director_reference_image(image_b64: str) -> str:
+        """按 NovelAI SDK 规则归一化 Director Reference 图片。"""
+        try:
+            image_bytes = base64.b64decode(image_b64, validate=True)
+            with Image.open(io.BytesIO(image_bytes)) as source:
+                source.load()
+                image = source.convert("RGB")
+        except (
+            Image.DecompressionBombError,
+            OSError,
+            SyntaxError,
+            ValueError,
+        ) as exc:
+            raise ValueError(f"角色参考图预处理失败: {str(exc)[:80]}") from exc
+
+        try:
+            target_width, target_height = 1024, 1536
+            source_width, source_height = image.size
+            source_ratio = source_width / source_height
+            target_ratio = target_width / target_height
+            if source_ratio > target_ratio:
+                resized_width = target_width
+                resized_height = max(1, int(target_width / source_ratio))
+            else:
+                resized_height = target_height
+                resized_width = max(1, int(target_height * source_ratio))
+
+            with image.resize(
+                (resized_width, resized_height),
+                Image.Resampling.LANCZOS,
+            ) as resized:
+                with Image.new(
+                    "RGB", (target_width, target_height), (0, 0, 0),
+                ) as normalized:
+                    normalized.paste(
+                        resized,
+                        (
+                            (target_width - resized_width) // 2,
+                            (target_height - resized_height) // 2,
+                        ),
+                    )
+                    buffer = io.BytesIO()
+                    normalized.save(buffer, format="PNG")
+        finally:
+            image.close()
+
+        return base64.b64encode(buffer.getvalue()).decode("ascii")
+
     # ================================================================
     # 响应解析
     # ================================================================
+
+    def _parse_success_response(
+        self,
+        raw_response: bytes,
+    ) -> Tuple[bool, str]:
+        """解析 Native ZIP；非 ZIP 响应继续兼容 YesNAI JSON。"""
+        payload = bytes(raw_response or b"")
+        if payload and zipfile.is_zipfile(io.BytesIO(payload)):
+            return self._parse_native_zip_response(payload)
+
+        try:
+            data = json.loads(payload.decode("utf-8-sig"))
+        except (UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError):
+            return False, "API 返回非 ZIP 或 JSON 数据"
+        return self._parse_response(data)
+
+    def _parse_native_zip_response(self, raw_response: bytes) -> Tuple[bool, str]:
+        """从 NovelAI Native ZIP 中安全读取首张有效图片。"""
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw_response)) as archive:
+                entries = archive.infolist()
+                if len(entries) > self._NATIVE_ZIP_MAX_ENTRIES:
+                    return False, "Native ZIP 文件数量超过安全限制"
+
+                total_size = sum(max(0, entry.file_size) for entry in entries)
+                if total_size > YESNAI_CAPABILITIES.max_response_bytes:
+                    return False, "Native ZIP 解压后超过安全限制"
+
+                image_entries = [
+                    entry for entry in entries
+                    if not entry.is_dir()
+                    and entry.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+                ]
+                if not image_entries:
+                    return False, "Native ZIP 中没有 PNG、JPEG 或 WebP 图片"
+
+                last_error = ""
+                for entry in image_entries:
+                    if entry.file_size > YESNAI_CAPABILITIES.max_image_bytes:
+                        last_error = "生成图片超过安全限制"
+                        continue
+                    with archive.open(entry, "r") as image_file:
+                        image_bytes = image_file.read(
+                            YESNAI_CAPABILITIES.max_image_bytes + 1
+                        )
+                    if len(image_bytes) > YESNAI_CAPABILITIES.max_image_bytes:
+                        last_error = "生成图片超过安全限制"
+                        continue
+                    valid, error = self.validate_image_bytes(
+                        image_bytes,
+                        capabilities=YESNAI_CAPABILITIES,
+                        field_name="生成图片",
+                    )
+                    if not valid:
+                        last_error = error
+                        continue
+
+                    self._logger.info(
+                        f"{self.log_prefix} (YesNAI) 图片生成成功，"
+                        f"大小 {len(image_bytes)} bytes"
+                    )
+                    return True, base64.b64encode(image_bytes).decode("ascii")
+
+                return False, last_error or "Native ZIP 中没有完整有效的图片"
+        except (
+            zipfile.BadZipFile,
+            zipfile.LargeZipFile,
+            NotImplementedError,
+            RuntimeError,
+            OSError,
+            ValueError,
+        ):
+            return False, "Native 接口返回的 ZIP 数据无效"
 
     @staticmethod
     def _format_http_error(status: int, text: str) -> str:
