@@ -1456,6 +1456,100 @@ def _cleanup_plain_llm_prompt(prompt: str) -> str:
     return cleaned
 
 
+def cleanup_flat_prompt(prompt: str) -> str:
+    """清理 flat 模式的 LLM 结果，不解析或构造 V4 分层结构。
+
+    Flat 模式的输出协议就是一条普通提示词；这里只移除常见包装和
+    偶发的槽位前缀，避免把协议标记原样发送给通用图片接口。不会执行
+    人物数量、动作关系或人物负面校验。
+    """
+    raw = str(prompt or "").strip()
+    if "\n" in raw or "\r" in raw:
+        cleaned = raw
+        if cleaned.startswith("```") and cleaned.endswith("```"):
+            cleaned = cleaned[3:-3].strip()
+            if "\n" in cleaned:
+                first_line, rest = cleaned.split("\n", 1)
+                if first_line.strip().lower() in {"text", "prompt", "plain"}:
+                    cleaned = rest.strip()
+        if cleaned.startswith("`") and cleaned.endswith("`") and cleaned.count("`") == 2:
+            cleaned = cleaned[1:-1].strip()
+        cleaned = re.sub(
+            r"^(?:output|result|prompt|here(?:'s| is)(?: the)?(?: prompt)?)\s*[:：]\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+    else:
+        cleaned = _cleanup_plain_llm_prompt(raw)
+    if not cleaned:
+        return ""
+    if cleaned.lstrip().startswith(("{", "[")):
+        try:
+            parsed_json = json.loads(cleaned)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed_json = None
+        if isinstance(parsed_json, (dict, list)):
+            return ""
+
+    lines = []
+    marker_re = re.compile(
+        r"(?P<marker>GLOBAL|P\d+\s*[+-]|PERSON[_\s-]*\d+\s*"
+        r"(?:POSITIVE|NEGATIVE)?|char\d+)\s*[:：|]",
+        flags=re.IGNORECASE,
+    )
+    wrapper_re = re.compile(
+        r"^(?:output|result|prompt|final\s+prompt|here(?:'s|\s+is)"
+        r"(?:\s+the)?(?:\s+prompt)?|explanation|note|remarks?)\s*[:：]?\s*",
+        flags=re.IGNORECASE,
+    )
+    closing_re = re.compile(
+        r"^(?:hope\s+this\s+helps|let\s+me\s+know|feel\s+free\s+to|"
+        r"enjoy|i\s+hope\s+this|this\s+should\s+work|sure[,!]?|"
+        r"certainly[,!]?)\s*[.!]*$",
+        flags=re.IGNORECASE,
+    )
+    for raw_line in re.split(r"[\r\n]+", cleaned):
+        line = raw_line.strip().strip(",")
+        if not line:
+            continue
+        line = re.sub(r"^(?:[-*•]\s+)", "", line).strip()
+        if closing_re.fullmatch(line):
+            continue
+        wrapped = wrapper_re.match(line)
+        if wrapped:
+            line = line[wrapped.end():].strip()
+            if not line:
+                continue
+        matches = list(marker_re.finditer(line))
+        if matches:
+            # 兼容旧版 `GLOBAL: ... | char1: ...` 单行结果；人物负面段
+            # 直接丢弃，其他正向段按出现顺序合并。
+            segments = []
+            for index, match in enumerate(matches):
+                marker = re.sub(r"\s+", "", match.group("marker")).lower()
+                start = match.end()
+                end = matches[index + 1].start() if index + 1 < len(matches) else len(line)
+                segment = line[start:end].strip(" ,|;")
+                if not segment or marker.endswith("-") or "negative" in marker:
+                    continue
+                segments.append(segment)
+            if segments:
+                lines.extend(segments)
+            continue
+        line = line.strip(" ,|;")
+        if line:
+            lines.append(line)
+    if not lines:
+        return ""
+
+    # 通用接口只需要一条正向提示词；保留原有逗号和权重语法，
+    # 仅把旧版多行文本连接起来。
+    merged = ", ".join(lines)
+    merged = re.sub(r"\s*\|\s*", ", ", merged)
+    return re.sub(r"\s*,\s*", ", ", merged).strip(" ,")
+
+
 def cleanup_llm_prompt(prompt: str) -> str:
     """兼容旧调用：始终返回可显示、可发送的完整正向提示词字符串。"""
     return parse_generated_prompt(prompt).flat_prompt

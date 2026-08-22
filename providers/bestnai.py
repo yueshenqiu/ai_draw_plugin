@@ -22,7 +22,11 @@ from requests.adapters import HTTPAdapter
 from requests.exceptions import ProxyError
 from urllib3.util.ssl_ import create_urllib3_context
 
-from .base import BaseImageProvider, ResponseLimitError
+from .base import (
+    BaseImageProvider,
+    ResponseLimitError,
+    normalize_prompt_structure,
+)
 from .capabilities import BESTNAI_CAPABILITIES
 
 if TYPE_CHECKING:
@@ -140,6 +144,24 @@ class BestNAIProvider(BaseImageProvider):
             size_override = model_config.get("size_preset") or model_config.get("nai_size")
             extra_params = model_config.get("extra_params") or model_config.get("nai_extra_params") or {}
             model_name = model_config.get("model") or model_config.get("default_model") or "nai-diffusion-4-5-full"
+            raw_prompt_structure = model_config.get("prompt_structure")
+            prompt_structure = normalize_prompt_structure(
+                raw_prompt_structure
+            )
+            if (
+                raw_prompt_structure is not None
+                and str(raw_prompt_structure).strip().lower()
+                not in {"auto", "nai_v4", "flat"}
+            ):
+                self._logger.warning(
+                    f"{self.log_prefix} (BestNAI) 未知 prompt_structure="
+                    f"{raw_prompt_structure!r}，已回退 auto"
+                )
+            if prompt_structure == "nai_v4" and not self._is_novelai_v4_model(model_name):
+                return False, (
+                    f"模型 {model_name} 不支持 nai_v4 提示词结构，"
+                    "请改用 flat 或选择 V4/V4.5 模型"
+                )
             seed = model_config.get("seed", -1)
 
             # 调用方显式传入的尺寸优先于模型配置中的默认/预设尺寸。
@@ -152,7 +174,9 @@ class BestNAIProvider(BaseImageProvider):
             if artist_prompt:
                 artist_prompt = self._sanitize_prompt(artist_prompt)
             structured_prompt = self._sanitize_structured_prompt(
-                structured_prompt, model_name,
+                structured_prompt,
+                model_name,
+                prompt_structure=prompt_structure,
             )
 
             normalized_size = self._normalize_size(final_size)
@@ -207,6 +231,27 @@ class BestNAIProvider(BaseImageProvider):
                 maximum=BESTNAI_CAPABILITIES.max_reference_strength,
                 name="ref_strength",
             )
+            i2i_strength = self.bounded_float(
+                model_config.get("i2i_strength", 0.65),
+                default=0.65,
+                minimum=0.0,
+                maximum=1.0,
+                name="i2i_strength",
+            )
+            i2i_noise = self.bounded_float(
+                model_config.get("i2i_noise", 0.1),
+                default=0.1,
+                minimum=0.0,
+                maximum=1.0,
+                name="i2i_noise",
+            )
+            raw_i2i_color_correct = model_config.get("i2i_color_correct", True)
+            if isinstance(raw_i2i_color_correct, str):
+                i2i_color_correct = raw_i2i_color_correct.strip().lower() not in {
+                    "0", "false", "no", "off", "否", "关闭",
+                }
+            else:
+                i2i_color_correct = bool(raw_i2i_color_correct)
             seed = self.bounded_int(
                 seed,
                 default=-1,
@@ -228,6 +273,19 @@ class BestNAIProvider(BaseImageProvider):
                     if not valid:
                         return False, normalized_ref
                     ref_image = normalized_ref
+                    if ref_mode == "i2i" and normalized_size:
+                        ok, resized_ref, _, resize_error = (
+                            self.normalize_i2i_base64_image(
+                                ref_image,
+                                normalized_size[0],
+                                normalized_size[1],
+                                BESTNAI_CAPABILITIES,
+                                field_name="图生图参考图",
+                            )
+                        )
+                        if not ok:
+                            return False, resize_error
+                        ref_image = resized_ref
 
             # 构建生成参数
             generation_params = self._build_generation_params(
@@ -247,8 +305,12 @@ class BestNAIProvider(BaseImageProvider):
                 ref_mode=ref_mode,
                 ref_fidelity=ref_fidelity,
                 ref_strength=ref_strength,
+                i2i_strength=i2i_strength,
+                i2i_noise=i2i_noise,
+                i2i_color_correct=i2i_color_correct,
                 seed=seed,
                 structured_prompt=structured_prompt,
+                prompt_structure=prompt_structure,
                 structured_base_prompt=(
                     f"{custom_prompt_add}, {', '.join(structured_prompt.global_tags)}"
                     if structured_prompt is not None and custom_prompt_add
@@ -273,7 +335,9 @@ class BestNAIProvider(BaseImageProvider):
                 max_tokens = 50000
 
             self._logger.info(
-                f"{self.log_prefix} (BestNAI) max_tokens={max_tokens} ref_mode={ref_mode}"
+                f"{self.log_prefix} (BestNAI) max_tokens={max_tokens} "
+                f"ref_mode={ref_mode} prompt_structure={prompt_structure} "
+                "transport=chat-completions"
             )
 
             timeout_seconds = self.bounded_float(
@@ -519,11 +583,18 @@ class BestNAIProvider(BaseImageProvider):
         guidance_scale, cfg_value, noise_schedule, nocache, final_size,
         extra_params, model="", ref_image="", ref_mode="",
         ref_fidelity: float = 1.0, ref_strength: float = 1.0,
+        i2i_strength: float = 0.65, i2i_noise: float = 0.1,
+        i2i_color_correct: bool = True,
         seed: int = -1,
         structured_prompt: Optional["StructuredPrompt"] = None,
         structured_base_prompt: str = "",
+        prompt_structure: str = "auto",
     ) -> Dict[str, Any]:
         """构造 NewAPI 绘图参数。"""
+        if normalize_prompt_structure(prompt_structure) == "flat":
+            # 防止旧调用方把已经过时的 StructuredPrompt 继续带入通用
+            # 平铺请求；flat 模式只允许一个普通 prompt。
+            structured_prompt = None
         safe_extra_params = self.filter_extra_params(
             extra_params,
             self._RESERVED_EXTRA_PARAMS,
@@ -594,8 +665,17 @@ class BestNAIProvider(BaseImageProvider):
                 if params.get("size") and not ref_image.startswith(("http://", "https://")):
                     ref_image = self._resize_to_match(ref_image, params["size"])
                     image_uri = self._to_data_uri(ref_image)
-                params["i2i"] = {"image": image_uri, "strength": 0.5, "noise": 0}
-                self._logger.info(f"{self.log_prefix} (BestNAI) i2i strength=0.5 size={params.get('size')}")
+                params["i2i"] = {
+                    "image": image_uri,
+                    "strength": i2i_strength,
+                    "noise": i2i_noise,
+                    "color_correct": i2i_color_correct,
+                }
+                self._logger.info(
+                    f"{self.log_prefix} (BestNAI) i2i "
+                    f"strength={i2i_strength} noise={i2i_noise} "
+                    f"color_correct={i2i_color_correct} size={params.get('size')}"
+                )
             elif ref_mode == "style":
                 params["controlnet"] = {
                     "strength": ref_strength,
@@ -623,8 +703,18 @@ class BestNAIProvider(BaseImageProvider):
 
         return params
 
-    def _sanitize_structured_prompt(self, structured_prompt, model: str):
-        if structured_prompt is None or not self._is_novelai_v4_model(model):
+    def _sanitize_structured_prompt(
+        self,
+        structured_prompt,
+        model: str,
+        *,
+        prompt_structure: str = "auto",
+    ):
+        if (
+            structured_prompt is None
+            or normalize_prompt_structure(prompt_structure) == "flat"
+            or not self._is_novelai_v4_model(model)
+        ):
             return None
         global_tags = tuple(
             cleaned for tag in structured_prompt.global_tags

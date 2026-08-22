@@ -156,6 +156,101 @@ TEXT_OUTPUT_RULES = """
 """.strip()
 
 
+FLAT_OUTPUT_RULES = """
+<flat_output_contract priority="highest">
+本轮使用通用扁平提示词模式。请直接输出最终要交给普通图片生成模型的英文提示词。
+- 只输出一行、逗号分隔的英文标签或短语；不要 JSON、Markdown、代码块、解释、前后缀或自然语言说明。
+- 不要输出 GLOBAL、P1+、P1-、P2+、char1、char2 或任何人物槽位/分层标记。
+- 多人时按用户描述顺序把所有人物的正向标签直接合并到同一行；不要输出人物专属负面标签。
+- 不要输出 Provider 字段、坐标、characters、characterPrompts、v4_prompt、v4_negative_prompt 或画师串。
+- 必须保留用户明确要求的角色、服装、动作、场景、镜头、光线、天气和氛围，并只做必要补全。
+</flat_output_contract>
+""".strip()
+
+
+I2I_PROMPT_RULES = """
+<i2i_translation priority="highest">
+<role>
+你负责把本轮图生图修改指令转换为英文 Danbooru 风格标签。参考图已经提供原有主体、人物数量、身份、外貌、服装、画风和构图；本轮输出只描述用户明确要求改变的内容。
+</role>
+
+<rules>
+- 忠实翻译本轮明确指定的服装或穿着状态、动作、姿势、表情、道具、场景、构图、镜头、光线、天气、氛围、身份、人数和外貌变化；用户给出的英文 tag 与权重原样保留。
+- 用户要求“更换一个/换一个/随机一个”姿势、动作、场景、背景、镜头或其他项目时，可以选择一个符合其限定条件的新项目，并补充让该修改在画面中成立所必需的少量动作关系、接触关系、环境或光线标签。
+- 不复述、不重建参考图中用户没有要求改变的内容，不为画面补齐完整人物设定或完整场景。
+- 不根据丝袜、裙子、胸部、姿势、动作或其他属性推断人物性别、人数或身份。
+- 用户没有明确要求时，禁止输出 `solo`、`1girl`、`1boy`、`2girls`、`2boys` 或其他人物计数标签。
+- 用户没有明确要求时，禁止输出角色名、作品名、发色、瞳色、发型、肤色、种族、体型、胸部尺寸、默认服装、画师名或画风标签。
+- 用户明确要求改变人物数量、性别、身份、外貌、服装或画风时，必须准确翻译，不得因为上述禁止推断规则而删除。
+- 标签按人物数量与身份、外貌变化、服装变化、动作与姿势、表情与视线、构图与镜头、场景、光线与氛围的顺序排列；未出现的类别直接跳过。
+- 不输出系统质量词、全局通用负面词、坐标或 Provider 请求字段。
+</rules>
+</i2i_translation>
+""".strip()
+
+
+I2I_FINAL_SELF_CHECK_RULES = """
+<i2i_final_check>
+输出前只核对一次且不展示过程：本轮所有明确修改均已保留；必要补充只服务于这些修改；没有加入用户未指定的原图人物、人数、身份、外貌、默认服装、画风或其他原图内容。发现问题直接修正，只输出规定格式。
+</i2i_final_check>
+""".strip()
+
+
+I2I_FLAT_OUTPUT_RULES = """
+<i2i_output mode="flat" priority="highest">
+- 只输出一行、逗号分隔的英文修改标签或短语，不要 JSON、Markdown、代码块、解释、前后缀或槽位名。
+- 所有标签必须直接来自本轮明确修改或使该修改成立的必要补充。
+- 不输出人物专属负面标签；全局负面词由程序管理。
+</i2i_output>
+""".strip()
+
+
+I2I_SLOT_OUTPUT_RULES = """
+<i2i_output mode="nai_v4" priority="highest">
+只输出 I2I 专用的本地 V4 全局槽位，不要 JSON、Markdown、代码块、解释或前后缀：
+GLOBAL: edit_tag_1 | edit_tag_2
+
+- `GLOBAL` 必须且只能出现一次，内容不能为空；本轮所有实际修改标签都放在 `GLOBAL`，包括用户明确要求改变的角色身份、人数、性别或外貌。
+- 无论用户是否明确指定人物，都只输出 `GLOBAL`；禁止生成 `Pn+`、`Pn-`、`charN` 或其他人物分层槽位。图生图最终会把全部修改放入 Provider 的 base caption，人物 captions 保持为空。
+- 用户明确指定最终人数、性别或角色身份时，在 `GLOBAL` 中正常保留对应标签；例如明确要求 `solo`、`2people`、`2girls` 或 `keqing (genshin impact)` 时可以输出。未明确指定时禁止推断或补充。
+- 槽位内只用竖线 `|` 分隔标签，每项只能是一个英文 tag 或不可拆分的权重表达。
+- 不输出 version、format、intent、continuity、prompt、characters、characterPrompts、v4_prompt、v4_negative_prompt、坐标或画师串。
+</i2i_output>
+""".strip()
+
+
+def build_i2i_prompt_generator_template(
+    *, sfw_enabled: bool, output_format: str,
+) -> str:
+    """构造不继承普通文生图规则的 I2I 专用翻译模板。"""
+    content_policy = CONTENT_POLICY_TEXTS[
+        "sfw" if sfw_enabled else "allow_nsfw"
+    ]
+    output_rules = (
+        I2I_SLOT_OUTPUT_RULES
+        if str(output_format or "text").strip().lower() == "json"
+        else I2I_FLAT_OUTPUT_RULES
+    )
+    return "\n\n".join((
+        I2I_PROMPT_RULES,
+        content_policy,
+        "<user_request>\n<<USER_REQUEST>>\n</user_request>",
+        I2I_FINAL_SELF_CHECK_RULES,
+        output_rules,
+    ))
+
+
+def build_flat_prompt_generator_template(*, sfw_enabled: bool) -> str:
+    """构造 2.3.7 兼容的直接平铺提示词模板。
+
+    旧版本的普通文本模板已经验证过可直接让 LLM 输出英文提示词；
+    在末尾追加本地协议约束，避免旧多人物示例诱导模型返回 ``charN:``
+    分段，从而让结果可直接交给通用图片接口。
+    """
+    base = SFW_PROMPT_GENERATOR_TEMPLATE if sfw_enabled else PROMPT_GENERATOR_TEMPLATE
+    return f"{base}\n\n{FLAT_OUTPUT_RULES}".strip()
+
+
 def build_prompt_generator_template(
     *, sfw_enabled: bool, output_format: str,
 ) -> str:

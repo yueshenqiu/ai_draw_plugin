@@ -84,7 +84,7 @@
 
 人物正向和人物负向始终使用相同索引。YesNAI 即使人物负向为空，也会保留对应的空 Caption。画师串只进入全局正向，不会进入人物正向或人物负向。
 
-结构化人物字段只对 NovelAI V4/V4.5 模型启用；其他模型自动使用扁平提示词。`/ad0` 和 `/ad y` 始终保持扁平流程。解析器兼容旧 v2/v3 的 `global/people` 数组，但 `output_format = "json"` 时不会接受只有 `prompt` 字段的旧 JSON 或纯文本输出。
+每个模型可在 `[[models.entries]]` 中用 `prompt_structure` 选择提示词协议：`auto` 保持旧行为，`nai_v4` 使用 NovelAI V4/V4.5 分层人物字段，`flat` 让 LLM 直接输出通用英文平铺提示词。显式模式优先于全局 `[prompt_generator].output_format`；旧配置缺少该字段时按 `auto` 兼容。`/ad0` 和 `/ad y` 仍跳过 LLM，不会被转换成 V4 人物层。
 
 ## 自拍与日程增强
 
@@ -302,6 +302,7 @@ format = "bestnai"
 base_url = "https://your-image-api.example.com"
 api_key = "your-image-key"
 model = "nai-diffusion-4-5-full"
+prompt_structure = "nai_v4"
 endpoint = ""
 sampler = "k_euler_ancestral"
 steps = 28
@@ -318,9 +319,21 @@ artist_preset = "无"
 | `format` | 默认端点 | 说明 |
 |---|---|---|
 | `bestnai` | `/v1/chat/completions` | OpenAI Chat Completions 兼容的 BestNAI/NovelAI 接口 |
-| `yesnai` | `/native/ai/generate-image-stream` | YesNovelAI Native MessagePack 流式请求格式 |
+| `yesnai` | `nai_v4/auto`：Native 流式/ZIP；`flat`：`/v1/images/generations` | YesNAI Native 流式优先并兼容 ZIP，或高层扁平 Images 接口 |
 
-端点留空时使用 Provider 默认值。YesNAI 未声明“角色+画风”组合参考能力，使用 `rh/hr` 前应确认当前 Provider 能力。
+端点留空时按 `prompt_structure` 选择默认协议。需要低层 JSON 响应时可显式填写 `/v1/nai/generate-image`，其请求体与 Native 相同但返回 `images` Base64。`/v1/images/generations` 只支持 flat 文生图，不承载 V4 人物层或参考图；flat 的图生图会自动改走 Native 低层接口，角色参考和画风参考仍在调用前拒绝。高层 V1 只传文档确认的常规 `nai` 参数，`cfg_rescale`、`nocache` 和任意 `extra_params` 不会硬塞入请求。显式端点必须与所选提示词结构兼容。
+
+### 图生图通用参数
+
+每个模型都可以独立设置以下字段；它们只作用于 `i2i/img2img`，不会改变角色参考或画风参考：
+
+```toml
+i2i_strength = 0.65
+i2i_noise = 0.1
+i2i_color_correct = true
+```
+
+YesNAI Native 图生图会把来源图中心裁剪并缩放到当前目标尺寸，再以纯 Base64 PNG 放入 `parameters.image`，并按 Launcher 的普通 I2I 协议发送直属的 `strength` 与 `noise`。`i2i_color_correct` 仅由支持该参数的 Provider（如 BestNAI）使用；YesNAI Launcher 只在局部重绘时发送颜色校正，而本插件不支持局部重绘（`infill`、mask）。
 
 ### 画师串与提示词预设
 
@@ -353,7 +366,7 @@ y_apply_artist_preset = true
 
 ### 自定义提示词模板
 
-建议保持 `prompt_template = ""` 使用内置模板。如果自定义模板，应继续要求输出与上文一致的 `version=4` JSON，并至少保留 `<<USER_REQUEST>>`。
+建议保持 `prompt_template = ""` 使用内置模板。`nai_v4` 模式的自定义模板应要求输出当前 `GLOBAL/Pn+/Pn-` 结构；`flat` 模式的自定义模板应要求只输出一行普通英文提示词，并至少保留 `<<USER_REQUEST>>`。
 
 常用占位符：
 
@@ -378,7 +391,7 @@ y_apply_artist_preset = true
 
 ### “提示词生成失败”
 
-检查提示词 LLM 的 `api_base`、`api_key`、`model_name` 和 `max_tokens`。`output_format = "json"` 时，LLM 必须返回有效的 `global/people` 结构化 JSON；内置模板要求 `version=4`，解析器仍兼容旧 v2/v3 人物数组。正文为空且 reasoning 中也没有可解析结构、只有旧 `prompt` 字段、纯文本或损坏 JSON 时都会终止任务，不会继续调用图像 Provider。
+检查提示词 LLM 的 `api_base`、`api_key`、`model_name` 和 `max_tokens`。`auto` 或 `nai_v4` 模式使用当前 `GLOBAL/Pn+/Pn-` 分层协议；`flat` 模式要求 LLM 直接返回普通英文提示词，不需要 JSON。正文为空或不符合所选模式时，任务会在调用图像 Provider 前终止。
 
 ### 自拍没有日程增强
 
@@ -446,6 +459,12 @@ ai_draw_plugin/
 Provider 若不接受 `structured_prompt`，生成器会保持旧调用兼容，不会为了兼容而重复调用图像 API。
 
 ## 更新日志
+
+### 2.4.8
+
+- 新增模型级 `prompt_structure`，支持 NovelAI V4/V4.5 分层提示词与 V5/通用模型的平铺提示词，并对齐 YesNAI Native、V1 JSON 和 Images 接口。
+- 完善 BestNAI 与 YesNAI 图生图参数、参考图尺寸归一化和 V5 I2I 的 V4 wire envelope，保持图片、强度、噪声和人物 Caption 结构正确。
+- 为自然语言图生图增加独立 I2I 翻译模板，只翻译本轮明确修改，避免擅自补充人物数量、身份、外貌或原图内容。
 
 ### 2.4.7
 

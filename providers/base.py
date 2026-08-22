@@ -24,6 +24,20 @@ class ResponseLimitError(ValueError):
     """远端响应超过 Provider 允许的安全上限。"""
 
 
+PROMPT_STRUCTURE_MODES = frozenset({"auto", "nai_v4", "flat"})
+
+
+def normalize_prompt_structure(value: Any) -> str:
+    """归一化模型级提示词结构配置。
+
+    ``auto`` 是旧配置的兼容默认值；显式 ``nai_v4`` 与 ``flat``
+    分别锁定分层和普通平铺协议。未知值不让 Provider 崩溃，回退到
+    ``auto``，由调用方负责记录配置警告。
+    """
+    mode = str(value or "auto").strip().lower()
+    return mode if mode in PROMPT_STRUCTURE_MODES else "auto"
+
+
 class BaseImageProvider(ABC):
     """图片生成 Provider 抽象基类。
 
@@ -402,6 +416,144 @@ class BaseImageProvider(ABC):
         if not valid:
             return False, error, 0
         return True, payload, len(raw)
+
+    def normalize_i2i_base64_image(
+        self,
+        image_data: str,
+        target_width: int,
+        target_height: int,
+        capabilities: Any,
+        field_name: str = "参考图",
+    ) -> Tuple[bool, str, int, str]:
+        """校验并将图生图输入归一化为目标尺寸的 PNG base64。
+
+        Native 图生图接口不会替调用方缩放来源图。该方法沿用
+        :meth:`normalize_and_validate_base64_image` 的输入安全限制，然后按
+        目标宽高比从中心裁剪，使用高质量 LANCZOS 精确缩放并重新编码为 PNG。
+
+        Returns:
+            ``(ok, pure_base64, byte_count, error)``。成功时 ``error`` 为空；
+            失败时 ``pure_base64`` 与 ``byte_count`` 均为空/为零。
+        """
+        # 目标尺寸不能默默接受 bool 或带小数的浮点数；字符串整数仍兼容
+        # 手工 TOML/WebUI 配置传值。
+        if isinstance(target_width, bool) or isinstance(target_height, bool):
+            return False, "", 0, f"{field_name}目标尺寸必须是整数"
+        try:
+            normalized_width = int(target_width)
+            normalized_height = int(target_height)
+        except (TypeError, ValueError, OverflowError):
+            return False, "", 0, f"{field_name}目标尺寸必须是整数"
+        for original, normalized in (
+            (target_width, normalized_width),
+            (target_height, normalized_height),
+        ):
+            if isinstance(original, float) and not original.is_integer():
+                return False, "", 0, f"{field_name}目标尺寸必须是整数"
+            if isinstance(original, str) and str(normalized) != original.strip():
+                return False, "", 0, f"{field_name}目标尺寸必须是整数"
+        if normalized_width <= 0 or normalized_height <= 0:
+            return False, "", 0, f"{field_name}目标尺寸必须大于 0"
+
+        # 目标尺寸也必须落在 Provider 已声明的安全边界内。I2I 来源图可
+        # 使用更宽松的参考图能力对象，但生成目标仍不会突破该对象上限。
+        try:
+            self.validate_dimensions(
+                normalized_width,
+                normalized_height,
+                capabilities,
+                require_multiple=False,
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            return False, "", 0, f"{field_name}目标尺寸无效: {str(exc)[:120]}"
+
+        valid, payload_or_error, _ = self.normalize_and_validate_base64_image(
+            image_data,
+            capabilities=capabilities,
+            field_name=field_name,
+        )
+        if not valid:
+            return False, "", 0, payload_or_error
+
+        try:
+            source_bytes = base64.b64decode(payload_or_error, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            return False, "", 0, f"{field_name} base64 解码失败: {str(exc)[:80]}"
+
+        try:
+            with Image.open(io.BytesIO(source_bytes)) as source:
+                source.load()
+                source_width, source_height = source.size
+                source_format = (source.format or "").upper()
+
+                # 已经是目标尺寸的 PNG 不重复压缩，避免无意义的质量/大小变化。
+                if (
+                    source_format == "PNG"
+                    and source_width == normalized_width
+                    and source_height == normalized_height
+                ):
+                    return True, payload_or_error, len(source_bytes), ""
+
+                source_ratio = source_width / source_height
+                target_ratio = normalized_width / normalized_height
+                if abs(source_ratio - target_ratio) < 1e-9:
+                    cropped = source.copy()
+                elif source_ratio > target_ratio:
+                    crop_width = max(
+                        1,
+                        min(source_width, int(round(source_height * target_ratio))),
+                    )
+                    left = max(0, (source_width - crop_width) // 2)
+                    cropped = source.crop((left, 0, left + crop_width, source_height))
+                else:
+                    crop_height = max(
+                        1,
+                        min(source_height, int(round(source_width / target_ratio))),
+                    )
+                    top = max(0, (source_height - crop_height) // 2)
+                    cropped = source.crop((0, top, source_width, top + crop_height))
+
+                try:
+                    # PNG 只可靠支持 RGB/RGBA 等常用模式；将调色板、CMYK
+                    # 等输入转为保留透明度的 RGBA 或普通 RGB。
+                    has_alpha = "A" in cropped.getbands() or "transparency" in cropped.info
+                    output_image = cropped.convert("RGBA" if has_alpha else "RGB")
+                    if output_image.size != (normalized_width, normalized_height):
+                        resampling = getattr(Image, "Resampling", Image)
+                        resized_image = output_image.resize(
+                            (normalized_width, normalized_height),
+                            resampling.LANCZOS,
+                        )
+                        output_image.close()
+                        output_image = resized_image
+
+                    encoded = io.BytesIO()
+                    output_image.save(encoded, format="PNG", optimize=True)
+                    output_bytes = encoded.getvalue()
+                finally:
+                    cropped.close()
+                    if "output_image" in locals():
+                        output_image.close()
+        except (
+            Image.DecompressionBombError,
+            UnidentifiedImageError,
+            OSError,
+            SyntaxError,
+            ValueError,
+            MemoryError,
+        ) as exc:
+            return False, "", 0, f"{field_name}处理失败: {str(exc)[:120]}"
+
+        valid_output, output_error = self.validate_image_bytes(
+            output_bytes,
+            capabilities=capabilities,
+            field_name=f"{field_name}处理结果",
+        )
+        if not valid_output:
+            return False, "", 0, output_error
+
+        output_payload = base64.b64encode(output_bytes).decode("ascii")
+        return True, output_payload, len(output_bytes), ""
 
     @staticmethod
     def validate_image_bytes(

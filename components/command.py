@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, Tuple
+from urllib.parse import urlsplit
 
 from ..core.prompt_types import GeneratedPrompt, PersonPrompt, StructuredPrompt
 
@@ -20,6 +21,7 @@ from ..constants.help_texts import HELP_TEXT
 from ..constants.constants import MODEL_MAPPINGS, SIZE_MAPPINGS
 from ..providers.capabilities import ImageFeature
 from ..providers import get_capabilities
+from ..providers.base import normalize_prompt_structure
 from ..core.image_utils import (
     load_image_file_as_base64,
     load_queue_image_spool,
@@ -1007,7 +1009,20 @@ async def handle_ad_style(style_name: str, kwargs: dict) -> tuple:
     if not model_config or not model_config.get("base_url"):
         await plugin.ctx.send.text("当前生图模型配置错误，请检查配置文件", stream_id)
         return False, "配置错误", 1
-    supported, reason = _check_ref_mode_capability(model_config, "i2i")
+    mode_supported, mode_reason = _check_prompt_structure_capability(
+        model_config,
+        normalize_prompt_structure(model_config.get("prompt_structure")),
+    )
+    if not mode_supported:
+        await plugin.ctx.send.text(mode_reason or "当前模型不支持所选提示词结构", stream_id)
+        return False, mode_reason or "提示词结构不兼容", 1
+    supported, reason = _check_ref_mode_capability(
+        model_config,
+        "i2i",
+        prompt_structure=normalize_prompt_structure(
+            model_config.get("prompt_structure")
+        ),
+    )
     if not supported:
         await plugin.ctx.send.text(reason or "当前模型不支持图生图", stream_id)
         return False, reason or "不支持图生图", 1
@@ -1097,7 +1112,20 @@ async def handle_dr0_ref_draw(mode: str, tags: str, kwargs: dict) -> tuple:
     if not model_config or not model_config.get("base_url"):
         await plugin.ctx.send.text("当前生图模型配置错误，请检查配置文件", stream_id)
         return False, "配置错误", 1
-    supported, reason = _check_ref_mode_capability(model_config, ref_mode)
+    mode_supported, mode_reason = _check_prompt_structure_capability(
+        model_config,
+        normalize_prompt_structure(model_config.get("prompt_structure")),
+    )
+    if not mode_supported:
+        await plugin.ctx.send.text(mode_reason or "当前模型不支持所选提示词结构", stream_id)
+        return False, mode_reason or "提示词结构不兼容", 1
+    supported, reason = _check_ref_mode_capability(
+        model_config,
+        ref_mode,
+        prompt_structure=normalize_prompt_structure(
+            model_config.get("prompt_structure")
+        ),
+    )
     if not supported:
         await plugin.ctx.send.text(reason or "当前模型不支持该参考模式", stream_id)
         return False, reason or "不支持参考模式", 1
@@ -1158,6 +1186,13 @@ async def handle_dr0_draw(description: str, kwargs: dict) -> tuple:
     if not model_config or not model_config.get("base_url"):
         await plugin.ctx.send.text("当前生图模型配置错误，请检查配置文件", stream_id)
         return False, "配置错误", 1
+    mode_supported, mode_reason = _check_prompt_structure_capability(
+        model_config,
+        normalize_prompt_structure(model_config.get("prompt_structure")),
+    )
+    if not mode_supported:
+        await plugin.ctx.send.text(mode_reason or "当前模型不支持所选提示词结构", stream_id)
+        return False, mode_reason or "提示词结构不兼容", 1
 
     # NSFW 过滤：扫描直接标签中是否包含违规 tag
     info = plugin._extract_session_info(kwargs)
@@ -1363,7 +1398,21 @@ async def ad_workflow(
 ) -> bool:
     plugin = get_plugin_instance()
     stream_id = kwargs.get("stream_id", "")
-    generation_request = _parse_generation_request(description, is_action)
+    ref_mode = str(ref_mode or "").strip().lower()
+    is_i2i = ref_mode == "i2i"
+    raw_description = str(description or "").strip()
+    # I2I 是与自拍、随机和普通文生图并列的翻译模式。参考图已经承担
+    # 原始画面上下文，不能先用普通模式解析或改写本轮修改指令。
+    generation_request = (
+        GenerationRequest(
+            policy="minimal",
+            request_text=raw_description,
+            constraints=raw_description,
+            is_selfie=False,
+        )
+        if is_i2i
+        else _parse_generation_request(description, is_action)
+    )
     policy = generation_request.policy
     is_selfie = generation_request.is_selfie
     random_fixed_constraints = (
@@ -1381,16 +1430,52 @@ async def ad_workflow(
         stream_id=stream_id,
     )
 
+    # 模型级提示词模式必须在 LLM 调用前确定；否则同一会话切换模型后，
+    # LLM 仍会沿用全局 output_format，导致 V5 flat 模式误走 V4 槽位协议。
+    mode_model_config = plugin._get_model_config_from_kwargs(kwargs)
+    prompt_structure = normalize_prompt_structure(
+        mode_model_config.get("prompt_structure") if mode_model_config else "auto"
+    )
+
+    mode_supported, mode_reason = _check_prompt_structure_capability(
+        mode_model_config, prompt_structure,
+    )
+    if not mode_supported:
+        await plugin.ctx.send.text(
+            mode_reason or "当前模型不支持所选提示词结构",
+            stream_id,
+        )
+        return False
+
     if policy == "random_content":
         description = _build_random_request_text(random_fixed_constraints)
 
     # Provider 能力预检查，避免在不支持参考模式的模型上浪费一次 LLM/API 调用。
     if ref_mode:
         supported, reason = _check_ref_mode_capability(
-            plugin._get_model_config_from_kwargs(kwargs), ref_mode,
+            mode_model_config, ref_mode, prompt_structure=prompt_structure,
         )
         if not supported:
             await plugin.ctx.send.text(reason or "当前模型不支持该参考模式", stream_id)
+            return False
+
+    # 固定自拍参考图也属于角色参考。flat YesNAI 不能把它静默丢弃，
+    # 在调用提示词 LLM 之前直接告知配置冲突，避免先产生一次调用费用。
+    if (
+        prompt_structure == "flat"
+        and str((mode_model_config or {}).get("format", "") or "").strip().lower() == "yesnai"
+        and is_selfie
+        and not ref_image
+    ):
+        selfie_ref_filename = (
+            getattr(plugin.config.prompt_show, "selfie_ref_image", "") or ""
+        ).strip()
+        if selfie_ref_filename and _resolve_safe_selfie_ref(selfie_ref_filename) is not None:
+            reason = (
+                "当前 YesNAI 模型使用 flat 提示词结构，不支持固定自拍角色参考图；"
+                "请改用 nai_v4 模式或清空 selfie_ref_image"
+            )
+            await plugin.ctx.send.text(reason, stream_id)
             return False
 
     selfie_scene_context = ""
@@ -1409,6 +1494,7 @@ async def ad_workflow(
         ref_mode=ref_mode,
         policy=policy,
         is_selfie=is_selfie,
+        prompt_structure=prompt_structure,
     )
     if not generated or not generated.flat_prompt:
         await plugin.ctx.send.text("提示词生成失败，请稍后再试~", stream_id)
@@ -1424,7 +1510,7 @@ async def ad_workflow(
     from ..core.selfie_engine import detect_selfie_from_output
 
     # LLM 已明确输出自拍意图或自拍标签时，纠正仅靠关键词前缀可能漏掉的场景。
-    if not is_selfie and (
+    if not is_i2i and not is_selfie and (
         (structured_prompt is not None and structured_prompt.intent == "selfie")
         or detect_selfie_from_output(generated_prompt)
     ):
@@ -1541,11 +1627,88 @@ async def ad_workflow(
 # 内部辅助函数
 # ================================================================
 
-def _check_ref_mode_capability(model_config: dict, ref_mode: str) -> tuple:
-    """在调用 LLM/生图 API 前确认当前 Provider 声明支持对应参考能力。"""
+def _check_prompt_structure_capability(
+    model_config: dict,
+    prompt_structure: str,
+) -> tuple:
+    """确认显式提示词模式与当前 Provider/模型组合相容。"""
+    mode = normalize_prompt_structure(prompt_structure)
+    cfg = model_config or {}
+    fmt = str(cfg.get("format", "bestnai") or "bestnai").strip().lower()
+    model = str(cfg.get("model", "") or "").strip().lower()
+    if mode == "nai_v4" and fmt in {"yesnai", "bestnai", "novelai"} and not (
+        "nai-diffusion-4" in model or "novelai-v4" in model
+    ):
+        return False, (
+            f"当前模型 {cfg.get('model') or '(未配置)'} 不支持 nai_v4 提示词结构，"
+            "请改用 flat 或选择 V4/V4.5 模型"
+        )
+
+    # 高层 Images 端点只接受扁平 prompt。提前拦截，避免先付费调用一次
+    # LLM、再由 Provider 才发现 endpoint 与模式不兼容。
+    if fmt == "yesnai":
+        configured_endpoint = str(
+            cfg.get("endpoint") or cfg.get("nai_endpoint") or ""
+        ).strip()
+        if configured_endpoint:
+            try:
+                endpoint_path = urlsplit(configured_endpoint).path
+            except ValueError:
+                endpoint_path = configured_endpoint
+            endpoint_path = (
+                f"/{endpoint_path.strip('/')}" if endpoint_path else ""
+            ).lower()
+            if endpoint_path == "/v1/images/generations" and mode != "flat":
+                return False, (
+                    "YesNAI /v1/images/generations 只支持 flat 提示词结构，"
+                    "请将当前模型的 prompt_structure 改为 flat"
+                )
+    return True, None
+
+
+def _check_ref_mode_capability(
+    model_config: dict,
+    ref_mode: str,
+    *,
+    prompt_structure: str = "auto",
+) -> tuple:
+    """在调用 LLM/生图 API 前确认 Provider 和模型模式都支持参考能力。"""
+    ref_mode = str(ref_mode or "").strip().lower()
     if not ref_mode:
         return True, None
     fmt = str((model_config or {}).get("format", "bestnai") or "bestnai").strip().lower()
+    mode = normalize_prompt_structure(prompt_structure)
+    if fmt == "yesnai" and mode == "flat" and ref_mode != "i2i":
+        return False, (
+            "当前模型已选择 flat 提示词模式；YesNAI flat 不支持角色参考或画风参考，"
+            "请切换 nai_v4 模式或移除参考图"
+        )
+    if fmt == "yesnai" and ref_mode == "i2i":
+        configured_endpoint = str(
+            (model_config or {}).get("endpoint")
+            or (model_config or {}).get("nai_endpoint")
+            or ""
+        ).strip()
+        if configured_endpoint:
+            try:
+                endpoint_path = urlsplit(configured_endpoint).path
+            except ValueError:
+                endpoint_path = configured_endpoint
+            endpoint_path = (
+                f"/{endpoint_path.strip('/')}" if endpoint_path else ""
+            ).lower()
+            if endpoint_path == "/v1/images/generations":
+                return False, (
+                    "YesNAI /v1/images/generations 只支持文生图，"
+                    "图生图请清空 endpoint 让插件自动使用 Native，"
+                    "或改为 /v1/nai/generate-image"
+                )
+    if fmt == "yesnai" and ref_mode in {"character", "style", "character&style"}:
+        model = str((model_config or {}).get("model", "") or "").strip().lower()
+        if model and "nai-diffusion-4-5" not in model:
+            return False, (
+                f"YesNAI 精准参考仅支持 V4.5 基础或 Inpainting 模型，当前为 {model}"
+            )
     caps = get_capabilities(fmt)
     if caps is None:
         return False, f"当前服务商 {fmt} 未声明参考图能力"
@@ -2028,6 +2191,7 @@ async def _generate_prompt_with_llm(
     ref_mode: str = "",
     policy: str = "minimal",
     is_selfie: bool = False,
+    prompt_structure: str = "auto",
 ) -> Optional[GeneratedPrompt]:
     plugin = get_plugin_instance()
     gen_cfg = plugin.config.prompt_generator
@@ -2038,25 +2202,65 @@ async def _generate_prompt_with_llm(
     # 加载模板
     from ..core.rules.prompt_rules import (
         CONTENT_POLICY_TEXTS,
+        FLAT_OUTPUT_RULES,
         GENERATION_POLICY_TEXTS,
+        SLOT_OUTPUT_RULES,
+        build_flat_prompt_generator_template,
+        build_i2i_prompt_generator_template,
         build_prompt_generator_template,
     )
 
-    output_format = (gen_cfg.output_format or "json").strip().lower()
-    template = gen_cfg.prompt_template or build_prompt_generator_template(
-        sfw_enabled=nsfw_enabled,
-        output_format=output_format,
-    )
+    mode = normalize_prompt_structure(prompt_structure)
+    configured_output_format = (gen_cfg.output_format or "json").strip().lower()
+    is_i2i = str(ref_mode or "").strip().lower() == "i2i"
+    if is_i2i:
+        output_format = (
+            "json"
+            if mode == "nai_v4"
+            or mode == "auto" and configured_output_format == "json"
+            else "text"
+        )
+        template = build_i2i_prompt_generator_template(
+            sfw_enabled=nsfw_enabled,
+            output_format=output_format,
+        )
+    elif mode == "flat":
+        output_format = "text"
+        template = gen_cfg.prompt_template or build_flat_prompt_generator_template(
+            sfw_enabled=nsfw_enabled,
+        )
+        if gen_cfg.prompt_template:
+            template = f"{template.rstrip()}\n\n{FLAT_OUTPUT_RULES}"
+    elif mode == "nai_v4":
+        output_format = "json"
+        template = gen_cfg.prompt_template or build_prompt_generator_template(
+            sfw_enabled=nsfw_enabled,
+            output_format="json",
+        )
+        if gen_cfg.prompt_template:
+            template = f"{template.rstrip()}\n\n{SLOT_OUTPUT_RULES}"
+    else:
+        output_format = configured_output_format
+        template = gen_cfg.prompt_template or build_prompt_generator_template(
+            sfw_enabled=nsfw_enabled,
+            output_format=output_format,
+        )
     content_policy_text = (
         CONTENT_POLICY_TEXTS["sfw" if nsfw_enabled else "allow_nsfw"]
-        if gen_cfg.prompt_template else ""
+        if gen_cfg.prompt_template and not is_i2i else ""
     )
-    policy_text = GENERATION_POLICY_TEXTS.get(
-        policy, GENERATION_POLICY_TEXTS["minimal"],
+    policy_text = (
+        "" if is_i2i else GENERATION_POLICY_TEXTS.get(
+            policy, GENERATION_POLICY_TEXTS["minimal"],
+        )
     )
     previous_prompt = ""
     previous_request = ""
-    if stream_id and _should_inherit_previous_context(request_text):
+    if (
+        not is_i2i
+        and stream_id
+        and _should_inherit_previous_context(request_text)
+    ):
         previous_prompt, previous_request = plugin._session_state.get_last_draw_context(
             stream_id, ttl=gen_cfg.inherit_ttl, nsfw_enabled=nsfw_enabled,
         )
@@ -2090,6 +2294,12 @@ async def _generate_prompt_with_llm(
     effective_max_tokens = _resolve_prompt_max_tokens(
         gen_cfg.max_tokens, output_format, gen_cfg.model_name,
     )
+    plugin.ctx.logger.debug(
+        "[LLM] 提示词模式: translation=%s prompt_structure=%s output_format=%s",
+        "i2i" if is_i2i else "standard",
+        mode,
+        output_format,
+    )
     if has_custom_api_config(llm_config):
         success, response, _, _ = await call_custom_llm_api(
             prompt=prompt, api_base=gen_cfg.api_base, api_key=gen_cfg.api_key,
@@ -2117,7 +2327,26 @@ async def _generate_prompt_with_llm(
         plugin.ctx.logger.error("[LLM] 提示词生成失败: LLM 返回空内容")
         return None
 
-    generated = parse_generated_prompt(response)
+    if (is_i2i and output_format == "text") or mode == "flat":
+        from ..core.prompt_engine import cleanup_flat_prompt
+
+        cleaned = cleanup_flat_prompt(response)
+        if not cleaned:
+            plugin.ctx.logger.error("[LLM] flat 模式未取得可用平铺提示词")
+            return None
+        generated = GeneratedPrompt(flat_prompt=cleaned)
+    elif is_i2i:
+        cleaned = _parse_i2i_global_slot_prompt(response)
+        if not cleaned:
+            plugin.ctx.logger.error(
+                "[LLM] I2I nai_v4 模式未取得可解析的 GLOBAL 槽位，已终止本次生图"
+            )
+            return None
+        # I2I 的 V4 输出不进入普通人物分层解析。Provider 继续收到一条
+        # base caption 和 structured_prompt=None，char_captions 因此保持为空。
+        generated = GeneratedPrompt(flat_prompt=cleaned)
+    else:
+        generated = parse_generated_prompt(response)
     if generated.structured_prompt is not None:
         parsed = generated.structured_prompt
         resolved_format = "multi" if len(parsed.people) > 1 else "single"
@@ -2141,13 +2370,60 @@ async def _generate_prompt_with_llm(
     if not generated.flat_prompt.strip():
         plugin.ctx.logger.error("[LLM] 输出中没有可用提示词，已终止本次生图")
         return None
-    if output_format == "json" and generated.structured_prompt is None:
+    if (
+        not is_i2i
+        and output_format == "json"
+        and generated.structured_prompt is None
+    ):
+        if mode == "nai_v4":
+            plugin.ctx.logger.error(
+                "[LLM] 当前模式未取得可解析的 GLOBAL/Pn 分层结构，已终止本次生图"
+            )
+            return None
         raw_response = response.strip()
         if _is_unusable_json_fallback(raw_response):
             plugin.ctx.logger.error("[LLM] JSON 输出损坏，已终止本次生图")
             return None
         plugin.ctx.logger.warning("[LLM] 未取得 V4 分层结构，本次按兼容平铺提示词生成")
     return generated
+
+
+_I2I_GLOBAL_SLOT_RE = re.compile(
+    r"^\s*(?:(?:[-*]|\d+[.)]|#{1,6})\s+)?(?:\*\*|__|`)?GLOBAL"
+    r"\s*(?:\*\*|__|`)?\s*(?::|：|\|)\s*(?:\*\*|__|`)?"
+    r"\s*(?P<value>.*?)\s*$",
+    re.IGNORECASE,
+)
+_I2I_NESTED_SLOT_RE = re.compile(
+    r"(?:^|[\s,;|])(?:\*\*|__|`)?(?:GLOBAL|P\d+\s*[+-]|"
+    r"PERSON[_\s-]*\d+(?:[_\s-]*(?:POSITIVE|NEGATIVE))?|char\d+)"
+    r"\s*(?:\*\*|__|`)?\s*[:：]",
+    re.IGNORECASE,
+)
+
+
+def _parse_i2i_global_slot_prompt(response: str) -> str:
+    """严格提取 I2I 的单个 GLOBAL 槽，不触发普通人物数量校验。"""
+    raw = str(response or "").strip()
+    if raw.startswith("```") and raw.endswith("```"):
+        lines = raw.splitlines()
+        raw = "\n".join(lines[1:-1]).strip() if len(lines) >= 2 else ""
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return ""
+    match = _I2I_GLOBAL_SLOT_RE.match(lines[0])
+    if not match:
+        return ""
+    value = match.group("value").strip()
+    if _I2I_NESTED_SLOT_RE.search(value):
+        return ""
+    for closing in ("**", "__", "`"):
+        if value.endswith(closing):
+            value = value[:-len(closing)].rstrip()
+            break
+    from ..core.prompt_engine import cleanup_flat_prompt
+
+    return cleanup_flat_prompt(value)
 
 
 def _is_unusable_json_fallback(response: str) -> bool:

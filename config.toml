@@ -3,7 +3,7 @@
 
 [plugin]
 enabled = true
-config_version = "2.4.7"
+config_version = "2.4.8"
 send_mode = "direct"
 force_forward_when_nsfw_off = true
 use_http_direct = false
@@ -87,6 +87,7 @@ default_model = "model2"
 id = "model1"
 name = "YesNovelAI V4.5"
 format = "yesnai"
+prompt_structure = "nai_v4"
 base_url = "https://nai.rinko.ai"
 api_key = ""
 model = "nai-diffusion-4-5-full"
@@ -102,11 +103,15 @@ size_preset = "竖图"
 artist_preset = "梦幻柔美3.0"
 ref_fidelity = 0.7
 ref_strength = 0.9
+i2i_strength = 0.65
+i2i_noise = 0.1
+i2i_color_correct = true
 
 [[models.entries]]
 id = "model2"
 name = "BestNAI V4.5（高参考）"
 format = "bestnai"
+prompt_structure = "nai_v4"
 base_url = "https://api.tuercha.com"
 api_key = ""
 model = "nai-diffusion-4-5-full"
@@ -122,11 +127,15 @@ size_preset = "竖图"
 artist_preset = "梦幻柔美3.0"
 ref_fidelity = 0.9
 ref_strength = 1.0
+i2i_strength = 0.65
+i2i_noise = 0.1
+i2i_color_correct = true
 
 [[models.entries]]
 id = "model3"
 name = "BestNAI V4 "
 format = "bestnai"
+prompt_structure = "auto"
 base_url = ""
 api_key = ""
 model = "nai-diffusion-4-full"
@@ -142,3 +151,30 @@ size_preset = "竖图"
 artist_preset = "无"
 ref_fidelity = 0.6
 ref_strength = 0.8
+i2i_strength = 0.65
+i2i_noise = 0.1
+i2i_color_correct = true
+
+[[models.entries]]
+id = "model4"
+name = "YesNovelAI V5（Flat）"
+format = "yesnai"
+prompt_structure = "flat"
+base_url = "https://nai.rinko.ai"
+api_key = ""
+model = "nai-diffusion-5-full"
+endpoint = ""
+max_tokens = 100000
+sampler = "k_euler_ancestral"
+steps = 28
+scale = 6.0
+cfg = 0.0
+noise_schedule = "karras"
+default_size = "832x1216"
+size_preset = "竖图"
+artist_preset = "梦幻柔美3.0"
+ref_fidelity = 0.7
+ref_strength = 0.9
+i2i_strength = 0.65
+i2i_noise = 0.1
+i2i_color_correct = true

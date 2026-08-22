@@ -111,7 +111,7 @@ class PluginSectionConfig(PluginConfigBase):
         ),
     )
     config_version: str = Field(
-        default="2.4.7", description="配置版本号",
+        default="2.4.8", description="配置版本号",
         json_schema_extra=_ui("配置版本", order=99, hidden=True, disabled=True),
     )
 
@@ -132,6 +132,18 @@ class ModelItem(PluginConfigBase):
                       json_schema_extra=_ui("显示名", order=1, placeholder="BestNAI V4.5"))
     format: str = Field(default="bestnai", description="服务商格式",
                         json_schema_extra=_ui("服务商格式", order=2, placeholder="bestnai"))
+    prompt_structure: Literal["auto", "nai_v4", "flat"] = Field(
+        default="auto",
+        description="提示词结构：auto（兼容旧行为）/ nai_v4（NovelAI 分层）/ flat（通用平铺）",
+        json_schema_extra=_ui(
+            "提示词结构",
+            order=2,
+            hint=(
+                "auto=保持旧行为；nai_v4=使用 V4/V4.5 人物分层；"
+                "flat=LLM 直接输出通用英文平铺提示词"
+            ),
+        ),
+    )
     base_url: str = Field(default="", description="API 地址",
                           json_schema_extra=_ui("API 地址", order=3, placeholder="https://..."))
     api_key: str = Field(default="", description="API 密钥",
@@ -174,6 +186,34 @@ class ModelItem(PluginConfigBase):
             hint="角色参考 (character) 的 strength。控制参考图对生成的整体影响力",
         ),
     )
+    i2i_strength: float = Field(
+        default=0.65, ge=0.0, le=1.0, description="图生图变化强度 (0~1)",
+        json_schema_extra=_ui(
+            "图生图变化强度", order=18, step=0.05,
+            hint="图生图 (img2img) 的变化强度；0=尽量保留原图，1=变化最大",
+        ),
+    )
+    i2i_noise: float = Field(
+        default=0.1, ge=0.0, le=1.0, description="图生图噪声 (0~1)",
+        json_schema_extra=_ui(
+            "图生图噪声", order=19, step=0.05,
+            hint="图生图 (img2img) 的初始噪声强度，按服务商接口要求传递",
+        ),
+    )
+    i2i_color_correct: bool = Field(
+        default=True, description="图生图颜色校正",
+        json_schema_extra=_ui(
+            "图生图颜色校正", order=20,
+            hint="是否向支持该参数的服务商请求颜色校正",
+        ),
+    )
+
+    @field_validator("prompt_structure", mode="before")
+    @classmethod
+    def _normalize_prompt_structure(cls, value: Any) -> str:
+        """未知值按旧兼容模式处理，避免手工配置阻断插件加载。"""
+        mode = str(value or "auto").strip().lower()
+        return mode if mode in {"auto", "nai_v4", "flat"} else "auto"
 
 
 
@@ -222,6 +262,7 @@ class ModelsSectionConfig(PluginConfigBase):
                 noise_schedule="karras", default_size="832x1216",
                 size_preset="竖图", artist_preset="梦幻柔美2.0",
                 ref_fidelity=0.6, ref_strength=0.8,
+                i2i_strength=0.65, i2i_noise=0.1, i2i_color_correct=True,
             ),
         ],
         description="生图模型列表",
@@ -599,7 +640,7 @@ class AiDrawPlugin(MaiBotPlugin):
         set_plugin_instance(self)
 
         self.ctx.logger.info(
-            f"ai_draw_plugin v2.4.7 已加载，共 {len(self._loaded_models)} 个模型配置"
+            f"ai_draw_plugin v2.4.8 已加载，共 {len(self._loaded_models)} 个模型配置"
         )
 
     async def on_unload(self) -> None:

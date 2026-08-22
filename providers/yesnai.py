@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""通过 YesNovelAI Native 低层接口调用 NovelAI 图片生成。"""
+"""通过 YesNovelAI Native 与高层 Images 接口调用 NovelAI 图片生成。"""
 
 import asyncio
 import base64
@@ -18,7 +18,11 @@ import certifi
 import msgpack
 from PIL import Image
 
-from .base import BaseImageProvider, ResponseLimitError
+from .base import (
+    BaseImageProvider,
+    ResponseLimitError,
+    normalize_prompt_structure,
+)
 from .capabilities import YESNAI_CAPABILITIES
 
 if TYPE_CHECKING:
@@ -26,9 +30,11 @@ if TYPE_CHECKING:
 
 
 class YesNAIProvider(BaseImageProvider):
-    """YesNovelAI 图片生成 Provider（NAI 原生格式）"""
+    """YesNovelAI 图片生成 Provider（Native/V1 双协议）"""
 
     default_endpoint = "/native/ai/generate-image"
+    v1_images_endpoint = "/v1/images/generations"
+    v1_nai_endpoint = "/v1/nai/generate-image"
     _NATIVE_ZIP_MAX_ENTRIES = 32
     _NATIVE_STREAM_MAX_BYTES = 256 * 1024 * 1024
     _NATIVE_STREAM_TOTAL_TIMEOUT = 600.0
@@ -46,7 +52,8 @@ class YesNAIProvider(BaseImageProvider):
         "width", "height", "steps", "num_inference_steps", "n_samples",
         "negative_prompt", "sampler", "scale", "guidance_scale", "cfg",
         "cfg_rescale", "seed", "noise_schedule", "nocache", "image",
-        "images", "img2img", "strength", "noise", "reference_image",
+        "images", "img2img", "strength", "noise", "color_correct",
+        "reference_image",
         "reference_images", "reference_image_multiple",
         "reference_strength_multiple", "reference_information_extracted_multiple",
         "director_reference_images", "director_reference_strength_values",
@@ -83,9 +90,19 @@ class YesNAIProvider(BaseImageProvider):
         artist_prompt: str = "",
         custom_prompt_add: str = "",
         structured_prompt: Optional["StructuredPrompt"] = None,
+        prompt_structure: str = "auto",
     ) -> Dict[str, Any]:
         request_parameters = dict(parameters)
         request_prompt = full_prompt
+        uses_v4_prompt = self._uses_v4_prompt_envelope(
+            model_name,
+            action,
+            prompt_structure,
+        )
+        if normalize_prompt_structure(prompt_structure) == "flat":
+            # Defensive guard for direct/internal callers: flat mode must never
+            # leak V4 character fields even if a stale StructuredPrompt is passed.
+            structured_prompt = None
         if structured_prompt is not None and structured_prompt.people:
             layout = self.character_layout(len(structured_prompt.people))
             character_prompts = []
@@ -137,7 +154,12 @@ class YesNAIProvider(BaseImageProvider):
 
             request_parameters["v4_prompt"]["caption"]["base_caption"] = request_prompt
 
-        if self._is_novelai_v4_model(model_name):
+        # V5 文生图使用 flat 高层协议，但 Launcher 的 V4.5/V5 I2I 都使用
+        # v4_prompt envelope。其他低层请求才使用 parameters.prompt。
+        if not uses_v4_prompt:
+            request_parameters["prompt"] = request_prompt
+
+        if uses_v4_prompt:
             request_parameters.setdefault("v4_prompt", {
                 "caption": {
                     "base_caption": request_prompt,
@@ -159,6 +181,7 @@ class YesNAIProvider(BaseImageProvider):
             "action": action,
             "input": request_prompt,
             "parameters": request_parameters,
+            # Launcher 1.7.2 对 generate/img2img/infill 都发送该字段。
             "use_new_shared_trial": True,
         }
 
@@ -187,12 +210,20 @@ class YesNAIProvider(BaseImageProvider):
             else ""
         )
         endpoint_lower = endpoint_path.lower()
-        if endpoint_lower in {"", "/native", "/v1/nai/generate-image"}:
+        if endpoint_lower in {"", "/native"}:
             endpoint_path = (
                 "/ai/generate-image"
                 if base_has_native_prefix
                 else cls.default_endpoint
             )
+        elif endpoint_lower in {
+            cls.v1_nai_endpoint,
+            cls.v1_images_endpoint,
+        }:
+            # /v1/nai/generate-image 与 /v1/images/generations 都是站点根路径；
+            # base_url 若沿用了 Launcher 的 /native 前缀，需要先剥掉它。
+            if base_has_native_prefix:
+                base_path = base_path[:-len("/native")]
         elif base_has_native_prefix and endpoint_lower.startswith("/native/"):
             base_path = base_path[:-len("/native")]
         if endpoint_path.lower().endswith("/ai/generate-image-stream"):
@@ -206,6 +237,72 @@ class YesNAIProvider(BaseImageProvider):
             query,
             "",
         ))
+
+    @classmethod
+    def _resolve_v1_images_url(
+        cls,
+        base_url: str,
+        configured_endpoint: str = "",
+    ) -> str:
+        """解析高层 /v1/images/generations 地址。"""
+        endpoint_text = str(configured_endpoint or "").strip()
+        if endpoint_text:
+            return cls._resolve_request_url(base_url, endpoint_text)
+
+        base_parts = urlsplit(str(base_url or "").strip())
+        if base_parts.fragment:
+            raise ValueError("YesNAI base_url 不能包含 URL fragment")
+        base_path = base_parts.path.rstrip("/")
+        if base_path.lower().endswith("/native"):
+            base_path = base_path[:-len("/native")]
+        return urlunsplit((
+            base_parts.scheme,
+            base_parts.netloc,
+            f"{base_path}{cls.v1_images_endpoint}",
+            base_parts.query,
+            "",
+        ))
+
+    @classmethod
+    def _resolve_transport(
+        cls,
+        base_url: str,
+        configured_endpoint: str,
+        prompt_structure: str,
+        ref_mode: str = "",
+    ) -> str:
+        """根据显式端点、提示词协议和参考模式选择 wire protocol。
+
+        Flat 文生图默认使用高层 Images API；Flat 图生图必须改走低层
+        Native，因为高层端点不承载 ``parameters.image``。
+        """
+        endpoint_text = str(configured_endpoint or "").strip()
+        if endpoint_text:
+            endpoint_parts = urlsplit(endpoint_text)
+            endpoint_path = (
+                f"/{endpoint_parts.path.strip('/')}"
+                if endpoint_parts.path else ""
+            ).lower()
+            if endpoint_path == cls.v1_images_endpoint:
+                return "v1-images"
+            if endpoint_path == cls.v1_nai_endpoint:
+                return "native-json"
+            if endpoint_path.endswith("/ai/generate-image-stream"):
+                return "native-stream"
+            if endpoint_path.endswith("/ai/generate-image"):
+                return "native-zip"
+            if endpoint_path in {"", "/native"}:
+                return "native-stream"
+            # 保持旧版自定义 Native endpoint 的兼容行为。
+            return "native-zip"
+        if (
+            normalize_prompt_structure(prompt_structure) == "flat"
+            and str(ref_mode or "").strip().lower() != "i2i"
+        ):
+            return "v1-images"
+        # Native 默认与 Launcher 一致使用 MessagePack 流。显式配置 ZIP
+        # 或 JSON 端点时仍严格遵循配置。
+        return "native-stream"
 
     @classmethod
     def _resolve_stream_request_url(
@@ -243,10 +340,14 @@ class YesNAIProvider(BaseImageProvider):
         ref_mode: str = "",
         structured_prompt: Optional["StructuredPrompt"] = None,
     ) -> Tuple[bool, str]:
-        """调用 YesNovelAI Native 接口生成图片（异步）。"""
+        """调用 YesNovelAI Native 或高层 Images 接口生成图片（异步）。"""
         try:
             if not self.validate_config(model_config):
                 return False, "模型配置不完整（缺少 base_url 或 model）"
+
+            # 命令层通常已经传入小写模式，但 Provider 也可能被 Tool 或
+            # 内部调用直接使用；统一规范化，避免 ``I2I`` 被当作文生图。
+            ref_mode = str(ref_mode or "").strip().lower()
 
             base_url = (model_config.get("base_url") or "").rstrip('/')
             if base_url.startswith("http://"):
@@ -259,12 +360,6 @@ class YesNAIProvider(BaseImageProvider):
                 model_config.get("endpoint")
                 or model_config.get("nai_endpoint")
                 or ""
-            )
-            non_stream_url = self._resolve_request_url(
-                base_url, configured_endpoint,
-            )
-            stream_url = self._resolve_stream_request_url(
-                base_url, configured_endpoint,
             )
 
             api_key = model_config.get("api_key", "")
@@ -314,6 +409,44 @@ class YesNAIProvider(BaseImageProvider):
                 or model_config.get("default_model")
                 or "nai-diffusion-4-5-full"
             )
+            raw_prompt_structure = model_config.get("prompt_structure")
+            prompt_structure = normalize_prompt_structure(
+                raw_prompt_structure
+            )
+            if (
+                raw_prompt_structure is not None
+                and str(raw_prompt_structure).strip().lower()
+                not in {"auto", "nai_v4", "flat"}
+            ):
+                self._logger.warning(
+                    f"{self.log_prefix} (YesNAI) 未知 prompt_structure="
+                    f"{raw_prompt_structure!r}，已回退 auto"
+                )
+            transport = self._resolve_transport(
+                base_url, configured_endpoint, prompt_structure, ref_mode,
+            )
+            if transport == "v1-images" and prompt_structure != "flat":
+                return False, (
+                    "YesNAI /v1/images/generations 只支持 flat 提示词结构，"
+                    "请将当前模型的 prompt_structure 改为 flat"
+                )
+            if (
+                prompt_structure == "flat"
+                and ref_mode
+                and ref_mode != "i2i"
+            ):
+                return False, (
+                    "当前模型已选择 flat 提示词结构，YesNAI flat 不支持角色参考或画风参考，"
+                    "请切换 nai_v4 模式或移除该参考图"
+                )
+            if transport == "v1-images":
+                request_url = self._resolve_v1_images_url(
+                    base_url, configured_endpoint,
+                )
+            else:
+                request_url = self._resolve_request_url(
+                    base_url, configured_endpoint,
+                )
             seed = model_config.get("seed", -1)
 
             # ── 尺寸解析 ──
@@ -337,9 +470,27 @@ class YesNAIProvider(BaseImageProvider):
             negative_prompt = self._sanitize_prompt(negative_prompt)
             custom_prompt_add = self._sanitize_prompt(custom_prompt_add)
             artist_prompt = self._sanitize_prompt(artist_prompt or "")
-            structured_prompt = self._sanitize_structured_prompt(
-                structured_prompt, model_name,
-            )
+            if prompt_structure == "flat":
+                structured_prompt = None
+            else:
+                structured_prompt = self._sanitize_structured_prompt(
+                    structured_prompt,
+                    model_name,
+                    prompt_structure=prompt_structure,
+                )
+
+            if prompt_structure == "nai_v4" and not self._is_novelai_v4_model(model_name):
+                return False, (
+                    f"模型 {model_name} 不支持 nai_v4 提示词结构，"
+                    "请改用 flat 或选择 V4/V4.5 模型"
+                )
+            if (
+                ref_mode in {"character", "style", "character&style"}
+                and "nai-diffusion-4-5" not in str(model_name).strip().lower()
+            ):
+                return False, (
+                    f"YesNAI 精准参考仅支持 V4.5 基础或 Inpainting 模型，当前为 {model_name}"
+                )
 
             steps = self.bounded_int(
                 steps,
@@ -378,7 +529,20 @@ class YesNAIProvider(BaseImageProvider):
                 maximum=YESNAI_CAPABILITIES.max_reference_strength,
                 name="ref_strength",
             )
-
+            i2i_strength = self.bounded_float(
+                model_config.get("i2i_strength", 0.65),
+                default=0.65,
+                minimum=0.0,
+                maximum=1.0,
+                name="i2i_strength",
+            )
+            i2i_noise = self.bounded_float(
+                model_config.get("i2i_noise", 0.1),
+                default=0.1,
+                minimum=0.0,
+                maximum=1.0,
+                name="i2i_noise",
+            )
             if ref_image and ref_mode:
                 valid, normalized_ref, _ = (
                     self.normalize_and_validate_base64_image(
@@ -390,12 +554,27 @@ class YesNAIProvider(BaseImageProvider):
                 if not valid:
                     return False, normalized_ref
                 ref_image = normalized_ref
+                if ref_mode == "i2i":
+                    ok, resized_ref, _, resize_error = (
+                        self.normalize_i2i_base64_image(
+                            ref_image,
+                            width,
+                            height,
+                            self._REFERENCE_IMAGE_CAPABILITIES,
+                            field_name="图生图参考图",
+                        )
+                    )
+                    if not ok:
+                        return False, resize_error
+                    ref_image = resized_ref
 
             action, ref_extra = self._build_ref_params(
                 ref_image=ref_image,
                 ref_mode=ref_mode,
                 ref_strength=ref_strength,
                 ref_fidelity=ref_fidelity,
+                i2i_strength=i2i_strength,
+                i2i_noise=i2i_noise,
             )
 
             # ── 构建 parameters ──
@@ -408,9 +587,19 @@ class YesNAIProvider(BaseImageProvider):
                 "scale": scale,
                 "negative_prompt": negative_prompt or "",
             }
-            if self._is_novelai_v4_model(model_name):
-                # Match Launcher's explicit V4 sampler contract instead of
-                # relying on upstream compatibility defaults.
+            uses_v4_prompt = self._uses_v4_prompt_envelope(
+                model_name,
+                action,
+                prompt_structure,
+            )
+            if action == "img2img" and not uses_v4_prompt:
+                # YesNAI 的低层 I2I 示例要求非 V4/flat prompt 同时位于
+                # parameters.prompt；顶层 input 仍保留作为统一 envelope。
+                parameters["prompt"] = full_prompt
+            if uses_v4_prompt:
+                # V4/V4.5 and V5 I2I share Launcher's V4+ low-level contract.
+                # V5 flat text-to-image exits through /v1/images before this
+                # body is sent, so its existing high-level request is unchanged.
                 parameters.update({
                     "params_version": 3,
                     "use_coords": False,
@@ -430,6 +619,32 @@ class YesNAIProvider(BaseImageProvider):
                 maximum=4_294_967_295,
                 name="seed",
             )
+
+            if transport == "v1-images":
+                if ref_image or ref_mode:
+                    return False, (
+                        "当前 flat 模式使用 YesNAI /v1/images/generations，"
+                        "该端点不支持参考图或图生图"
+                    )
+                return await self._generate_v1_images_request(
+                    url=request_url,
+                    token=token,
+                    model_config=model_config,
+                    model_name=model_name,
+                    prompt=full_prompt,
+                    negative_prompt=negative_prompt,
+                    width=width,
+                    height=height,
+                    steps=steps,
+                    sampler=sampler,
+                    scale=scale,
+                    seed=seed,
+                    noise_schedule=noise_schedule,
+                    cfg_value=cfg_value,
+                    nocache=nocache,
+                    extra_params=extra_params,
+                )
+
             if seed >= 0:
                 parameters["seed"] = seed
 
@@ -460,23 +675,37 @@ class YesNAIProvider(BaseImageProvider):
                 artist_prompt=artist_prompt,
                 custom_prompt_add=custom_prompt_add,
                 structured_prompt=structured_prompt,
+                prompt_structure=prompt_structure,
             )
+
+            # Native 默认保留旧版已验证的流式优先链路；显式 ZIP、JSON
+            # 端点则严格按用户配置发送，不把端点静默改写成另一种协议。
             stream_body = dict(body)
             stream_parameters = dict(body["parameters"])
             stream_parameters["stream"] = "msgpack"
             stream_body["parameters"] = stream_parameters
 
-            stream_headers = {
+            request_headers = {
                 "Content-Type": "application/json",
-                "Accept": "application/x-msgpack",
+                "Accept": (
+                    "application/json"
+                    if transport == "native-json"
+                    else "application/x-msgpack"
+                ),
             }
             if token:
-                stream_headers["Authorization"] = f"Bearer {token}"
+                request_headers["Authorization"] = f"Bearer {token}"
+
+            stream_url = self._resolve_stream_request_url(
+                base_url, configured_endpoint,
+            )
 
             self._logger.info(
                 f"{self.log_prefix} (YesNAI) 请求: model={model_name} "
                 f"action={action} size={width}x{height} steps={steps} "
-                f"transport=native-stream"
+                f"prompt_structure={prompt_structure} "
+                f"wire_prompt={'v4' if uses_v4_prompt else 'flat'} "
+                f"transport={transport}"
             )
 
             # ── 发送请求 ──
@@ -512,6 +741,68 @@ class YesNAIProvider(BaseImageProvider):
                     trust_env=False,
                     connector=connector,
                 ) as session:
+                    if transport == "native-json":
+                        async with session.post(
+                            request_url,
+                            headers=request_headers,
+                            json=body,
+                            proxy=proxy,
+                            allow_redirects=False,
+                        ) as response:
+                            raw_response = await self._read_limited_response(
+                                response,
+                                YESNAI_CAPABILITIES.max_response_bytes,
+                            )
+                            if 300 <= response.status < 400:
+                                return False, (
+                                    f"HTTP {response.status}: 接口发生重定向，请检查 base_url"
+                                )
+                            if response.status < 200 or response.status >= 300:
+                                text = raw_response.decode("utf-8-sig", errors="replace")
+                                return False, self._format_http_error(
+                                    response.status, text,
+                                )
+                            return self._parse_success_response(raw_response)
+
+                    if transport == "native-zip":
+                        # 显式 ZIP 端点必须直连，不能先探测流式端点。
+                        fallback_headers = {
+                            "Content-Type": "application/json",
+                            "Accept": "application/zip, application/json",
+                        }
+                        if token:
+                            fallback_headers["Authorization"] = f"Bearer {token}"
+                        async with session.post(
+                            request_url,
+                            headers=fallback_headers,
+                            json=body,
+                            proxy=proxy,
+                            allow_redirects=False,
+                        ) as response:
+                            raw_response = await self._read_limited_response(
+                                response,
+                                YESNAI_CAPABILITIES.max_response_bytes,
+                            )
+                            if 300 <= response.status < 400:
+                                return False, (
+                                    f"HTTP {response.status}: 接口发生重定向，请检查 base_url"
+                                )
+                            if response.status < 200 or response.status >= 300:
+                                text = raw_response.decode("utf-8-sig", errors="replace")
+                                return False, self._format_http_error(
+                                    response.status, text,
+                                )
+                            return self._parse_success_response(raw_response)
+
+                    # Native 流式端点不可用时，按旧版规则回退到 ZIP；
+                    # 只有明确表示不支持流式的状态才重试，避免把真实的
+                    # 上游 500 当成可安全重复的请求。
+                    stream_headers = {
+                        "Content-Type": "application/json",
+                        "Accept": "application/x-msgpack",
+                    }
+                    if token:
+                        stream_headers["Authorization"] = f"Bearer {token}"
                     async with session.post(
                         stream_url,
                         headers=stream_headers,
@@ -553,7 +844,7 @@ class YesNAIProvider(BaseImageProvider):
                     if token:
                         fallback_headers["Authorization"] = f"Bearer {token}"
                     async with session.post(
-                        non_stream_url,
+                        request_url,
                         headers=fallback_headers,
                         json=body,
                         proxy=proxy,
@@ -568,9 +859,7 @@ class YesNAIProvider(BaseImageProvider):
                                 f"HTTP {response.status}: 接口发生重定向，请检查 base_url"
                             )
                         if response.status < 200 or response.status >= 300:
-                            text = raw_response.decode(
-                                "utf-8-sig", errors="replace",
-                            )
+                            text = raw_response.decode("utf-8-sig", errors="replace")
                             return False, self._format_http_error(
                                 response.status, text,
                             )
@@ -591,6 +880,163 @@ class YesNAIProvider(BaseImageProvider):
         except Exception as e:
             self._logger.error(f"{self.log_prefix} (YesNAI) 未知异常: {e!r}", exc_info=True)
             return False, f"YesNAI 接口请求失败: {str(e)[:100]}"
+
+    async def _generate_v1_images_request(
+        self,
+        *,
+        url: str,
+        token: str,
+        model_config: Dict[str, Any],
+        model_name: str,
+        prompt: str,
+        negative_prompt: str,
+        width: int,
+        height: int,
+        steps: int,
+        sampler: str,
+        scale: Optional[float],
+        seed: int,
+        noise_schedule: str,
+        cfg_value: Optional[float],
+        nocache: Any,
+        extra_params: Any,
+    ) -> Tuple[bool, str]:
+        """调用 YesNAI 高层 Images API（flat/V5 路径）。"""
+        nai: Dict[str, Any] = {
+            "steps": steps,
+            "sampler": sampler,
+            "negative_prompt": negative_prompt or "",
+            "noise_schedule": str(noise_schedule or "karras"),
+        }
+        if scale is not None:
+            nai["scale"] = scale
+        if seed >= 0:
+            nai["seed"] = seed
+        ignored_fields = []
+        if cfg_value not in (None, 0, 0.0):
+            ignored_fields.append("cfg_rescale")
+        if nocache is not None:
+            ignored_fields.append("nocache")
+        if isinstance(extra_params, dict):
+            ignored_fields.extend(
+                str(key) for key in extra_params
+                if str(key) not in {"steps", "sampler", "scale", "seed", "negative_prompt", "noise_schedule"}
+            )
+        if ignored_fields:
+            self._logger.warning(
+                f"{self.log_prefix} (YesNAI) /v1/images/generations "
+                "未透传 Native 专用参数: "
+                + ", ".join(dict.fromkeys(ignored_fields))
+            )
+        body = {
+            "model": model_name,
+            "prompt": prompt,
+            "size": f"{width}x{height}",
+            "n": 1,
+            "response_format": "b64_json",
+            "nai": nai,
+        }
+
+        request_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if token:
+            request_headers["Authorization"] = f"Bearer {token}"
+
+        proxy_value = model_config.get("proxy")
+        if proxy_value is not None and not isinstance(proxy_value, str):
+            return False, "代理地址必须是字符串"
+        proxy = (proxy_value or "").strip() or None
+        if proxy:
+            try:
+                parsed_proxy = urlsplit(proxy)
+                proxy_hostname = parsed_proxy.hostname
+            except ValueError:
+                return False, "代理地址必须是有效的 HTTP(S) URL"
+            if parsed_proxy.scheme.lower() not in {"http", "https"} or not proxy_hostname:
+                return False, "代理地址必须是有效的 HTTP(S) URL"
+
+        timeout_seconds = self.bounded_float(
+            model_config.get("timeout_seconds"),
+            default=120.0,
+            minimum=1.0,
+            maximum=600.0,
+            name="timeout_seconds",
+        )
+        self._logger.info(
+            f"{self.log_prefix} (YesNAI) 请求: model={model_name} "
+            f"size={width}x{height} steps={steps} "
+            f"prompt_structure=flat transport=v1-images"
+        )
+        return await self._post_image_request(
+            url=url,
+            headers=request_headers,
+            body=body,
+            proxy=proxy,
+            timeout_seconds=timeout_seconds,
+            transport="v1-images",
+        )
+
+    async def _post_image_request(
+        self,
+        *,
+        url: str,
+        headers: Dict[str, str],
+        body: Dict[str, Any],
+        proxy: Optional[str],
+        timeout_seconds: float,
+        transport: str,
+    ) -> Tuple[bool, str]:
+        """发送非流式图片请求并统一解析 ZIP/JSON 响应。"""
+        try:
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(
+                    total=self._NATIVE_STREAM_TOTAL_TIMEOUT,
+                    connect=min(timeout_seconds, 30.0),
+                    sock_read=timeout_seconds,
+                ),
+                trust_env=False,
+                connector=connector,
+            ) as session:
+                async with session.post(
+                    url,
+                    headers=headers,
+                    json=body,
+                    proxy=proxy,
+                    allow_redirects=False,
+                ) as response:
+                    raw_response = await self._read_limited_response(
+                        response,
+                        YESNAI_CAPABILITIES.max_response_bytes,
+                    )
+                    if 300 <= response.status < 400:
+                        return False, (
+                            f"HTTP {response.status}: 接口发生重定向，请检查 base_url"
+                        )
+                    if response.status < 200 or response.status >= 300:
+                        text = raw_response.decode("utf-8-sig", errors="replace")
+                        return False, self._format_http_error(
+                            response.status, text,
+                        )
+                    return self._parse_success_response(raw_response)
+        except ResponseLimitError as exc:
+            return False, str(exc)
+        except (asyncio.TimeoutError, TimeoutError):
+            return False, (
+                f"收图超时（连续 {timeout_seconds}s 未收到数据，"
+                f"或单次请求时长超过 {self._NATIVE_STREAM_TOTAL_TIMEOUT}s）"
+            )
+        except aiohttp.ClientError as exc:
+            return False, f"网络错误: {type(exc).__name__}: {exc}"
+        except Exception as exc:
+            self._logger.error(
+                f"{self.log_prefix} (YesNAI) {transport} 请求异常: {exc!r}",
+                exc_info=True,
+            )
+            return False, f"请求失败: {str(exc)[:100]}"
 
     @staticmethod
     async def _read_limited_response(
@@ -871,6 +1317,8 @@ class YesNAIProvider(BaseImageProvider):
         ref_mode: str,
         ref_strength: float,
         ref_fidelity: float,
+        i2i_strength: float = 0.65,
+        i2i_noise: float = 0.1,
     ) -> Tuple[str, Dict[str, Any]]:
         """将插件参考模式翻译为 YesNovelAI 原生 NAI 参数。
 
@@ -884,12 +1332,11 @@ class YesNAIProvider(BaseImageProvider):
         b64 = self._strip_data_uri(ref_image)
 
         if ref_mode == "i2i":
-            strength = 0.5
+            strength = float(i2i_strength)
             return "img2img", {
                 "image": b64,
                 "strength": strength,
-                "noise": 0.0,
-                "img2img": {"strength": strength},
+                "noise": float(i2i_noise),
             }
 
         if ref_mode in ("style", "character", "character&style"):
@@ -1213,8 +1660,18 @@ class YesNAIProvider(BaseImageProvider):
             )
         return cleaned
 
-    def _sanitize_structured_prompt(self, structured_prompt, model: str):
-        if structured_prompt is None or not self._is_novelai_v4_model(model):
+    def _sanitize_structured_prompt(
+        self,
+        structured_prompt,
+        model: str,
+        *,
+        prompt_structure: str = "auto",
+    ):
+        if (
+            structured_prompt is None
+            or normalize_prompt_structure(prompt_structure) == "flat"
+            or not self._is_novelai_v4_model(model)
+        ):
             return None
         global_tags = tuple(
             cleaned for tag in structured_prompt.global_tags
@@ -1249,3 +1706,27 @@ class YesNAIProvider(BaseImageProvider):
     def _is_novelai_v4_model(model: str) -> bool:
         value = str(model or "").strip().lower()
         return "nai-diffusion-4" in value or "novelai-v4" in value
+
+    @staticmethod
+    def _is_novelai_v5_model(model: str) -> bool:
+        value = str(model or "").strip().lower()
+        return "nai-diffusion-5" in value or "novelai-v5" in value
+
+    @classmethod
+    def _uses_v4_prompt_envelope(
+        cls,
+        model: str,
+        action: str,
+        prompt_structure: str,
+    ) -> bool:
+        # Launcher 的 V4.5 与 V5 Img2ImgRequest 都使用 v4_prompt，哪怕
+        # V5 文生图在插件中配置为 flat。
+        if str(action or "").strip().lower() == "img2img":
+            return (
+                cls._is_novelai_v4_model(model)
+                or cls._is_novelai_v5_model(model)
+            )
+        return (
+            normalize_prompt_structure(prompt_structure) != "flat"
+            and cls._is_novelai_v4_model(model)
+        )
